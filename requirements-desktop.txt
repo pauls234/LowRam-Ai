@@ -1,0 +1,11 @@
+# Desktop app: native window + packaging (see docs/DESKTOP.md).
+# Not needed for the CLI or `python -m backend.app`.
+#   pip install -r requirements.txt -r requirements-desktop.txt
+# All versions support Python 3.10-3.13 (platform dependencies such as
+# pyobjc on macOS and pythonnet on Windows are resolved by pip).
+pywebview==6.2.1
+pyinstaller==6.22.3
+pyinstaller-hooks-contrib==2026.9
+# CA certificates for HTTPS downloads inside the frozen app (the bundled
+# Python cannot see the build machine's certificate store).
+certifi==2026.10.23
