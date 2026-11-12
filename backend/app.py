@@ -347,7 +347,7 @@ def start_background(port: int | None = None) -> LowRAMServer:
 def shutdown(server: LowRAMServer) -> None:
     """Stop the loop, run shutdown hooks (e.g. stop llama-server) and close the socket."""
     server.loop.stop()
-    web.run_hooks(web.SHUTDOWN_HOOKS, server)
+    web.run_hooks(list(reversed(web.SHUTDOWN_HOOKS)), server)
     server.shutdown()
     server.server_close()
 
@@ -374,7 +374,7 @@ def main(argv: list[str] | None = None) -> int:
         print("\nStopping…")
     finally:
         server.loop.stop()
-        web.run_hooks(web.SHUTDOWN_HOOKS, server)
+        web.run_hooks(list(reversed(web.SHUTDOWN_HOOKS)), server)
         server.server_close()
     return 0
 

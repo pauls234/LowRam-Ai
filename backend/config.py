@@ -90,9 +90,27 @@ def llm_model() -> str:
     return os.environ.get("LOWRAM_LLM_MODEL", "").strip() or DEFAULT_MODEL
 
 
+_runtime_llm_api_key: str | None = None
+
+
+def set_runtime_llm_api_key(key: str | None) -> None:
+    """Called by the engine manager: the random key its own llama-server requires."""
+    global _runtime_llm_api_key
+    _runtime_llm_api_key = key
+
+
 def llm_api_key() -> str | None:
-    """Optional bearer token for endpoints that require one (never logged)."""
-    return os.environ.get("LOWRAM_LLM_API_KEY") or None
+    """Bearer token for the model endpoint (never logged).
+
+    ``LOWRAM_LLM_API_KEY`` wins. The managed engine's random key is only sent
+    to the managed engine, never to an external ``LOWRAM_LLM_URL``.
+    """
+    env_key = os.environ.get("LOWRAM_LLM_API_KEY")
+    if env_key:
+        return env_key
+    if not os.environ.get("LOWRAM_LLM_URL", "").strip() and _runtime_llm_url:
+        return _runtime_llm_api_key
+    return None
 
 
 def llm_timeout() -> float:

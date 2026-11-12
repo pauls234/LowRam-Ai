@@ -190,7 +190,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                         f"{summary['failed']} failed. {summary['message']}")
     if summary["failed"]:
         return 1
-    return 3 if summary["stopped_because"] in ("busy", "paused_low_ram") else 0
+    return 3 if summary["stopped_because"] in ("busy", "paused_low_ram", "no_model") else 0
 
 
 def cmd_result(args: argparse.Namespace) -> int:

@@ -81,7 +81,11 @@ def on_startup(func: Callable[[Any], None]) -> Callable[[Any], None]:
 
 
 def on_shutdown(func: Callable[[Any], None]) -> Callable[[Any], None]:
-    """Run ``func(server)`` when the dashboard stops (e.g. stop llama-server)."""
+    """Run ``func(server)`` when the dashboard stops (e.g. stop llama-server).
+
+    Shutdown hooks run in reverse registration order (last registered first), so
+    features that use the engine (media, cluster) stop before the engine itself.
+    """
     SHUTDOWN_HOOKS.append(func)
     return func
 
