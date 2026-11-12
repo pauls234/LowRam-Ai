@@ -16,3 +16,6 @@ htmlcov/
 *.db
 # local agent worktrees / tool state
 .claude/
+# desktop build output
+build/
+dist/
