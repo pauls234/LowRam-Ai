@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="lowram-token" content="__LOWRAM_TOKEN__">
+  <meta name="color-scheme" content="light dark">
+  <meta name="referrer" content="no-referrer">
+  <title>LowRAM AI</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#project-detail">Skip to project</a>
+
+  <header class="site-header">
+    <div class="wrap header-grid">
+      <div class="brand">
+        <img class="brand-logo" src="/static/favicon.svg" alt="" width="40" height="40">
+        <div class="brand-text">
+          <div class="brand-title-row">
+            <h1 class="brand-title">LowRAM AI</h1>
+            <span class="badge badge-mvp">MVP · local only</span>
+          </div>
+          <p class="brand-tagline">A task queue for your local model that waits for free memory.</p>
+        </div>
+      </div>
+
+      <section class="card ram-card" aria-labelledby="ram-title">
+        <div class="card-head">
+          <h2 id="ram-title" class="card-title">Memory</h2>
+          <span id="ram-pill" class="pill pill-unknown">
+            <span class="pill-dot" aria-hidden="true"></span>
+            <span id="ram-pill-text">Checking…</span>
+          </span>
+        </div>
+        <dl class="stats">
+          <div class="stat"><dt>Total</dt><dd id="ram-total">—</dd></div>
+          <div class="stat"><dt>Available</dt><dd id="ram-available">—</dd></div>
+          <div class="stat"><dt>Used</dt><dd id="ram-used">—</dd></div>
+        </dl>
+        <div id="ram-gauge" class="gauge" role="meter" aria-label="Available memory compared with the planning budget" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+          <span class="gauge-fill"></span>
+          <span class="gauge-reserve"></span>
+          <span class="gauge-marker"></span>
+        </div>
+        <p class="gauge-legend">
+          <span class="legend-item"><span class="legend-swatch legend-avail" aria-hidden="true"></span>Available <strong id="ram-legend-available">—</strong></span>
+          <span class="legend-item"><span class="legend-swatch legend-budget" aria-hidden="true"></span>Budget <strong id="ram-legend-budget">—</strong></span>
+          <span class="legend-item"><span class="legend-swatch legend-reserve" aria-hidden="true"></span>Reserve <strong id="ram-min-free">—</strong></span>
+        </p>
+        <p id="ram-reason" class="ram-reason" hidden></p>
+        <p class="help gauge-help">A task starts only while available RAM stays above the reserve.</p>
+      </section>
+
+      <section class="card budget-card" aria-labelledby="budget-title">
+        <div class="card-head">
+          <h2 id="budget-title" class="card-title"><label for="budget-range">Planning budget</label></h2>
+          <output id="budget-output" class="budget-output" for="budget-range">40%</output>
+        </div>
+        <input id="budget-range" class="range" type="range" min="20" max="80" step="5" value="40" aria-describedby="budget-help">
+        <div class="range-scale" aria-hidden="true"><span>20%</span><span>50%</span><span>80%</span></div>
+        <dl class="stats stats-compact">
+          <div class="stat"><dt>Budget</dt><dd id="budget-bytes">—</dd></div>
+          <div class="stat"><dt>Context</dt><dd id="budget-context">—</dd></div>
+          <div class="stat"><dt>Max tokens</dt><dd id="budget-tokens">—</dd></div>
+        </dl>
+        <p id="budget-help" class="help">Share of total RAM the scheduler plans for. It sizes the prompt context and the output length (max tokens). This is a scheduling hint, not a hard memory cap.</p>
+      </section>
+    </div>
+  </header>
+
+  <div id="banner" class="banner" role="alert" hidden>
+    <div class="wrap banner-inner">
+      <p class="banner-text"><strong id="banner-title"></strong> <span id="banner-message"></span></p>
+      <button id="banner-action" class="btn btn-sm btn-secondary" type="button"></button>
+    </div>
+  </div>
+
+  <main class="wrap layout">
+    <section class="card panel-projects" aria-labelledby="projects-title">
+      <div class="card-head">
+        <h2 id="projects-title" class="card-title">Projects</h2>
+        <button id="projects-refresh" class="btn btn-ghost btn-sm" type="button">Refresh</button>
+      </div>
+      <p id="projects-empty" class="empty-text">Loading projects…</p>
+      <ul id="project-list" class="project-list"></ul>
+    </section>
+
+    <div class="panel-detail">
+      <section id="loop-banner" class="loop-banner" aria-labelledby="loop-title" hidden>
+        <div class="loop-head">
+          <span id="loop-spinner" class="spinner" aria-hidden="true"></span>
+          <div class="loop-heading">
+            <h2 id="loop-title" class="loop-title">Loop running</h2>
+            <p id="loop-project" class="loop-project"></p>
+          </div>
+          <div class="loop-actions">
+            <button id="loop-view" class="btn btn-ghost btn-sm" type="button" hidden>View project</button>
+            <button id="loop-stop" class="btn btn-danger btn-sm" type="button">Stop loop</button>
+            <button id="loop-dismiss" class="btn btn-ghost btn-sm" type="button" hidden>Dismiss</button>
+          </div>
+        </div>
+        <div id="loop-progress" class="progress" role="progressbar" aria-labelledby="loop-title" aria-valuemin="0" aria-valuemax="1" aria-valuenow="0">
+          <span class="progress-fill"></span>
+        </div>
+        <p id="loop-stats" class="loop-stats"></p>
+        <p id="loop-message" class="loop-message" hidden></p>
+      </section>
+
+      <section id="project-detail" class="card detail-card" aria-labelledby="detail-title" tabindex="-1">
+        <div class="detail-head">
+          <div class="detail-heading">
+            <h2 id="detail-title" class="detail-title">No project selected</h2>
+            <p id="detail-sub" class="detail-sub" hidden>
+              <span id="detail-kind" class="badge"></span>
+              <span id="detail-created" class="muted"></span>
+            </p>
+          </div>
+          <ul id="detail-counts" class="count-chips" aria-label="Task counts"></ul>
+        </div>
+
+        <div id="detail-empty" class="empty-state">
+          <p>Select a project from the list, or create a new one with one task per line.</p>
+        </div>
+
+        <div id="detail-body" hidden>
+          <dl id="detail-meta" class="detail-meta" hidden></dl>
+
+          <p id="coding-note" class="callout callout-info" hidden>
+            Use the CLI to plan/step/approve coding projects. This dashboard shows them read-only.
+          </p>
+
+          <div id="run-controls" class="run-controls" hidden>
+            <div class="run-row">
+              <button id="run-next" class="btn btn-primary" type="button">Run next task</button>
+              <div class="loop-group">
+                <label for="max-tasks" class="inline-label">Max tasks</label>
+                <input id="max-tasks" class="input input-number" type="number" min="1" max="100" step="1" value="5" inputmode="numeric" aria-describedby="max-tasks-error">
+                <button id="run-loop" class="btn btn-secondary" type="button">Run loop</button>
+              </div>
+            </div>
+            <p id="max-tasks-error" class="field-error" hidden></p>
+            <p id="run-busy" class="run-busy" hidden>
+              <span class="spinner" aria-hidden="true"></span>
+              <span id="run-busy-text">Running… this can take a while.</span>
+              <span id="run-elapsed" class="run-elapsed"></span>
+            </p>
+            <p id="run-hint" class="help"></p>
+          </div>
+
+          <div id="outcome" class="outcome-region" aria-live="polite" aria-atomic="true"></div>
+
+          <div class="table-wrap">
+            <table class="task-table">
+              <caption class="visually-hidden">Tasks in this project</caption>
+              <thead>
+                <tr>
+                  <th scope="col" class="col-pos">#</th>
+                  <th scope="col" class="col-title">Task</th>
+                  <th scope="col" class="col-status">Status</th>
+                  <th scope="col" class="col-attempts">Attempts</th>
+                  <th scope="col" class="col-finished">Finished</th>
+                  <th scope="col" class="col-actions"><span class="visually-hidden">Actions</span></th>
+                </tr>
+              </thead>
+              <tbody id="task-rows"></tbody>
+            </table>
+            <p id="tasks-empty" class="empty-text" hidden>This project has no tasks.</p>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <section class="card panel-new" aria-labelledby="new-title">
+      <div class="card-head">
+        <h2 id="new-title" class="card-title">New project</h2>
+      </div>
+      <form id="new-project-form" class="form" novalidate>
+        <div class="field">
+          <label for="project-name">Name</label>
+          <input id="project-name" class="input" name="name" type="text" maxlength="200" autocomplete="off" spellcheck="false" placeholder="e.g. Release notes">
+        </div>
+        <div class="field">
+          <label for="project-tasks">Tasks <span class="label-hint">one task per line</span></label>
+          <textarea id="project-tasks" class="input textarea" name="tasks" rows="6" aria-describedby="task-count" placeholder="Summarize the changelog&#10;Draft the announcement&#10;List open questions"></textarea>
+          <p id="task-count" class="help">0 tasks</p>
+        </div>
+        <p id="form-error" class="form-error" role="alert" hidden></p>
+        <div class="form-actions">
+          <button id="create-btn" class="btn btn-primary" type="submit">Create</button>
+          <p id="form-status" class="form-status" aria-live="polite"></p>
+        </div>
+      </form>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="wrap footer-inner">
+      <p class="footer-note">Runs one inference at a time against your local model endpoint. Do not expose port 8765 to the network.</p>
+      <div class="footer-actions">
+        <p id="recover-status" class="recover-status" aria-live="polite"></p>
+        <button id="recover-btn" class="btn btn-ghost btn-sm" type="button">Recover stuck tasks</button>
+      </div>
+    </div>
+  </footer>
+
+  <dialog id="result-dialog" class="dialog" aria-labelledby="dialog-title">
+    <div class="dialog-head">
+      <div class="dialog-heading">
+        <h2 id="dialog-title" class="dialog-title">Result</h2>
+        <p id="dialog-sub" class="dialog-sub"></p>
+      </div>
+      <button id="dialog-x" class="btn btn-ghost btn-icon" type="button" aria-label="Close">
+        <span aria-hidden="true">×</span>
+      </button>
+    </div>
+    <pre id="dialog-content" class="result-pre" tabindex="0"></pre>
+    <div class="dialog-foot">
+      <span id="dialog-meta" class="muted"></span>
+      <div class="dialog-buttons">
+        <button id="dialog-copy" class="btn btn-secondary btn-sm" type="button">Copy</button>
+        <button id="dialog-close" class="btn btn-primary btn-sm" type="button">Close</button>
+      </div>
+    </div>
+  </dialog>
+</body>
+</html>
