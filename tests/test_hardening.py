@@ -13,7 +13,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from backend import agent, db, llm, runner
+from backend import api_core, agent, db, llm, runner
 from tests.helpers import (
     EchoAuthError, Gate, HttpError, LowRAMTestCase, Redirect, Text, closed_port_url, wait_until,
 )
@@ -479,7 +479,7 @@ class AppHardeningTests(AppTestCase):
         pid = self.new_project("x")
         self.llm.push(Text("y" * 50))
         _, data = self.api("POST", f"/api/projects/{pid}/run")
-        with mock.patch.object(app, "MAX_RESULT_CHARS", 10):
+        with mock.patch.object(api_core, "MAX_RESULT_CHARS", 10):
             status, res = self.api("GET", f"/api/tasks/{data['task']['id']}/result")
         self.assertEqual(status, 200)
         self.assertIs(res["truncated"], True)

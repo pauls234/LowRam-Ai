@@ -64,8 +64,26 @@ def skills_dir() -> Path:
     return _ensure_dir(home_dir() / "skills")
 
 
+_runtime_llm_url: str | None = None
+
+
+def set_runtime_llm_url(url: str | None) -> None:
+    """Called by the engine manager when it starts/stops its own llama-server."""
+    global _runtime_llm_url
+    _runtime_llm_url = url
+
+
 def llm_url() -> str:
-    return os.environ.get("LOWRAM_LLM_URL", "").strip() or DEFAULT_LLM_URL
+    """``LOWRAM_LLM_URL`` wins, then the managed engine, then the llama-server default."""
+    return os.environ.get("LOWRAM_LLM_URL", "").strip() or _runtime_llm_url or DEFAULT_LLM_URL
+
+
+def models_dir() -> Path:
+    return _ensure_dir(home_dir() / "models")
+
+
+def bin_dir() -> Path:
+    return _ensure_dir(home_dir() / "bin")
 
 
 def llm_model() -> str:

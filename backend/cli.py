@@ -236,6 +236,20 @@ def cmd_serve(args: argparse.Namespace) -> int:
     return app.main([])
 
 
+def cmd_app(args: argparse.Namespace) -> int:
+    """Start the desktop app (native window if pywebview is installed, else the browser)."""
+    from desktop import launcher
+
+    return launcher.main(["--no-window"] if args.browser else [])
+
+
+def cmd_worker(args: argparse.Namespace) -> int:
+    """Run this machine as a helper device for another LowRAM AI."""
+    from . import worker
+
+    return worker.run_cli(args)
+
+
 # --------------------------------------------------------------------------- parser
 
 
@@ -251,6 +265,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("serve", help="start the local dashboard on 127.0.0.1:8765")
     p.set_defaults(func=cmd_serve)
+
+    p = sub.add_parser("app", help="start LowRAM AI Studio (desktop window)")
+    p.add_argument("--browser", action="store_true", help="open in the default browser instead of a window")
+    p.set_defaults(func=cmd_app)
+
+    p = sub.add_parser("worker", help="help another LowRAM AI on your network as a worker device")
+    p.add_argument("--join", metavar="PAIRING_CODE", required=True, help="code shown on the host under Devices")
+    p.add_argument("--name", help="name of this device as shown on the host")
+    _ram_arg(p)
+    p.set_defaults(func=cmd_worker)
 
     p = sub.add_parser("new", help="create a general project (one task per --task or line in --file)")
     p.add_argument("name")
