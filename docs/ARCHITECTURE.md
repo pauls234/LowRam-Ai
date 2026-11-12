@@ -172,6 +172,9 @@ Device = {id, name, status: "online"|"offline"|"busy", platform, ram_total_bytes
 * `POST /api/cluster/devices/<id>/revoke {}` → `{revoked: true}`
 * `POST /api/cluster/projects/<id>/distribute {percent?, merge: bool}` → 202 `{project_id, distributed: true}` – helper devices may claim this project's pending tasks while this machine works on it too; with `merge` a final "combine the results" step runs locally when all tasks are done.
 * `GET /api/cluster/projects/<id>/final` → `{content, path}` (404 until merged)
+* `POST /api/cluster/join {code, name?, percent?}` → 202 `{worker}`; `POST /api/cluster/leave {}` → `{worker}`
+* `GET /api/cluster` additionally returns `worker: {state: "idle"|"pairing"|"working"|"error"|"stopped", host, device_id, tasks_done, current_task: {id, title, project_id}|null, error, message}|null`, `projects: [{project_id, name, percent, merge, merge_state: "off"|"waiting"|"running"|"done"|"failed", merge_error, final_available, counts, total}]`, `pairing_error`, `host_name`
+* LAN API (`/cluster/v1/pair|heartbeat|claim|leave`, `/cluster/v1/tasks/<id>/result|fail`): see the `backend/cluster.py` docstring. Device leases are requeued after 90 s without a heartbeat (max 3 attempts) – the only automatic retry in LowRAM AI.
 * LAN API (`scope="cluster"`, served only by the TLS device server): designed by the devices owner, all requests HMAC-signed except the one-time pairing call.
 
 ### Desktop (`desktop/launcher.py`)
