@@ -409,6 +409,8 @@ class Worker:
 
     def _set(self, **changes: Any) -> None:
         with self._lock:
+            if self._stop.is_set() and changes.get("state") not in (None, "stopped"):
+                changes.pop("state")  # a loop iteration finishing after stop() must not look "idle" again
             self._status.update(changes)
         if changes.get("message"):
             self.say(changes["message"])

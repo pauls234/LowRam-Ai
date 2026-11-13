@@ -105,6 +105,13 @@ class ClusterTestCase(AppTestCase):
             tasks = "\n".join(f"task {i}" for i in range(1, tasks + 1))
         return runner.create_project(name, tasks)
 
+    def pause_coordinator(self) -> None:
+        """Stop the background coordinator (and keep it stopped) so a test drives sweeps itself."""
+        patcher = mock.patch.object(cluster, "_ensure_coordinator", lambda: None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        cluster._stop_coordinator()
+
     def lan_request(self, method: str, path: str, body: bytes = b"", headers: dict | None = None):
         conn = worker.PinnedHTTPSConnection("127.0.0.1", cluster.listening_port(), cluster.certificate_fingerprint(), 10)
         try:
