@@ -7,7 +7,11 @@ Flow: create a project for a local repository -> plan (or add steps by hand)
 Error mapping: ``agent.ProposalError`` (unsafe path) -> 400,
 ``agent.ReviewPending`` and other ``agent.AgentError`` (wrong state, low RAM,
 unusable model output) -> 409, ``db.Busy`` -> 409 (by the app),
-``llm.LLMError`` (model endpoint unreachable/failing) -> 502.
+``llm.LLMError`` (model endpoint unreachable/failing) -> 502, except when the
+managed model was paused/stopped (image or video job) during the call -> 409.
+
+Repositories must be a folder inside the user's home directory, not in a
+hidden folder or ``~/Library``, and not the LowRAM AI data folder.
 """
 
 from __future__ import annotations
@@ -22,6 +26,7 @@ from . import agent, chat, config, db, llm, memory
 from .web import HTTPError, Request, Response, route
 
 MAX_REASON_CHARS = 500
+PAUSED_MESSAGE = "The model was paused for an image/video job – try again when it finishes"
 
 
 def _percent(data: dict) -> int:
@@ -30,10 +35,20 @@ def _percent(data: dict) -> int:
 
 
 def validate_repo(repo_path: object) -> Path:
-    """``agent.validate_repo`` plus: never the LowRAM AI data folder (or a folder containing it)."""
+    """``agent.validate_repo`` plus: inside the user's home, no hidden folder or ~/Library,
+    and never the LowRAM AI data folder (or a folder containing it)."""
     repo = agent.validate_repo(repo_path)
-    home = config.home_dir().resolve()
-    if repo == home or home in repo.parents or repo in home.parents:
+    user_home = Path.home().resolve()
+    try:
+        inside = repo.relative_to(user_home)
+    except ValueError:
+        raise ValueError(f"The repository must be a folder inside your home directory ({user_home})") from None
+    if any(part.startswith(".") for part in repo.parts):
+        raise ValueError("The repository must not be inside a hidden folder (a folder whose name starts with '.')")
+    if inside.parts and inside.parts[0] == "Library":
+        raise ValueError("The repository must not be inside ~/Library")
+    data = config.home_dir().resolve()
+    if repo == data or data in repo.parents or repo in data.parents:
         raise ValueError("The repository must not be, contain or be inside the LowRAM AI data folder")
     return repo
 
@@ -74,11 +89,15 @@ def _call(func: Callable[..., Any], *args: Any) -> Any:
     except agent.AgentError as exc:  # includes ReviewPending
         raise HTTPError(HTTPStatus.CONFLICT, str(exc)) from exc
     except llm.LLMError as exc:
+        if chat.engine_interrupted():
+            raise HTTPError(HTTPStatus.CONFLICT, PAUSED_MESSAGE) from exc
         raise HTTPError(HTTPStatus.BAD_GATEWAY, str(exc)) from exc
 
 
 def _prepare_model() -> None:
-    """Fail fast when busy, and start the managed model if one is needed (409 if none)."""
+    """Fail fast when busy, and start the managed model if one is needed (409 if none).
+
+    Called right before the agent call, which takes the inference slot itself."""
     reason = db.busy_reason()
     if reason:
         raise db.Busy(reason)
@@ -152,7 +171,14 @@ def post_step_run(req: Request, project_id: int) -> Response:
     percent = _percent(data)
     _coding_project(project_id)
     _prepare_model()
-    return Response(_call(agent.execute_coding_step, project_id, percent))
+    result = _call(agent.execute_coding_step, project_id, percent)
+    # A model-call failure (not a validation failure, which has raw_output) while the
+    # engine was paused for an image/video job: requeue the step and ask to retry later.
+    if result.get("status") == "failed" and "raw_output" not in result and chat.engine_interrupted():
+        if result.get("task_id"):
+            db.retry_task(result["task_id"])
+        raise HTTPError(HTTPStatus.CONFLICT, PAUSED_MESSAGE)
+    return Response(result)
 
 
 @route("GET", r"/api/coding/projects/(\d+)/tasks/(\d+)/proposal")
