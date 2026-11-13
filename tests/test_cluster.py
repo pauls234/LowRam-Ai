@@ -6,6 +6,7 @@ import io
 import json
 import os
 import secrets
+import socket
 import stat
 import threading
 import time
@@ -15,7 +16,7 @@ from contextlib import redirect_stderr
 from unittest import mock
 
 from backend import artifacts, cluster, db, settings, worker
-from tests.cluster_helpers import ClusterTestCase, requires_openssl
+from tests.cluster_helpers import ClusterTestCase, free_udp_port, null_slot, requires_openssl, result_meta
 from tests.helpers import Gate, HttpError, LowRAMTestCase, Text, closed_port_url, wait_until
 
 FP = bytes(range(32))
@@ -48,12 +49,14 @@ class PairingCodeTests(unittest.TestCase):
         sig = cluster.sign(b"k" * 32, "post", "/x", "1", "n" * 16, b"{}")
         self.assertEqual(sig, cluster.sign(b"k" * 32, "POST", "/x", "1", "n" * 16, b"{}"))
         self.assertNotEqual(sig, cluster.sign(b"k" * 32, "POST", "/x", "1", "n" * 16, b"{ }"))
-        cache = cluster.NonceCache(capacity=2)
-        self.assertTrue(cache.add("a", 100, 0))
-        self.assertFalse(cache.add("a", 100, 1))  # replay
-        self.assertTrue(cache.add("b", 100, 1))
-        self.assertFalse(cache.add("c", 100, 2))  # full of live entries: refuse, never forget
-        self.assertTrue(cache.add("c", 300, 150))  # a and b expired
+        cache = cluster.NonceCache(capacity=3, per_device=2)
+        self.assertTrue(cache.add("1", "a", 100, 0))
+        self.assertFalse(cache.add("1", "a", 100, 1))  # replay
+        self.assertTrue(cache.add("1", "b", 100, 1))
+        self.assertFalse(cache.add("1", "c", 100, 2))  # device 1 used its share: refuse, never forget
+        self.assertTrue(cache.add("2", "a", 100, 2))  # … but device 2 is not locked out
+        self.assertFalse(cache.add("3", "a", 100, 2))  # whole cache full of live entries
+        self.assertTrue(cache.add("1", "c", 300, 150))  # the old ones expired
         self.assertEqual(len(cache), 1)
 
     def test_lan_addresses_skip_loopback_and_link_local(self):
@@ -254,7 +257,10 @@ class FlowTests(ClusterTestCase):
         status, data = client.call("POST", f"/cluster/v1/tasks/{task['task_id']}/result",
                                    {"content": "Answer one", "duration_s": 1.5, "model": "tiny"})
         self.assertEqual((status, data["status"]), (200, "done"))
-        meta = json.loads((artifacts.project_dir(pid) / f"task_{task['task_id']}.json").read_text())
+        done = db.get_task(task["task_id"])
+        self.assertEqual(done["attempts"], 1)  # counted when the work was reported, not on claim
+        self.assertIn(f"_device{client.device_id}_", done["result_path"])  # a file per attempt
+        meta = result_meta(done)
         self.assertEqual((meta["device"]["name"], meta["model"], meta["duration_s"]), ("pc", "tiny", 1.5))
         self.assertEqual(self.api("GET", f"/api/tasks/{task['task_id']}/result")[1]["content"].strip(), "Answer one")
 
@@ -268,7 +274,7 @@ class FlowTests(ClusterTestCase):
         task3 = self.claim(client)
         client.call("POST", f"/cluster/v1/tasks/{task3['task_id']}/fail", {"error": "worker stopped", "release": True})
         released = db.get_task(task3["task_id"])
-        self.assertEqual((released["status"], released["attempts"]), ("pending", 1))
+        self.assertEqual((released["status"], released["attempts"]), ("pending", 0))
         self.assertIn("worker stopped", released["error"])
         device = self.api("GET", "/api/cluster")[1]["devices"][0]
         self.assertEqual((device["tasks_done"], device["model"]), (1, "tiny"))
@@ -320,8 +326,7 @@ class FlowTests(ClusterTestCase):
         self.assertEqual(stat.S_IMODE(os.stat(state_file).st_mode), 0o600)
         self.wait(lambda: w.status()["tasks_done"] == 3)
         self.assertEqual(w.status()["host"], cluster.host_display_name())
-        meta = json.loads((artifacts.project_dir(pid) / f"task_{db.list_tasks(pid)[0]['id']}.json").read_text())
-        self.assertEqual(meta["device"]["name"], "helper")
+        self.assertEqual(result_meta(db.list_tasks(pid)[0])["device"]["name"], "helper")
         w.stop()
         self.assertEqual(w.status()["state"], "stopped")
         # A second run reuses the stored credentials (the one-time code is used up already).
@@ -350,10 +355,7 @@ class FlowTests(ClusterTestCase):
         gate.set()
         self.wait(lambda: db.get_project(pid)["counts"]["done"] == 6, message="tasks did not finish")
         self.assertEqual(len(self.llm.requests), 6)  # every task ran exactly once
-        endpoints = {
-            json.loads((artifacts.project_dir(pid) / f"task_{t['id']}.json").read_text())["endpoint"]
-            for t in db.list_tasks(pid)
-        }
+        endpoints = {result_meta(t)["endpoint"] for t in db.list_tasks(pid)}
         self.assertGreaterEqual(len(endpoints), 2)
 
     def test_worker_respects_low_ram_and_dead_model(self):
@@ -382,7 +384,7 @@ class FlowTests(ClusterTestCase):
         with mock.patch.object(worker.llm, "chat", side_effect=KeyboardInterrupt):
             self.assertEqual(w.run(), 0)
         task = db.list_tasks(pid)[0]
-        self.assertEqual((task["status"], task["attempts"]), ("pending", 1))
+        self.assertEqual((task["status"], task["attempts"]), ("pending", 0))
         self.assertIn("Ctrl+C", task["error"])
         self.assertEqual(w.status()["state"], "stopped")
 
@@ -561,6 +563,280 @@ class UiTests(ClusterTestCase):
         status, data = self.api("POST", "/api/cluster/leave")
         self.assertEqual((status, data["worker"]["state"]), (200, "stopped"))
         self.assertEqual(stat.S_IMODE(os.stat(worker.default_state_path()).st_mode), 0o600)
+
+
+def _send_udp(port: int, payload: bytes) -> None:
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.sendto(payload, ("127.0.0.1", port))
+
+
+class DiscoveryUnitTests(unittest.TestCase):
+    def test_beacon_roundtrip_and_validation(self):
+        raw = cluster.encode_beacon("0123456789abcdef", "Büro-PC", 8766, FP)
+        self.assertEqual(cluster.decode_beacon(raw),
+                         {"id": "0123456789abcdef", "name": "Büro-PC", "port": 8766, "fp": FP.hex()[:16]})
+        self.assertLessEqual(len(cluster.encode_beacon("0123456789abcdef", "ü" * 500, 8766, FP)), 512)
+        good = json.loads(raw)
+        for bad in ({**good, "app": "x"}, {**good, "v": 2}, {**good, "id": "XYZ"}, {**good, "fp": "00"},
+                    {**good, "port": 80}, {**good, "port": True}, {**good, "port": "8766"}):
+            self.assertIsNone(cluster.decode_beacon(json.dumps(bad).encode()), bad)
+        for junk in (b"", b"\xff\xfe", b"[1]", b"{" * 600, json.dumps({**good, "name": "x" * 600}).encode()):
+            self.assertIsNone(cluster.decode_beacon(junk))
+        self.assertEqual(cluster.decode_beacon(json.dumps({**good, "name": "\x1b[31mevil\n"}).encode())["name"],
+                         "[31mevil")
+
+    def test_listener_collects_ignores_and_expires(self):
+        port = free_udp_port()
+        listener = cluster.DiscoveryListener(port, "127.0.0.1", own_id="aaaaaaaaaaaaaaaa")
+        self.assertTrue(listener.start())
+        self.addCleanup(listener.stop)
+        _send_udp(port, b"garbage")
+        _send_udp(port, cluster.encode_beacon("aaaaaaaaaaaaaaaa", "me", 8766, FP))  # own beacon
+        time.sleep(0.25)
+        _send_udp(port, cluster.encode_beacon("bbbbbbbbbbbbbbbb", "Laptop", 9000, FP))
+        self.assertTrue(wait_until(lambda: listener.hosts(), 5))
+        [host] = listener.hosts()
+        self.assertEqual((host["id"], host["name"], host["port"], host["addresses"], host["fingerprint_short"]),
+                         ("bbbbbbbbbbbbbbbb", "Laptop", 9000, ["127.0.0.1"], FP.hex()[:16]))
+        self.assertFalse(listener.handle(cluster.encode_beacon("cccccccccccccccc", "x", 9000, FP), "127.0.0.1"))
+        with mock.patch.object(cluster, "_now", return_value=time.time() + cluster.NEARBY_TTL_S + 1):
+            self.assertEqual(listener.hosts(), [])
+
+    def test_listener_never_raises_when_it_cannot_bind(self):
+        listener = cluster.DiscoveryListener(free_udp_port(), "203.0.113.1")  # not a local address
+        self.assertFalse(listener.start())
+        self.assertIn("Cannot listen", listener.error)
+        self.assertEqual(listener.hosts(), [])
+
+    def test_verification_code_binds_the_certificate(self):
+        nonce_c, nonce_h = secrets.token_bytes(16), secrets.token_bytes(16)
+        code = cluster.verification_code(FP, nonce_c, nonce_h)
+        self.assertRegex(code, r"^\d{3} \d{3}$")
+        self.assertEqual(code, cluster.verification_code(FP, nonce_c, nonce_h))
+        self.assertNotEqual(code, cluster.verification_code(bytes(32), nonce_c, nonce_h))  # MITM certificate
+
+    def test_worker_clamps_max_tokens_to_its_own_plan(self):
+        plan = namedtuple("Plan", "max_tokens")(400)
+        self.assertEqual(worker.effective_max_tokens({"max_tokens": 2048}, plan), 400)
+        self.assertEqual(worker.effective_max_tokens({"max_tokens": 300}, plan), 300)
+        self.assertEqual(worker.effective_max_tokens({"max_tokens": "x"}, plan), 400)
+
+
+class EasyPairingTests(ClusterTestCase):
+    def setUp(self):
+        super().setUp()
+        self.enable()
+        self.assertTrue(wait_until(lambda: self.nearby(), 5), "beacon not received")
+
+    def nearby(self):
+        status, data = self.api("GET", "/api/cluster/nearby")
+        self.assertEqual(status, 200)
+        return data["hosts"]
+
+    def raw_client(self, full_pin=True):
+        fp = cluster.certificate_fingerprint()
+        return worker.HostClient(["127.0.0.1"], cluster.listening_port(), fp if full_pin else fp[:8])
+
+    def pair_request(self, client, nonce, ip_name="x"):
+        commit = cluster._b64url(cluster.hashlib.sha256(nonce).digest())
+        return client.call("POST", "/cluster/v1/pair-request", {"name": ip_name, "client_commit": commit}, signed=False)
+
+    def poll(self, client, rid, nonce):
+        return client.call("POST", "/cluster/v1/pair-status",
+                           {"request_id": rid, "client_nonce": cluster._b64url(nonce)}, signed=False)
+
+    def test_nearby_shows_the_beacon(self):
+        [host] = self.nearby()
+        self.assertEqual(host["id"], cluster.host_id())
+        self.assertEqual(host["port"], cluster.listening_port())
+        self.assertEqual(host["fingerprint_short"], cluster.certificate_fingerprint().hex()[:16])
+        self.assertEqual(host["addresses"], ["127.0.0.1"])
+
+    def test_join_request_approve_then_work(self):
+        pid = self.new_project(1)
+        cluster.distribute(pid, 40, merge=False)
+        host_id = self.nearby()[0]["id"]
+        self.assertEqual(self.api("POST", "/api/cluster/join", {"host_id": "ffffffffffffffff"})[0], 404)
+        status, data = self.api("POST", "/api/cluster/join", {"host_id": host_id, "name": "Helper"})
+        self.assertEqual(status, 202, data)
+        self.wait(lambda: self.api("GET", "/api/cluster")[1]["worker"]["state"] == "awaiting_approval")
+
+        def shown():
+            reqs = self.api("GET", "/api/cluster")[1]["requests"]
+            return reqs and reqs[0]["verification_code"]
+
+        self.wait(shown)
+        cluster_state = self.api("GET", "/api/cluster")[1]
+        [req] = cluster_state["requests"]
+        self.assertEqual(req["verification_code"], cluster_state["worker"]["verification_code"])  # same number
+        self.assertEqual((req["name"], req["address"]), ("Helper", "127.0.0.1"))
+        self.assertEqual(self.api("POST", f"/api/cluster/requests/{req['id']}/approve")[1], {"approved": True})
+        self.wait(lambda: db.get_project(pid)["counts"]["done"] == 1, message="paired helper did not work")
+        state = self.api("GET", "/api/cluster")[1]
+        self.assertEqual([d["name"] for d in state["devices"]], ["Helper"])
+        self.assertEqual(state["requests"], [])
+        creds = worker.load_credentials(worker.default_state_path())
+        self.assertEqual(bytes.fromhex(creds["fingerprint"]), cluster.certificate_fingerprint())
+        self.assertEqual(self.api("POST", f"/api/cluster/requests/{req['id']}/approve")[0], 404)
+
+    def test_deny(self):
+        status, _ = self.api("POST", "/api/cluster/join", {"host_id": self.nearby()[0]["id"]})
+        self.assertEqual(status, 202)
+        self.wait(lambda: (self.api("GET", "/api/cluster")[1]["requests"] or [{}])[0].get("verification_code"))
+        rid = self.api("GET", "/api/cluster")[1]["requests"][0]["id"]
+        self.assertEqual(self.api("POST", f"/api/cluster/requests/{rid}/deny")[1], {"denied": True})
+        self.wait(lambda: "declined" in (self.api("GET", "/api/cluster")[1]["worker"]["error"] or ""))
+        self.assertEqual(self.api("GET", "/api/cluster")[1]["devices"], [])
+
+    def test_key_only_once_and_only_for_the_nonce_owner(self):
+        client = self.raw_client(full_pin=False)
+        nonce, other = secrets.token_bytes(16), secrets.token_bytes(16)
+        status, data = self.pair_request(client, nonce)
+        self.assertEqual(status, 200, data)
+        rid = data["request_id"]
+        self.assertEqual(self.poll(client, rid, other)[0], 404)
+        rid_status = self.poll(client, rid, nonce)
+        self.assertEqual(rid_status, (200, {"state": "pending"}))
+        self.assertEqual(self.api("POST", f"/api/cluster/requests/{rid}/approve")[0], 200)
+        self.assertEqual(self.poll(client, rid, other)[0], 404)  # a stranger cannot collect the key
+        status, data = self.poll(client, rid, nonce)
+        self.assertEqual(data["state"], "approved")
+        self.assertEqual(len(base64.b64decode(data["device_key"])), 32)
+        status, again = self.poll(client, rid, nonce)
+        self.assertNotIn("device_key", again)  # handed out exactly once
+        self.assertEqual(again["device_id"], data["device_id"])
+
+    def test_numbers_differ_for_another_certificate(self):
+        client = self.raw_client(full_pin=False)
+        nonce = secrets.token_bytes(16)
+        status, data = self.pair_request(client, nonce)
+        rid = data["request_id"]
+        self.assertEqual(self.api("POST", f"/api/cluster/requests/{rid}/approve")[0], 409)  # nonce not revealed
+        self.poll(client, rid, nonce)
+        shown = self.api("GET", "/api/cluster")[1]["requests"][0]["verification_code"]
+        host_nonce = cluster._from_b64url(data["host_nonce"], 16)
+        self.assertEqual(shown, cluster.verification_code(client.peer_fingerprint, nonce, host_nonce))
+        self.assertNotEqual(shown, cluster.verification_code(bytes(32), nonce, host_nonce))
+
+    def test_expiry_limits_and_hidden_mode(self):
+        client = self.raw_client(full_pin=False)
+        nonce = secrets.token_bytes(16)
+        rid = self.pair_request(client, nonce)[1]["request_id"]
+        status, data = self.pair_request(client, secrets.token_bytes(16))
+        self.assertEqual(status, 429)  # rate limit per address
+        later = time.time() + cluster.REQUEST_TTL_S + 1
+        with mock.patch.object(cluster, "_now", return_value=later):
+            self.assertEqual(self.poll(client, rid, nonce)[1], {"state": "expired"})
+            self.assertEqual(self.api("GET", "/api/cluster")[1]["requests"], [])
+            self.assertEqual(self.api("POST", f"/api/cluster/requests/{rid}/approve")[0], 404)
+        commit = cluster._b64url(cluster.hashlib.sha256(b"n" * 16).digest())
+        for i in range(cluster.MAX_PENDING_REQUESTS - 1):
+            cluster._pair_request({"name": f"d{i}", "client_commit": commit}, f"10.0.0.{i + 1}")
+        cluster._pair_request({"name": "last", "client_commit": commit}, "10.0.0.50")
+        with self.assertRaises(cluster.HTTPError) as ctx:
+            cluster._pair_request({"name": "too many", "client_commit": commit}, "10.0.0.99")
+        self.assertEqual(ctx.exception.status, 429)
+        settings.update("cluster", {"discoverable": False})
+        with mock.patch.object(cluster, "REQUEST_MIN_INTERVAL_S", 0):
+            status, data = self.pair_request(self.raw_client(False), nonce)
+        self.assertEqual(status, 403)
+        self.assertIn("pairing code", data["error"])
+
+
+class HardeningTests(ClusterTestCase):
+    def setUp(self):
+        super().setUp()
+        self.enable()
+
+    def tls_socket(self):
+        raw = socket.create_connection(("127.0.0.1", cluster.listening_port()), timeout=5)
+        return worker._client_context().wrap_socket(raw)
+
+    def test_claim_cycles_do_not_burn_attempts_and_are_rate_limited(self):
+        client = self.paired_client("greedy")
+        pid = self.new_project(1)
+        cluster.distribute(pid, 40, merge=False)
+        for _ in range(5):  # claim → (re-)claim releases the held task without counting an attempt
+            self.assertIsNotNone(client.call("POST", "/cluster/v1/claim", {})[1]["task"])
+        task = db.list_tasks(pid)[0]
+        self.assertEqual((task["status"], task["attempts"]), ("running", 0))
+        with mock.patch.object(cluster, "CLAIM_MIN_INTERVAL_S", 5.0):
+            client.call("POST", "/cluster/v1/claim", {})
+            status, data = client.call("POST", "/cluster/v1/claim", {})
+        self.assertEqual(status, 429)
+        self.assertGreater(data["retry_after"], 0)
+
+    def test_slow_request_is_cut_off(self):
+        with mock.patch.object(cluster, "REQUEST_DEADLINE_S", 0.5):
+            sock = self.tls_socket()
+            self.addCleanup(sock.close)
+            for ch in b"POST /cluster/v1/heartbeat HTTP/1.1\r\n":  # one byte every 50 ms (each read is "fast")
+                try:
+                    sock.sendall(bytes([ch]))
+                except OSError:
+                    break
+                time.sleep(0.05)
+            sock.settimeout(3)
+            try:
+                data = sock.recv(100)
+            except socket.timeout:
+                self.fail("the server kept the trickling connection open")
+            except OSError:
+                data = b""
+            self.assertEqual(data, b"")
+
+    def test_connections_per_address_are_capped(self):
+        with mock.patch.object(cluster, "MAX_CONNECTIONS_PER_IP", 2):
+            held = [self.tls_socket(), self.tls_socket()]
+            with self.assertRaises(OSError):
+                extra = self.tls_socket()
+                extra.settimeout(3)
+                if not extra.recv(1):
+                    raise ConnectionResetError("closed")
+            for sock in held:
+                sock.close()
+            self.wait(lambda: self.lan_request("POST", "/cluster/v1/heartbeat")[0] == 401)
+
+    def test_worker_reconnects_after_the_host_comes_back(self):
+        w = self.make_worker(self.new_code(), "roamer")
+        self.start_worker(w)
+        self.wait(lambda: w.status()["device_id"] is not None and w.status()["state"] == "idle")
+        self.api("POST", "/api/cluster/disable")
+        self.wait(lambda: "turned off there" in (w.status()["error"] or ""), message="no clear 'host off' message")
+        self.assertEqual(w.status()["state"], "error")
+        self.enable()
+        self.wait(lambda: w.status()["state"] == "idle" and w.status()["error"] is None, message="did not reconnect")
+        self.wait(lambda: self.api("GET", "/api/cluster")[1]["devices"][0]["status"] == "online")
+
+    def test_worker_hands_back_when_busy_and_waits_for_a_model(self):
+        pid = self.new_project(1)
+        cluster.distribute(pid, 40, merge=False)
+
+        def busy_slot(label):
+            raise db.Busy("Busy: an image is being generated")
+
+        w = self.make_worker(self.new_code(), "busy", slot=busy_slot)
+        self.start_worker(w)
+        self.wait(lambda: "Handed task" in (w.status()["message"] or ""))
+        w.stop()
+        task = db.list_tasks(pid)[0]
+        self.assertEqual((task["status"], task["attempts"]), ("pending", 0))
+        self.assertEqual(self.llm.requests, [])
+
+        calls = []
+
+        def flaky_engine(timeout=None):
+            calls.append(timeout)
+            if len(calls) < 3:
+                raise RuntimeError("No chat model is installed")
+            return self.llm.url
+
+        with mock.patch.object(cluster, "local_llm_url", side_effect=flaky_engine):
+            w2 = self.make_worker(self.new_code(), "patient", slot=null_slot)
+            self.start_worker(w2)
+            self.wait(lambda: w2.status()["message"] == "Waiting for a local model…" or len(calls) >= 3)
+            self.wait(lambda: db.get_project(pid)["counts"]["done"] == 1, message="worker gave up on the engine")
+        self.assertGreaterEqual(len(calls), 3)
 
 
 if __name__ == "__main__":
