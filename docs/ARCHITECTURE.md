@@ -104,6 +104,29 @@ EngineServer = {state: "stopped"|"starting"|"ready"|"error", model_id: str|null,
 * `POST /api/engine/start {model_id?}` → 202 `{server}`; `POST /api/engine/stop {}` → `{server}`
 * `GET /api/downloads` → `{downloads: [Download]}`; `POST /api/downloads/<id>/cancel {}` → `{download}` (download ids are strings)
 
+**Own models (v0.3.1).** `CatalogModel` gains `source: "catalog"|"custom"|"local"`,
+`path: str|null`, `available: bool` (file present – false when the external
+drive is unplugged), `fits_ram: bool`.
+
+* `POST /api/engine/custom/resolve {source}` – `source` is `owner/repo`, a
+  Hugging Face repo URL or a direct `…/resolve/<rev>/<file>.gguf` URL →
+  `{repo, revision, files: [{filename, size_bytes, quant, fits_ram, recommended}]}`
+  (GGUF files only, split `-00001-of-0000N` files grouped as one entry).
+* `POST /api/engine/custom/install {repo, filename, name?, purpose?}` → 202 `{download, model_id}`
+  (size + SHA-256 from the Hugging Face API; unverified downloads refused).
+* `POST /api/engine/custom/import {path, name?, purpose?}` → 201 `{model}` – registers an
+  existing local `.gguf` (e.g. on an external drive) without copying it.
+  Deleting an imported model only unregisters it; the file is never removed.
+* `GET /api/engine/storage` → `{models_dir, default_dir, custom: bool, available: bool,
+  writable: bool, free_bytes, total_bytes, moving: {state, bytes_done, bytes_total, error}|null}`
+* `POST /api/engine/storage {models_dir: str|null, move_existing: bool}` → 202 `{storage}` –
+  `null` resets to the default folder. The folder must be absolute, exist, be
+  writable and not be a system location. Moving runs in the background (copy,
+  verify size, then delete the source); the engine must be stopped meanwhile.
+* `config.models_dir()` resolves `LOWRAM_MODELS_DIR` > `settings.engine.models_dir` >
+  `<home>/models` and never creates a custom folder. Downloads may write below
+  `LOWRAM_HOME` **or** below `config.models_dir()`.
+
 Python API for other modules:
 `engine.status()`, `engine.ensure_running(timeout=...) -> str` (LLM url, raises `engine.EngineError`),
 `engine.stop()`, `engine.pause_for_heavy_job()` (context manager: stop the managed

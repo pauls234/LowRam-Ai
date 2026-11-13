@@ -24,6 +24,7 @@ DEFAULTS: dict[str, Any] = {
         "code_model_id": None,  # optional separate model for the Code mode
         "port": None,  # None = pick a free port
         "ctx_size": None,  # None = derive from the RAM budget
+        "models_dir": None,  # None = <home>/models; or an absolute folder, e.g. on an external SSD
     },
     "media": {
         "image_model_id": None,

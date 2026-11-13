@@ -78,8 +78,29 @@ def llm_url() -> str:
     return os.environ.get("LOWRAM_LLM_URL", "").strip() or _runtime_llm_url or DEFAULT_LLM_URL
 
 
-def models_dir() -> Path:
+def default_models_dir() -> Path:
     return _ensure_dir(home_dir() / "models")
+
+
+def models_dir() -> Path:
+    """Where models live: ``LOWRAM_MODELS_DIR`` > ``settings.engine.models_dir`` > ``<home>/models``.
+
+    A custom folder (e.g. on an external SSD) is NOT created automatically: if
+    the drive is unplugged the path simply does not exist and callers must
+    report "drive not connected" instead of silently writing to the boot disk.
+    """
+    env = os.environ.get("LOWRAM_MODELS_DIR", "").strip()
+    if env:
+        return Path(env).expanduser()
+    try:
+        from . import settings  # lazy: settings imports this module
+
+        custom = settings.get("engine", "models_dir")
+    except Exception:  # settings unreadable → fall back to the default folder
+        custom = None
+    if isinstance(custom, str) and custom.strip():
+        return Path(custom).expanduser()
+    return default_models_dir()
 
 
 def bin_dir() -> Path:
