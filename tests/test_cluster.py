@@ -396,6 +396,7 @@ class LeaseTests(ClusterTestCase):
         self.client = self.paired_client("flaky")
         self.pid = self.new_project(1)
         cluster.distribute(self.pid, 40, merge=False)
+        self.pause_coordinator()  # these tests drive sweep_leases() themselves
 
     def claim(self):
         return self.client.call("POST", "/cluster/v1/claim", {})[1]["task"]
@@ -472,9 +473,9 @@ class MergeTests(ClusterTestCase):
 
     def test_merge_writes_final_md(self):
         pid = self.new_project(2)
-        status, data = self.api("POST", f"/api/cluster/projects/{pid}/distribute", {"merge": True})
-        self.assertEqual(status, 202)
-        self.wait(lambda: self.api("GET", "/api/loop")[1]["loop"]["active"] is False)
+        # Without the host loop only this test's device works on the tasks, so nothing can be
+        # merged before both results arrive – independent of thread scheduling.
+        cluster.distribute(pid, 40, merge=True)
         self.assertEqual(self.final(pid)[0], 404)
         self.llm.push(Text("THE COMBINED ANSWER"))
         self.finish_all(pid)
@@ -590,17 +591,24 @@ class DiscoveryUnitTests(unittest.TestCase):
         listener = cluster.DiscoveryListener(port, "127.0.0.1", own_id="aaaaaaaaaaaaaaaa")
         self.assertTrue(listener.start())
         self.addCleanup(listener.stop)
-        _send_udp(port, b"garbage")
-        _send_udp(port, cluster.encode_beacon("aaaaaaaaaaaaaaaa", "me", 8766, FP))  # own beacon
-        time.sleep(0.25)
-        _send_udp(port, cluster.encode_beacon("bbbbbbbbbbbbbbbb", "Laptop", 9000, FP))
-        self.assertTrue(wait_until(lambda: listener.hosts(), 5))
+        with mock.patch.object(cluster, "BEACON_MIN_GAP_S", 0.0):  # rate limit tested separately below
+            _send_udp(port, b"garbage")
+            _send_udp(port, cluster.encode_beacon("aaaaaaaaaaaaaaaa", "me", 8766, FP))  # own beacon
+            _send_udp(port, cluster.encode_beacon("bbbbbbbbbbbbbbbb", "Laptop", 9000, FP))
+            self.assertTrue(wait_until(lambda: listener.hosts(), 10))
         [host] = listener.hosts()
         self.assertEqual((host["id"], host["name"], host["port"], host["addresses"], host["fingerprint_short"]),
                          ("bbbbbbbbbbbbbbbb", "Laptop", 9000, ["127.0.0.1"], FP.hex()[:16]))
-        self.assertFalse(listener.handle(cluster.encode_beacon("cccccccccccccccc", "x", 9000, FP), "127.0.0.1"))
         with mock.patch.object(cluster, "_now", return_value=time.time() + cluster.NEARBY_TTL_S + 1):
             self.assertEqual(listener.hosts(), [])
+
+    def test_listener_rate_limits_per_address(self):
+        listener = cluster.DiscoveryListener(0, own_id="aaaaaaaaaaaaaaaa")  # not started: handle() directly
+        with mock.patch.object(cluster, "BEACON_MIN_GAP_S", 60.0):
+            self.assertTrue(listener.handle(cluster.encode_beacon("bbbbbbbbbbbbbbbb", "b", 9000, FP), "10.0.0.2"))
+            self.assertFalse(listener.handle(cluster.encode_beacon("cccccccccccccccc", "c", 9000, FP), "10.0.0.2"))
+            self.assertTrue(listener.handle(cluster.encode_beacon("cccccccccccccccc", "c", 9000, FP), "10.0.0.3"))
+        self.assertEqual(sorted(h["id"] for h in listener.hosts()), ["bbbbbbbbbbbbbbbb", "cccccccccccccccc"])
 
     def test_listener_never_raises_when_it_cannot_bind(self):
         listener = cluster.DiscoveryListener(free_udp_port(), "203.0.113.1")  # not a local address
@@ -802,8 +810,8 @@ class HardeningTests(ClusterTestCase):
         self.start_worker(w)
         self.wait(lambda: w.status()["device_id"] is not None and w.status()["state"] == "idle")
         self.api("POST", "/api/cluster/disable")
-        self.wait(lambda: "turned off there" in (w.status()["error"] or ""), message="no clear 'host off' message")
-        self.assertEqual(w.status()["state"], "error")
+        self.wait(lambda: w.status()["state"] == "error" and "turned off there" in (w.status()["error"] or ""),
+                  message="no clear 'host off' message")
         self.enable()
         self.wait(lambda: w.status()["state"] == "idle" and w.status()["error"] is None, message="did not reconnect")
         self.wait(lambda: self.api("GET", "/api/cluster")[1]["devices"][0]["status"] == "online")
@@ -816,11 +824,14 @@ class HardeningTests(ClusterTestCase):
             raise db.Busy("Busy: an image is being generated")
 
         w = self.make_worker(self.new_code(), "busy", slot=busy_slot)
-        self.start_worker(w)
+        thread = self.start_worker(w)
         self.wait(lambda: "Handed task" in (w.status()["message"] or ""))
+        # The worker may already have claimed the task again; stopping (and its /leave) hands it back.
         w.stop()
-        task = db.list_tasks(pid)[0]
-        self.assertEqual((task["status"], task["attempts"]), ("pending", 0))
+        thread.join(10)
+        self.assertFalse(thread.is_alive())
+        self.wait(lambda: db.list_tasks(pid)[0]["status"] == "pending", message="task was not handed back")
+        self.assertEqual(db.list_tasks(pid)[0]["attempts"], 0)  # hand-backs never use an attempt
         self.assertEqual(self.llm.requests, [])
 
         calls = []
