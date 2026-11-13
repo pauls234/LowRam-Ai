@@ -174,6 +174,23 @@ Device = {id, name, status: "online"|"offline"|"busy", platform, ram_total_bytes
 * `GET /api/cluster/projects/<id>/final` → `{content, path}` (404 until merged)
 * `POST /api/cluster/join {code, name?, percent?}` → 202 `{worker}`; `POST /api/cluster/leave {}` → `{worker}`
 * `GET /api/cluster` additionally returns `worker: {state: "idle"|"pairing"|"working"|"error"|"stopped", host, device_id, tasks_done, current_task: {id, title, project_id}|null, error, message}|null`, `projects: [{project_id, name, percent, merge, merge_state: "off"|"waiting"|"running"|"done"|"failed", merge_error, final_available, counts, total}]`, `pairing_error`, `host_name`
+**Easy pairing (v0.3.1) – like Bluetooth.** While Devices is enabled and
+`cluster.discoverable` is true, the host announces itself on the LAN (UDP
+beacon, see `cluster.py`). Any LowRAM AI (even with Devices off) listens and
+lists nearby hosts. Joining sends a pairing *request*; both screens show the
+same 6-digit verification number derived from the host certificate
+fingerprint and both nonces; the host user clicks Allow. A man-in-the-middle
+would have a different certificate and therefore a different number.
+
+* `GET /api/cluster/nearby` → `{hosts: [{id, name, addresses: [str], port, fingerprint_short, last_seen}]}`
+* `POST /api/cluster/join {host_id, name?, percent?}` (discovered host) or `{code, name?, percent?}`
+  (manual code, unchanged) → 202 `{worker}`; `worker.state` may be `"awaiting_approval"` with
+  `worker.verification_code` ("123 456") to show on the helper.
+* Host: `GET /api/cluster` adds `requests: [{id, name, platform, ram_total_bytes, address,
+  verification_code, expires_at}]`; `POST /api/cluster/requests/<id>/approve {}` / `…/deny {}`.
+  Requests expire after 2 minutes, at most 3 pending, rate-limited per address.
+* Desktop window: `window.pywebview.api.pick_folder(title)` → absolute path or `null`
+  (only inside the app window; the browser UI falls back to a text field).
 * LAN API (`/cluster/v1/pair|heartbeat|claim|leave`, `/cluster/v1/tasks/<id>/result|fail`): see the `backend/cluster.py` docstring. Device leases are requeued after 90 s without a heartbeat (max 3 attempts) – the only automatic retry in LowRAM AI.
 * LAN API (`scope="cluster"`, served only by the TLS device server): designed by the devices owner, all requests HMAC-signed except the one-time pairing call.
 

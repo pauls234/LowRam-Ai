@@ -34,6 +34,7 @@ DEFAULTS: dict[str, Any] = {
         "enabled": False,  # accept helper devices on the local network
         "port": 8766,
         "device_name": None,
+        "discoverable": True,  # announce this host on the LAN so helpers can find it without a code
     },
     "ui": {"theme": "system"},
 }
