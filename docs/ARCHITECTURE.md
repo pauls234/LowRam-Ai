@@ -224,6 +224,24 @@ would have a different certificate and therefore a different number.
 * LAN API (`/cluster/v1/pair|heartbeat|claim|leave`, `/cluster/v1/tasks/<id>/result|fail`): see the `backend/cluster.py` docstring. Device leases are requeued after 90 s without a heartbeat (max 3 attempts) – the only automatic retry in LowRAM AI.
 * LAN API (`scope="cluster"`, served only by the TLS device server): designed by the devices owner, all requests HMAC-signed except the one-time pairing call.
 
+### Smart features (v0.3.2)
+
+**Chat (`chat.py`)**
+* Custom instructions: `settings.chat.instructions` (≤ 4000 chars, set via `POST /api/settings {section:"chat"}`) are appended to the system prompt of every conversation.
+* Attachments: `POST /api/chats/<id>/messages {content, percent?, attachments?: [{name, content}]}` – text files only (≤ 5 files, ≤ 200 KB each, UTF-8, no NUL); stored with the user message (`Message.attachments: [{name, chars}]`) and put into the prompt within the context budget (truncated with a visible note).
+* Message stats: `Message.tokens`, `Message.tokens_per_s`, `Message.finish_reason` (`"stop"|"length"|null`); `truncated: true` when the answer hit `max_tokens`.
+* `POST /api/chats/<id>/continue {percent?}` – SSE stream that appends to the last assistant message (only when it is `truncated`).
+* `POST /api/chats/<id>/regenerate {percent?}` – SSE stream that replaces the last assistant answer.
+* `GET /api/chats?q=text` – search titles and message contents (case-insensitive).
+* `GET /api/chats/<id>/export` – Markdown download (`FileResponse`, `text/markdown`).
+
+**Power (`power.py`, MacBook-friendly long jobs)**
+* `power.keep_awake(reason)` – context manager; macOS: `caffeinate -i -w <pid>` while any long job runs (reference-counted), Windows: `SetThreadExecutionState`, Linux: best effort; respects `settings.power.keep_awake`.
+* `power.battery()` → `{available, percent, plugged}`; `power.battery_block_reason()` → text when on battery below `settings.power.battery_min_percent`, else `None`.
+* `power.notify(title, body)` – system notification (macOS via `osascript` with arguments, never string-built scripts), respects `settings.power.notifications`; never raises.
+* `GET /api/power` → `{battery, keep_awake: {enabled, active: [reasons]}, settings}`.
+* Integration: task loop (stop reason `"on_battery"`, notification when finished), media jobs (wait while on low battery, notification when done), device worker (no claims on low battery), cluster host (notification on pairing request and when a merged result is ready).
+
 ### Desktop (`desktop/launcher.py`)
 
 `main(argv) -> int`: pick a port (prefer 8765), `app.start_background(port)`,

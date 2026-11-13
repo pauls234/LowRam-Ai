@@ -38,6 +38,14 @@ DEFAULTS: dict[str, Any] = {
         "discoverable": True,  # announce this host on the LAN so helpers can find it without a code
     },
     "ui": {"theme": "system"},
+    "chat": {
+        "instructions": "",  # custom instructions added to every conversation (max 4000 chars)
+    },
+    "power": {
+        "keep_awake": True,  # keep the Mac awake while long jobs run (caffeinate)
+        "battery_min_percent": 20,  # on battery below this, long jobs pause (0 = never pause)
+        "notifications": True,  # system notifications when long jobs finish / devices ask to pair
+    },
 }
 
 _lock = threading.RLock()  # re-entrant: update() holds it across load() + write
