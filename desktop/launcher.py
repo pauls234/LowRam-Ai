@@ -18,16 +18,21 @@ from __future__ import annotations
 import argparse
 import atexit
 import base64
+import contextlib
 import errno
+import hashlib
+import hmac
 import http.client
 import json
 import logging
 import logging.handlers
 import os
 import re
+import secrets
 import signal
 import socket
 import ssl
+import stat
 import subprocess
 import sys
 import threading
@@ -56,6 +61,9 @@ WINDOW_BACKGROUND = "#f5f5f4"
 LOG_FILE_BYTES = 1024 * 1024
 LOG_BACKUPS = 5
 EXIT_OK, EXIT_FAILED, EXIT_USAGE = 0, 1, 2
+INSTANCE_FILE = "instance.json"
+_TOKEN_META = re.compile(r'<meta\s+name="lowram-token"\s+content="([^"<>]{8,512})"')
+_FILE_PATTERN = re.compile(r"\*\.[A-Za-z0-9]{1,16}")
 # Windows reports "port in use" / "access denied" for bind() with these codes.
 _WIN_BIND_ERRORS = (10013, 10048)
 
@@ -219,12 +227,114 @@ def probe_instance(port: int, timeout: float = PROBE_TIMEOUT_S) -> dict | None:
     return None
 
 
-def find_running_instance(ports: Sequence[int]) -> int | None:
-    """Port of a LowRAM AI that already runs on one of ``ports`` (only busy ports are probed)."""
-    for port in ports:
-        if not port_is_free(port) and probe_instance(port) is not None:
-            return port
-    return None
+def _token_digest(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _process_start_time(pid: int) -> float | None:
+    import psutil
+
+    try:
+        return psutil.Process(pid).create_time()
+    except (psutil.Error, ValueError, OverflowError):
+        return None
+
+
+def write_instance_file(home: Path, port: int, token: str) -> tuple[Path, str]:
+    """Record this process as the running instance: ``<home>/instance.json``, 0600, atomic.
+
+    Stores the SHA-256 of the server's per-process page token (never the token).
+    Returns the path and a random nonce that marks the file as ours.
+    """
+    path = home / INSTANCE_FILE
+    nonce = secrets.token_hex(16)
+    data = {
+        "port": port, "pid": os.getpid(), "create_time": _process_start_time(os.getpid()),
+        "token_sha256": _token_digest(token), "nonce": nonce,
+    }
+    tmp = home / f".{INSTANCE_FILE}.{nonce}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+    return path, nonce
+
+
+def remove_instance_file(path: Path, nonce: str) -> None:
+    """Delete the instance file if it is still ours (a newer instance may have replaced it)."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    if isinstance(data, dict) and data.get("nonce") == nonce:
+        with contextlib.suppress(OSError):
+            path.unlink()
+
+
+def _read_page_token(port: int) -> str | None:
+    conn = http.client.HTTPConnection(LOOPBACK, port, timeout=PROBE_TIMEOUT_S)
+    try:
+        conn.request("GET", "/", headers={"Connection": "close"})
+        resp = conn.getresponse()
+        body = resp.read(2 * 1024 * 1024)
+        if resp.status != 200:
+            return None
+    except (OSError, http.client.HTTPException):
+        return None
+    finally:
+        conn.close()
+    match = _TOKEN_META.search(body.decode("utf-8", "replace"))
+    return match.group(1) if match else None
+
+
+def find_verified_instance(home: Path) -> int | None:
+    """Port of *this user's* running LowRAM AI (proven by ``<home>/instance.json``), else None.
+
+    Anything else answering on 127.0.0.1 - another user's LowRAM AI, an old
+    process, an impostor - is never opened in our window (it would share the
+    window's storage). Reused only if the file is a regular file owned by this
+    user and not writable by others, its process is alive with the recorded
+    start time, and the server on the recorded port serves the page token
+    whose SHA-256 the file holds.
+    """
+    path = home / INSTANCE_FILE
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        log.warning("Cannot read %s: %s", path, exc)
+        return None
+    if not stat.S_ISREG(info.st_mode):  # lstat: a symlink is not a regular file
+        log.warning("Ignoring %s: not a regular file", path)
+        return None
+    if hasattr(os, "getuid") and (info.st_uid != os.getuid() or info.st_mode & 0o022):
+        log.warning("Ignoring %s: not owned by this user or writable by others", path)
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        port, pid, started, digest = data["port"], data["pid"], data["create_time"], data["token_sha256"]
+    except (OSError, ValueError, KeyError, TypeError):
+        log.warning("Ignoring unreadable %s", path)
+        return None
+    if not (isinstance(port, int) and 1024 <= port <= 65535 and isinstance(pid, int) and pid > 0
+            and isinstance(started, (int, float)) and isinstance(digest, str)):
+        log.warning("Ignoring malformed %s", path)
+        return None
+    actual = _process_start_time(pid)
+    if actual is None or abs(actual - started) > 1.0:
+        log.info("The previous LowRAM AI (pid %s) is no longer running", pid)
+        return None
+    token = _read_page_token(port) if probe_instance(port) is not None else None
+    if token is None or not hmac.compare_digest(_token_digest(token), digest):
+        log.warning("The server on port %s could not prove it is this LowRAM AI; not reusing it", port)
+        return None
+    return port
 
 
 def wait_until_ready(port: int, timeout: float = READY_TIMEOUT_S) -> dict:
@@ -273,6 +383,7 @@ class Backend:
         self._app = app_module
         self._lock = threading.Lock()
         self._stopped = False
+        self.instance: tuple[Path, str] | None = None  # (instance.json, nonce) while we own it
 
     @property
     def url(self) -> str:
@@ -296,10 +407,13 @@ class Backend:
             log.exception("Clean shutdown failed")
         else:
             log.info("LowRAM AI stopped")
+        finally:
+            if self.instance is not None:
+                remove_instance_file(*self.instance)
 
 
-def start_or_reuse(ports: Sequence[int], ready_timeout: float = READY_TIMEOUT_S) -> Backend:
-    existing = find_running_instance(ports)
+def start_or_reuse(ports: Sequence[int], home: Path, ready_timeout: float = READY_TIMEOUT_S) -> Backend:
+    existing = find_verified_instance(home)
     if existing is not None:
         log.info("LowRAM AI already runs on port %s; opening it instead of starting a second server", existing)
         os.environ["LOWRAM_PORT"] = str(existing)
@@ -318,6 +432,10 @@ def start_or_reuse(ports: Sequence[int], ready_timeout: float = READY_TIMEOUT_S)
     except BaseException:
         backend.stop()
         raise
+    try:
+        backend.instance = write_instance_file(home, backend.port, server.csrf_token)
+    except OSError as exc:  # single-instance detection only; not fatal
+        log.warning("Could not write %s: %s", home / INSTANCE_FILE, exc)
     log.info("LowRAM AI %s is running at %s", __version__, backend.url)
     return backend
 
@@ -325,8 +443,9 @@ def start_or_reuse(ports: Sequence[int], ready_timeout: float = READY_TIMEOUT_S)
 class Starter:
     """Starts (or finds) the backend exactly once; safe to call from the window thread."""
 
-    def __init__(self, ports: Sequence[int], ready_timeout: float = READY_TIMEOUT_S):
+    def __init__(self, ports: Sequence[int], home: Path, ready_timeout: float = READY_TIMEOUT_S):
         self.ports = list(ports)
+        self.home = home
         self.ready_timeout = ready_timeout
         self.backend: Backend | None = None
         self.error: str | None = None
@@ -340,7 +459,7 @@ class Starter:
             if self._closed:
                 raise LauncherError("LowRAM AI is shutting down.")
             try:
-                self.backend = start_or_reuse(self.ports, self.ready_timeout)
+                self.backend = start_or_reuse(self.ports, self.home, self.ready_timeout)
             except Exception as exc:
                 self.error = describe(exc)
                 raise
@@ -532,6 +651,117 @@ def _call_window(func: Callable[[str], Any], arg: str) -> None:
         log.info("Could not update the window: %s", exc)
 
 
+class DesktopApi:
+    """The only Python functions the window's JavaScript can call (``window.pywebview.api``).
+
+    pywebview exposes every public attribute of this object, so everything
+    except the two dialog methods is private. Titles are accepted for the UI's
+    convenience but not shown (pywebview's dialogs have no title option).
+    """
+
+    __slots__ = ("_window", "_open", "_folder")
+
+    def __init__(self, webview_module: Any):
+        dialogs = getattr(webview_module, "FileDialog", None)
+        self._open = dialogs.OPEN if dialogs is not None else webview_module.OPEN_DIALOG
+        self._folder = dialogs.FOLDER if dialogs is not None else webview_module.FOLDER_DIALOG
+        self._window: Any = None
+
+    def pick_folder(self, title: str | None = None) -> str | None:
+        """Native folder dialog -> absolute path or None (e.g. a models folder on an external SSD)."""
+        return self._pick(self._folder, ())
+
+    def pick_file(self, title: str | None = None, patterns: list | None = None) -> str | None:
+        """Native open dialog -> absolute path or None; ``patterns`` like ``["*.gguf"]``."""
+        allowed = [p for p in (patterns if isinstance(patterns, list) else []) if isinstance(p, str)
+                   and _FILE_PATTERN.fullmatch(p)][:8] or ["*.gguf"]
+        return self._pick(self._open, (f"Supported files ({';'.join(allowed)})",))
+
+    def _pick(self, dialog_type: Any, file_types: tuple) -> str | None:
+        if self._window is None:
+            return None
+        try:
+            result = self._window.create_file_dialog(
+                dialog_type, directory=str(Path.home()), allow_multiple=False, file_types=file_types
+            )
+        except Exception:
+            log.exception("File dialog failed")
+            return None
+        path = result[0] if isinstance(result, (list, tuple)) and result else result
+        return path if isinstance(path, str) and os.path.isabs(path) else None
+
+
+class SignalWatcher:
+    """Run ``callback(signum)`` in a thread as soon as SIGTERM/SIGHUP/SIGINT arrives.
+
+    While a GUI loop (Cocoa, GTK, WinForms) owns the main thread, Python-level
+    signal handlers may not run for a long time. The C-level wakeup fd still
+    receives the signal number immediately, so this thread can shut the server
+    down (stopping llama-server) and close the window. Signal masks are not
+    touched, so child processes such as llama-server stay killable.
+    """
+
+    def __init__(self, callback: Callable[[int], None]):
+        self._callback = callback
+        self._signals = {getattr(signal, n) for n in ("SIGTERM", "SIGHUP", "SIGINT") if hasattr(signal, n)}
+        self._previous: dict[int, Any] = {}
+        self._closed = threading.Event()
+        self._reader, self._writer = socket.socketpair()
+        self._writer.setblocking(False)
+        self._old_fd: int | None = None
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> bool:
+        if threading.current_thread() is not threading.main_thread():
+            return False
+        try:
+            self._old_fd = signal.set_wakeup_fd(self._writer.fileno(), warn_on_full_buffer=False)
+        except (ValueError, OSError) as exc:
+            log.info("Signal watcher unavailable: %s", exc)
+            return False
+        for signum in self._signals:
+            with contextlib.suppress(OSError, ValueError):
+                self._previous[signum] = signal.signal(signum, self._python_handler)
+        self._thread = threading.Thread(target=self._run, name="lowram-signals", daemon=True)
+        self._thread.start()
+        return True
+
+    @staticmethod
+    def _python_handler(signum, frame):  # noqa: ARG004 - the watcher thread does the work
+        pass
+
+    def _run(self) -> None:
+        while not self._closed.is_set():
+            try:
+                data = self._reader.recv(64)
+            except OSError:
+                return
+            if self._closed.is_set() or not data:
+                return
+            for signum in data:
+                if signum in self._signals:
+                    log.info("Received signal %s; closing LowRAM AI", signum)
+                    try:
+                        self._callback(signum)
+                    except Exception:
+                        log.exception("Shutdown after signal %s failed", signum)
+                    return
+
+    def close(self) -> None:
+        self._closed.set()
+        if self._thread is not None:
+            with contextlib.suppress(ValueError, OSError):
+                signal.set_wakeup_fd(self._old_fd if self._old_fd is not None else -1)
+            for signum, old in self._previous.items():
+                with contextlib.suppress(OSError, ValueError, TypeError):
+                    signal.signal(signum, old)
+            with contextlib.suppress(OSError):
+                self._writer.send(b"\0")  # wake the thread
+            self._thread.join(2)
+        self._reader.close()
+        self._writer.close()
+
+
 def run_window(starter: Starter, storage_dir: Path, log_path: Path | None) -> int | None:
     """Show the native window until it is closed. None = no native web view (use the browser)."""
     try:
@@ -547,15 +777,18 @@ def run_window(starter: Starter, storage_dir: Path, log_path: Path | None) -> in
 
     try:
         storage_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        api = DesktopApi(webview)
         window = webview.create_window(
             APP_NAME,
             html=splash_html(),
+            js_api=api,
             width=WINDOW_SIZE[0],
             height=WINDOW_SIZE[1],
             min_size=MIN_WINDOW_SIZE,
             text_select=True,
             background_color=WINDOW_BACKGROUND,
         )
+        api._window = window
     except Exception as exc:
         log.warning("Could not create the window (%s); using the browser", exc, exc_info=True)
         return None
@@ -569,12 +802,30 @@ def run_window(starter: Starter, storage_dir: Path, log_path: Path | None) -> in
             return
         _call_window(window.load_url, backend.url)
 
+    gui_done = threading.Event()
+
+    def on_signal(signum: int) -> None:
+        starter.close()  # stop the server and llama-server first, whatever the GUI does
+        try:
+            window.destroy()
+        except Exception:
+            log.exception("Could not close the window")
+        if not gui_done.wait(10):
+            log.warning("The window did not close after signal %s; exiting", signum)
+            logging.shutdown()
+            os._exit(EXIT_OK)
+
+    watcher = SignalWatcher(on_signal)
+    watcher.start()
     try:
         # Not private: the dashboard keeps theme and drafts in localStorage.
         webview.start(boot, private_mode=False, storage_path=str(storage_dir))
     except Exception as exc:
         log.warning("The native window is not available (%s); using the browser", exc, exc_info=True)
         return None
+    finally:
+        gui_done.set()
+        watcher.close()
     log.info("Window closed")
     return EXIT_FAILED if starter.error else EXIT_OK
 
@@ -677,7 +928,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if root.level == logging.NOTSET or root.level > logging.INFO:
         root.setLevel(logging.INFO)
     restore_hooks = install_excepthooks()
-    starter = Starter(candidate_ports(explicit))
+    starter = Starter(candidate_ports(explicit), home)
     atexit.register(starter.close)
     try:
         configure_environment()

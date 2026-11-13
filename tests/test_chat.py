@@ -608,6 +608,120 @@ class EngineTests(StreamLLMTestCase):
         self.assertIsNone(model)
 
 
+class ContextLimitTests(unittest.TestCase):
+    def test_engine_context_caps_budget_and_answer(self):
+        self.assertEqual(chat.context_limits(6400, 870, "code", 4096), (7040, 1024))
+        budget, tokens = chat.context_limits(6400, 870, "chat", 4096)
+        self.assertEqual(tokens, 870)
+        self.assertEqual(budget, int((4096 - 870 - chat.CTX_RESERVE_TOKENS) * chat.CHARS_PER_TOKEN))
+        self.assertLessEqual(budget / chat.CHARS_PER_TOKEN + tokens + chat.CTX_RESERVE_TOKENS, 4096)
+        self.assertEqual(chat.context_limits(6400, 2048, "chat", 2048)[1], 1024)  # answer at most half
+        self.assertEqual(chat.context_limits(2000, 300, "chat", 131072), (4000, 512))  # RAM plan is smaller
+
+    def test_external_server_keeps_ram_plan(self):
+        self.assertEqual(chat.context_limits(6400, 300, "chat", None), (12800, 512))
+        self.assertEqual(chat.context_limits(6400, 300, "code", None), (12800, 1024))
+
+
+class ManagedEngineStreamTests(ChatApiTestCase):
+    """The real engine API shape: status(), start(persist=False), ensure_running(timeout), ctx_size()."""
+
+    def setUp(self):
+        super().setUp()
+        os.environ.pop("LOWRAM_LLM_URL")  # managed engine; restored by the base class
+
+        class EngineError(RuntimeError):
+            pass
+
+        self.EngineError = EngineError
+        self.loaded = threading.Event()
+        self.addCleanup(self.loaded.set)
+        self.state = {"state": "stopped", "model_id": None, "ctx_size": None}
+        self.start_error = None
+        self.load_error = None
+
+        def start(model_id=None, *, persist=True):
+            if self.start_error:
+                raise self.start_error
+            self.state = {"state": "starting", "model_id": "qwen2.5-3b", "ctx_size": 4096}
+            return dict(self.state)
+
+        def ensure_running(timeout):
+            self.loaded.wait(10)
+            if self.load_error:
+                raise self.load_error
+            self.state = {**self.state, "state": "ready"}
+            return self.fake.url
+
+        engine = types.SimpleNamespace(
+            EngineError=EngineError, start=start, ensure_running=ensure_running, ctx_size=lambda: 4096,
+            status=lambda: {"server": dict(self.state), "paused": False},
+        )
+        patcher = mock.patch.object(chat, "_engine_module", return_value=engine)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_status_events_while_the_model_loads(self):
+        cid = self.new_chat(mode="code")
+        self.fake.push(Stream(["loaded and answering"]))
+        with mock.patch.object(chat, "STATUS_INTERVAL_S", 0.05):
+            client = self.send(cid, "q" * 15000)
+            self.assertEqual(client.status, 200)
+            self.assertEqual([e["type"] for e in client.until("status")], ["start", "status"])
+            self.assertEqual(client.next(), {"type": "status", "text": chat.LOADING_TEXT})  # repeated
+            self.assertEqual(self.fake.requests, [])
+            self.loaded.set()
+            events = client.rest()
+        self.assertEqual(events[-1]["type"], "done")
+        self.assertEqual(events[-1]["message"]["model"], "qwen2.5-3b")
+        sent = self.fake.requests[0]["json"]
+        prompt_chars = sum(len(m["content"]) for m in sent["messages"])
+        self.assertEqual(sent["max_tokens"], 1024)
+        self.assertLessEqual(prompt_chars / chat.CHARS_PER_TOKEN + sent["max_tokens"] + 256, 4096)
+        self.assertIn("characters left out", sent["messages"][-1]["content"])
+
+    def test_ready_engine_streams_without_status(self):
+        self.state = {"state": "ready", "model_id": "qwen2.5-3b", "ctx_size": 4096}
+        self.loaded.set()
+        cid = self.new_chat()
+        types_seen = [e["type"] for e in self.send(cid).rest()]
+        self.assertEqual(types_seen, ["start", "token", "done"])
+
+    def test_engine_reason_is_409_before_streaming(self):
+        for reason in ("No model is installed yet.", "The models drive /Volumes/SSD is not connected",
+                       "The engine is paused while an image or video job uses the memory"):
+            with self.subTest(reason=reason):
+                self.start_error = self.EngineError(reason)
+                cid = self.new_chat()
+                client = self.send(cid)
+                self.assertEqual(client.status, 409)
+                self.assertTrue(client.json["error"].startswith(chat.NO_MODEL_MESSAGE))
+                self.assertIn(reason, client.json["error"])
+                self.assertEqual(self.messages(cid), [])
+                self.assertIsNone(db.busy_reason())
+
+    def test_load_failure_after_start_is_an_error_event(self):
+        self.load_error = self.EngineError("llama-server exited: out of memory")
+        self.loaded.set()
+        cid = self.new_chat()
+        events = self.send(cid).rest()
+        self.assertEqual([e["type"] for e in events], ["start", "status", "error"])
+        self.assertIn("out of memory", events[-1]["error"])
+        self.assertEqual(self.messages(cid)[1]["status"], "error")
+        self.assertIsNone(db.busy_reason())
+
+    def test_stop_while_loading(self):
+        cid = self.new_chat()
+        with mock.patch.object(chat, "STOP_GRACE_S", 0.2):
+            client = self.send(cid)
+            client.until("status")
+            self.assertEqual(self.api("POST", f"/api/chats/{cid}/stop"), (200, {"stopped": True}))
+            done = client.rest()[-1]
+        self.assertEqual((done["type"], done["message"]["status"]), ("done", "stopped"))
+        self.assertIsNone(db.busy_reason())
+        self.loaded.set()
+
+
 def web_http_error():
     from backend.web import HTTPError
 

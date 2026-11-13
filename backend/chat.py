@@ -9,9 +9,15 @@ Design notes
   is stopped, the client disconnects, or the stream object is dropped without
   ever being iterated (see :class:`ChatStream`).
 * The model runs in a worker thread; the HTTP thread turns its text into SSE
-  events (``start``, ``reasoning``, ``token``, ``ping``, ``done``/``error``).
-  ``ping`` keeps the connection alive while a slow model is still reading the
-  prompt and lets a closed browser tab be noticed within seconds.
+  events: ``start``, ``status`` (``{"type":"status","text":…}`` right after
+  ``start`` and every ~5 s while the managed model is still being started or
+  loaded), ``reasoning`` (``<think>`` text, not stored), ``token``, ``ping``
+  (keep-alive after 10 s of silence, e.g. while a slow model reads the prompt;
+  also lets a closed browser tab be noticed), then ``done`` or ``error``.
+  Problems found before the stream (busy, invalid input, no model installed,
+  engine paused) are plain JSON errors; later ones are ``error`` events.
+* With the managed engine the prompt is sized to the real llama-server
+  context (``engine.ctx_size()``), not only to the RAM budget.
 * An assistant message is never left ``streaming``: it ends ``complete``,
   ``stopped`` (stop button / disconnect; partial text kept) or ``error`` (with
   the reason). Leftovers from a crash are marked ``stopped`` on startup.
@@ -55,6 +61,11 @@ QUEUE_POLL_S = 0.2
 STOP_GRACE_S = 3.0
 WORKER_JOIN_S = 2.0
 ENGINE_START_TIMEOUT_S = 300.0
+STATUS_INTERVAL_S = 5.0
+CHARS_PER_TOKEN = 2.5  # conservative: code and non-English text pack fewer characters per token
+CTX_RESERVE_TOKENS = 256  # chat-template markup and safety margin
+MIN_CONTEXT_CHARS = 1000
+LOADING_TEXT = "Loading the model… (first answer after a start can take a minute)"
 
 NO_MODEL_MESSAGE = "No model is running. Open Models to install and start one."
 OMITTED_NOTE = "[Earlier messages of this conversation were left out to fit the memory budget.]"
@@ -432,6 +443,36 @@ def _configured_model() -> str | None:
     return os.environ.get("LOWRAM_LLM_MODEL", "").strip() or None
 
 
+def _managed_engine():
+    """The engine module when LowRAM AI manages llama-server itself (no ``LOWRAM_LLM_URL``)."""
+    if os.environ.get("LOWRAM_LLM_URL", "").strip():
+        return None
+    return _engine_module()
+
+
+def _no_model_error(engine, exc: BaseException) -> HTTPError:
+    """409 with the engine's own reason (not installed, drive unplugged, paused, …)."""
+    engine_error = getattr(engine, "EngineError", None)
+    if engine_error is None or not isinstance(exc, engine_error):
+        log.error("The engine failed unexpectedly", exc_info=exc)
+    detail = str(exc).strip()
+    message = f"{NO_MODEL_MESSAGE} Details: {detail}" if detail else NO_MODEL_MESSAGE
+    return HTTPError(HTTPStatus.CONFLICT, message[:1000])
+
+
+def engine_interrupted() -> bool:
+    """Is the managed model paused (image/video job) or not ready right now?"""
+    engine = _managed_engine()
+    if engine is None:
+        return False
+    try:
+        info = engine.status()
+        return bool(info.get("paused")) or (info.get("server") or {}).get("state") != "ready"
+    except Exception:
+        log.debug("Could not read the engine status", exc_info=True)
+        return False
+
+
 def ensure_model(timeout: float = ENGINE_START_TIMEOUT_S) -> tuple[str, str | None]:
     """``(llm_url, model_name)`` to use, starting the managed engine when needed.
 
@@ -439,20 +480,13 @@ def ensure_model(timeout: float = ENGINE_START_TIMEOUT_S) -> tuple[str, str | No
     the configured URL is used as is. Otherwise ``engine.ensure_running`` must
     succeed, else ``HTTPError(409)`` tells the user to install/start a model.
     """
-    if os.environ.get("LOWRAM_LLM_URL", "").strip():
-        return config.llm_url(), _configured_model()
-    engine = _engine_module()
+    engine = _managed_engine()
     if engine is None:
         return config.llm_url(), _configured_model()
     try:
         url = engine.ensure_running(timeout=timeout)
     except Exception as exc:  # EngineError or anything else: the user needs a reason, not a 500
-        engine_error = getattr(engine, "EngineError", None)
-        if engine_error is None or not isinstance(exc, engine_error):
-            log.exception("engine.ensure_running failed unexpectedly")
-        detail = str(exc).strip()
-        message = f"{NO_MODEL_MESSAGE} Details: {detail}" if detail else NO_MODEL_MESSAGE
-        raise HTTPError(HTTPStatus.CONFLICT, message[:1000]) from exc
+        raise _no_model_error(engine, exc) from exc
     model = _configured_model()
     try:
         server = engine.status().get("server") or {}
@@ -461,6 +495,54 @@ def ensure_model(timeout: float = ENGINE_START_TIMEOUT_S) -> tuple[str, str | No
     except Exception:  # the model name is informational only
         log.debug("Could not read the engine status", exc_info=True)
     return (url if isinstance(url, str) and url else config.llm_url()), model
+
+
+def prepare_model() -> dict:
+    """Before streaming: ``{url, wait, model, ctx_size}`` for the answer.
+
+    External server / no engine: ``url`` is set, ``ctx_size`` unknown. Managed
+    engine ready: ``url`` and ``ctx_size`` set. Managed engine stopped: it is
+    started here (fast; raises 409 for no model, no runtime, unplugged drive or
+    a pause) and ``wait`` is a callable that waits for it to finish loading –
+    called inside the stream so the user sees ``status`` events meanwhile.
+    """
+    engine = _managed_engine()
+    if engine is None:
+        return {"url": config.llm_url(), "wait": None, "model": _configured_model(), "ctx_size": None}
+    start = getattr(engine, "start", None)
+    try:
+        server = dict(engine.status().get("server") or {})
+        if server.get("state") not in ("ready", "starting") and start is not None:
+            server = dict(start(persist=False) or {})
+    except Exception as exc:
+        raise _no_model_error(engine, exc) from exc
+    ctx = server.get("ctx_size")
+    if not isinstance(ctx, int) or isinstance(ctx, bool) or ctx <= 0:
+        try:
+            ctx = int(engine.ctx_size())
+        except Exception:
+            ctx = None
+    model = server["model_id"] if isinstance(server.get("model_id"), str) else _configured_model()
+    if server.get("state") != "starting":  # ready (or an engine without start()): no visible wait
+        url, model = ensure_model()
+        return {"url": url, "wait": None, "model": model, "ctx_size": ctx}
+
+    def wait() -> str:
+        url = engine.ensure_running(timeout=ENGINE_START_TIMEOUT_S)
+        return url if isinstance(url, str) and url else config.llm_url()
+
+    return {"url": None, "wait": wait, "model": model, "ctx_size": ctx}
+
+
+def context_limits(plan_chars: int, plan_tokens: int, mode: str, ctx_size: int | None) -> tuple[int, int]:
+    """``(char_budget, max_tokens)``: the RAM plan, capped so prompt + answer fit ``ctx_size``."""
+    budget = plan_chars * CONTEXT_FACTOR
+    max_tokens = max(plan_tokens, MIN_MAX_TOKENS[mode])
+    if ctx_size:
+        max_tokens = min(max_tokens, max(ctx_size // 2, 64))
+        room = int((ctx_size - max_tokens - CTX_RESERVE_TOKENS) * CHARS_PER_TOKEN)
+        budget = min(budget, max(room, MIN_CONTEXT_CHARS))
+    return budget, max_tokens
 
 
 # --------------------------------------------------------------------------- streaming
@@ -492,7 +574,8 @@ class _Answer:
     """
 
     def __init__(self, *, chat: dict, user_message: dict, assistant_message: dict, messages: list[dict],
-                 max_tokens: int, temperature: float, url: str, slot: ExitStack) -> None:
+                 max_tokens: int, temperature: float, url: str | None, slot: ExitStack,
+                 wait=None) -> None:
         self.chat_id = int(chat["id"])
         self.chat = chat
         self.user_message = user_message
@@ -502,6 +585,8 @@ class _Answer:
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.url = url
+        self.wait = wait  # waits for the managed model to finish loading (worker thread)
+        self.loading = False
         self.stop_event = threading.Event()
         self.queue: queue.Queue = queue.Queue()
         self.worker: threading.Thread | None = None
@@ -516,11 +601,19 @@ class _Answer:
     # ---- model side (worker thread)
 
     def start_worker(self) -> None:
+        self.loading = self.wait is not None
         self.worker = threading.Thread(target=self._produce, name=f"lowram-chat-{self.chat_id}", daemon=True)
         self.worker.start()
 
     def _produce(self) -> None:
         try:
+            if self.wait is not None:
+                try:
+                    self.url = self.wait()
+                except Exception as exc:
+                    raise llm.LLMError(f"The model could not be loaded: {exc}") from exc
+                finally:
+                    self.loading = False
             for piece in llm.stream_chat(
                 self.messages, max_tokens=self.max_tokens, temperature=self.temperature,
                 url=self.url, stop_event=self.stop_event,
@@ -620,8 +713,10 @@ def _pump(answer: _Answer) -> Iterator[dict]:
     """Forward the worker's text as events. Returns ``(status, error)``."""
     answer.start_worker()
     splitter = ThinkSplitter()
-    last_event = time.monotonic()
+    last_event = last_status = time.monotonic()
     stop_seen: float | None = None
+    if answer.wait is not None:  # the managed model is still starting / loading
+        yield {"type": "status", "text": LOADING_TEXT}
     while True:
         try:
             kind, value = answer.queue.get(timeout=QUEUE_POLL_S)
@@ -632,7 +727,10 @@ def _pump(answer: _Answer) -> Iterator[dict]:
                 if now - stop_seen >= STOP_GRACE_S:
                     log.info("Chat #%s: model connection did not close in time; stopping anyway", answer.chat_id)
                     break
-            if now - last_event >= PING_INTERVAL_S:
+            if answer.loading and now - last_status >= STATUS_INTERVAL_S:
+                last_status = last_event = now
+                yield {"type": "status", "text": LOADING_TEXT}
+            elif now - last_event >= PING_INTERVAL_S:
                 last_event = now
                 yield {"type": "ping"}
             continue
@@ -731,13 +829,14 @@ def start_answer(chat_id: int, content: object, percent: object = None) -> ChatS
     slot = ExitStack()
     slot.enter_context(db.inference_slot(f"chat #{chat_id}"))
     try:
-        url, model = ensure_model()
-        messages = build_messages(mode, _recent_messages(chat_id), text, plan.context_chars * CONTEXT_FACTOR)
-        user_message, assistant_message, chat = _insert_turn(chat_id, text, model)
+        endpoint = prepare_model()
+        budget, max_tokens = context_limits(plan.context_chars, plan.max_tokens, mode, endpoint["ctx_size"])
+        messages = build_messages(mode, _recent_messages(chat_id), text, budget)
+        user_message, assistant_message, chat = _insert_turn(chat_id, text, endpoint["model"])
         answer = _Answer(
             chat=chat, user_message=user_message, assistant_message=assistant_message, messages=messages,
-            max_tokens=max(plan.max_tokens, MIN_MAX_TOKENS[mode]), temperature=TEMPERATURE[mode],
-            url=url, slot=slot,
+            max_tokens=max_tokens, temperature=TEMPERATURE[mode],
+            url=endpoint["url"], slot=slot, wait=endpoint["wait"],
         )
         with _ACTIVE_LOCK:
             _ACTIVE[chat_id] = answer

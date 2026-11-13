@@ -245,8 +245,14 @@ class ExtractionTests(DownloadTestCase):
     def extract(self, key, data, fmt):
         self.hub.files[key] = data
         dest = config.bin_dir() / "rt"
-        job = self.run_job("https://" + key, dest, extract=fmt, kind="runtime")
+        job = self.run_job("https://" + key, dest, extract=fmt, kind="runtime", sha256=hashlib.sha256(data).hexdigest())
         return job, dest
+
+    def test_runtime_without_checksum_is_refused(self):
+        for kind in ("runtime", "media-runtime"):
+            with self.subTest(kind=kind), self.assertRaises(ValueError) as ctx:
+                downloads.start("rt", "https://" + TAR, config.bin_dir() / "rt", kind=kind, label="R", extract="tar.gz")
+            self.assertIn("unverified program", str(ctx.exception))
 
     def test_tar_gz_with_exec_bit_and_sibling_symlink(self):
         data = make_tar_gz([

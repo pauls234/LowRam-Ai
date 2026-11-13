@@ -19,6 +19,13 @@ Network design
 * Pairing: a one-time code (10 minutes, at most 5 wrong attempts) carries the
   host's addresses, port, fingerprint prefix and a 16-byte secret. A successful
   ``POST /cluster/v1/pair`` returns a random 32-byte device key once.
+* Easy pairing: while ``cluster.discoverable`` is on, the host sends a UDP
+  beacon (port 8767, broadcast + multicast) with its id, name, port and the
+  first 8 bytes of its certificate fingerprint. A helper sends a pairing
+  *request* (commitment to a client nonce), gets a host nonce, then reveals
+  its nonce; both screens show a 6-digit number derived from the full
+  certificate fingerprint and both nonces, and the host user clicks Allow.
+  The key is handed out once, to the poller that knows the client nonce.
 * Every other LAN request is signed: ``X-LowRAM-Signature`` =
   HMAC-SHA256(key, method\\npath\\ntimestamp\\nnonce\\nsha256(body)). Requests
   with clock skew > 60 s, a reused nonce, an unknown/revoked device or a bad
@@ -30,6 +37,14 @@ Protected: passive sniffing and active man-in-the-middle on the LAN (TLS +
 pinning), other LAN hosts calling the API (HMAC device keys), replay (nonce +
 timestamp), guessing the pairing secret (128 bit, 5 attempts, 10 minutes),
 leaking the device key (never logged, returned once, DB file is 0600).
+Easy pairing: beacons are unauthenticated (anyone can announce a fake host or
+spoof names); they only offer a target. Safety comes from the number the user
+compares: a man-in-the-middle presents another certificate and gets another
+number, and the commitment keeps it from choosing nonces until the numbers
+match (1 in 10^6 per attempt; requests are rate-limited, at most 3 pending,
+2 minutes each). A user who clicks Allow without comparing can pair an
+attacker's device – it then gets tasks of shared projects, nothing else.
+
 Not protected: a paired device is trusted to return honest answers (its text is
 stored as a task result and becomes context for later prompts and the merge);
 anyone who can read ``LOWRAM_HOME`` can read the keys; a LAN attacker can burn a
@@ -37,10 +52,14 @@ pairing code with 5 wrong guesses (denial of service, not access); a code that
 is photographed/copied while valid can be used by someone else once.
 
 The one exception to "nothing is retried automatically": a task whose device
-stops sending heartbeats for :data:`LEASE_REQUEUE_S` seconds (or that leaves,
-is revoked or is switched off) goes back to ``pending`` with a note in its
-error field, at most until the task has been attempted :data:`MAX_ATTEMPTS`
-times; then it is marked ``failed`` like any other failure.
+stops sending heartbeats for :data:`LEASE_REQUEUE_S` seconds goes back to
+``pending`` with a note in its error field; that counts as an attempt, and
+after :data:`MAX_ATTEMPTS` attempts it is marked ``failed``. Claims never count
+as attempts, and tasks a device hands back (it stops, leaves, re-claims, is
+revoked or Devices is switched off) return to ``pending`` without using one.
+Claims are rate-limited per device, nonces are capped per device, and the LAN
+server enforces a total request deadline, an idle timeout and a per-address
+connection cap (slowloris).
 """
 
 from __future__ import annotations
@@ -103,7 +122,23 @@ MAX_ERROR_TEXT = 2000
 MERGE_MIN_SHARE = 300
 OPENSSL_TIMEOUT_S = 60
 LLM_START_TIMEOUT_S = 300
-PUBLIC_LAN_PATHS = frozenset({"/cluster/v1/pair"})
+CLAIM_MIN_INTERVAL_S = 1.0  # per device; faster claims get 429 + retry_after
+NONCES_PER_DEVICE = 300  # one device cannot fill the shared nonce cache
+REQUEST_DEADLINE_S = 15.0  # headers + body must arrive within this time (slowloris)
+IDLE_TIMEOUT_S = 5  # per socket read / keep-alive idle time
+MAX_CONNECTIONS_PER_IP = 4
+DISCOVERY_PORT = 8767
+DISCOVERY_BIND = ""  # all interfaces; tests use 127.0.0.1
+DISCOVERY_GROUP = "239.255.76.82"
+BEACON_INTERVAL_S = 2.0
+NEARBY_TTL_S = 10.0
+MAX_BEACON_BYTES = 512
+MAX_NEARBY = 64
+BEACON_MIN_GAP_S = 0.2  # per source address
+REQUEST_TTL_S = 120
+MAX_PENDING_REQUESTS = 3
+REQUEST_MIN_INTERVAL_S = 5.0  # per address
+PUBLIC_LAN_PATHS = frozenset({"/cluster/v1/pair", "/cluster/v1/pair-request", "/cluster/v1/pair-status"})
 REMOTE = db.REMOTE_OWNER_PREFIX  # "device:"
 
 HEADER_DEVICE = "X-LowRAM-Device"
@@ -306,29 +341,46 @@ def format_fingerprint(digest: bytes) -> str:
 
 
 class NonceCache:
-    """Remembers (device, nonce) pairs until their timestamp can no longer pass the skew check."""
+    """Remembers (device, nonce) pairs until their timestamp can no longer pass the skew check.
 
-    def __init__(self, capacity: int = NONCE_CACHE_SIZE):
+    Full caches refuse new requests instead of forgetting live nonces; the
+    per-device cap keeps one (compromised) device from locking out the others.
+    """
+
+    def __init__(self, capacity: int = NONCE_CACHE_SIZE, per_device: int = NONCES_PER_DEVICE):
         self.capacity = capacity
-        self._items: OrderedDict[str, float] = OrderedDict()
+        self.per_device = per_device
+        self._items: OrderedDict[tuple[str, str], float] = OrderedDict()
+        self._counts: dict[str, int] = {}
         self._lock = threading.Lock()
 
-    def add(self, key: str, expires: float, now: float) -> bool:
-        """False if ``key`` was seen before (replay) or the cache is full of live entries."""
+    def _drop(self, key: tuple[str, str]) -> None:
+        self._items.pop(key, None)
+        left = self._counts.get(key[0], 0) - 1
+        if left > 0:
+            self._counts[key[0]] = left
+        else:
+            self._counts.pop(key[0], None)
+
+    def add(self, owner: str, nonce: str, expires: float, now: float) -> bool:
+        """False if the nonce was seen before (replay) or there is no room for it."""
         with self._lock:
             while self._items:
                 first_key, first_exp = next(iter(self._items.items()))
                 if first_exp > now:
                     break
-                self._items.pop(first_key)
+                self._drop(first_key)
+            key = (owner, nonce)
             if key in self._items:
                 return False
-            if len(self._items) >= self.capacity:
-                self._items = OrderedDict((k, e) for k, e in self._items.items() if e > now)
-                if len(self._items) >= self.capacity:
-                    log.warning("Device nonce cache is full; refusing requests until entries expire")
+            if self._counts.get(owner, 0) >= self.per_device or len(self._items) >= self.capacity:
+                for old in [k for k, e in self._items.items() if e <= now]:
+                    self._drop(old)
+                if self._counts.get(owner, 0) >= self.per_device or len(self._items) >= self.capacity:
+                    log.warning("Nonce cache full for %s; refusing requests until entries expire", owner)
                     return False
             self._items[key] = expires
+            self._counts[owner] = self._counts.get(owner, 0) + 1
             return True
 
     def __len__(self) -> int:
@@ -352,6 +404,13 @@ class _State:
         self.merging: set[int] = set()
         self.auto_loop: set[int] = set()
         self.stats = {"requests": 0, "unauthorized": 0}
+        self.last_claim: dict[int, float] = {}
+        self.requests: dict[int, dict] = {}
+        self.request_seq = 0
+        self.request_last_by_ip: dict[str, float] = {}
+        self.discovery: DiscoveryListener | None = None
+        self.beacon: threading.Thread | None = None
+        self.beacon_stop = threading.Event()
 
 
 _STATE = _State()
@@ -494,11 +553,32 @@ class LanHandler(BaseHTTPRequestHandler):
     server_version = "LowRAM-AI-Devices"
     sys_version = ""
     protocol_version = "HTTP/1.1"
-    timeout = 30
+    timeout = IDLE_TIMEOUT_S  # every socket read (and keep-alive idling) times out quickly
     lan_device: dict | None = None
+    _deadline: threading.Timer | None = None
 
     def log_message(self, format: str, *args) -> None:  # noqa: A002 - stdlib signature
         log.debug("LAN %s %s", self.address_string(), format % args)
+
+    def handle_one_request(self) -> None:
+        # Total deadline for request line + headers + body: a client that trickles
+        # bytes (slowloris) is cut off even though each single read is fast enough.
+        timer = threading.Timer(REQUEST_DEADLINE_S, self._deadline_hit)
+        timer.daemon = True
+        self._deadline = timer
+        timer.start()
+        try:
+            super().handle_one_request()
+        finally:
+            timer.cancel()
+
+    def _deadline_hit(self) -> None:
+        log.info("Device request from %s did not arrive in time; closing it", self.client_address[0])
+        self.close_connection = True
+        try:  # plain socket shutdown: wakes the blocked read without touching the TLS object
+            socket.socket.shutdown(self.connection, socket.SHUT_RDWR)
+        except OSError:
+            pass
 
     def _json(self, status: HTTPStatus, data: dict) -> None:
         body = json.dumps(data).encode("utf-8")
@@ -546,6 +626,9 @@ class LanHandler(BaseHTTPRequestHandler):
         request: Request | None = None
         try:
             request = web.Request.from_handler(self)
+            request.body(MAX_BODY_BYTES)  # whole request received (413 above 1 MiB) …
+            if self._deadline is not None:
+                self._deadline.cancel()  # … so the deadline no longer applies to the handler
             found = web.match(self.command, request.path, LAN_SCOPE)
             if not (found is not None and request.path in PUBLIC_LAN_PATHS):
                 self.lan_device = _authenticate(request)
@@ -591,24 +674,40 @@ class LanServer(ThreadingHTTPServer):
     def __init__(self, address: tuple[str, int], ssl_context: ssl.SSLContext):
         self.ssl_context = ssl_context
         self._slots = threading.BoundedSemaphore(MAX_LAN_CONNECTIONS)
+        self._per_ip: dict[str, int] = {}
+        self._ip_lock = threading.Lock()
         super().__init__(address, LanHandler)
 
+    def _release(self, ip: str) -> None:
+        with self._ip_lock:
+            left = self._per_ip.get(ip, 1) - 1
+            if left > 0:
+                self._per_ip[ip] = left
+            else:
+                self._per_ip.pop(ip, None)
+        self._slots.release()
+
     def process_request(self, request, client_address) -> None:  # type: ignore[override]
-        if not self._slots.acquire(blocking=False):
-            log.warning("Too many device connections; refusing %s", client_address[0])
+        ip = client_address[0]
+        with self._ip_lock:
+            refused = self._per_ip.get(ip, 0) >= MAX_CONNECTIONS_PER_IP or not self._slots.acquire(blocking=False)
+            if not refused:
+                self._per_ip[ip] = self._per_ip.get(ip, 0) + 1
+        if refused:
+            log.warning("Too many device connections from %s; refusing", ip)
             self.shutdown_request(request)
             return
         try:
             super().process_request(request, client_address)
         except BaseException:
-            self._slots.release()
+            self._release(ip)
             raise
 
     def process_request_thread(self, request, client_address) -> None:  # type: ignore[override]
         try:
             super().process_request_thread(request, client_address)
         finally:
-            self._slots.release()
+            self._release(client_address[0])
 
     def finish_request(self, request, client_address) -> None:  # type: ignore[override]
         request.settimeout(HANDSHAKE_TIMEOUT_S)
@@ -665,9 +764,11 @@ def start_lan_server() -> None:
         _STATE.thread.start()
     log.info("Device server listening on %s:%s", LAN_BIND_HOST, server.server_address[1])
     _ensure_coordinator()
+    _start_beacon()
 
 
 def stop_lan_server() -> None:
+    _stop_beacon()
     with _STATE.lock:
         server, thread = _STATE.server, _STATE.thread
         _STATE.server, _STATE.thread, _STATE.pairing = None, None, None
@@ -712,7 +813,7 @@ def _authenticate(request: Request) -> dict:
     expected = sign(key, request.method, request.handler.path, timestamp, nonce, body)
     if not hmac.compare_digest(expected, signature.lower()):
         raise _Unauthorized
-    if not _STATE.nonces.add(f"{device['id']}:{nonce}", int(timestamp) + MAX_SKEW_S + 1, now):
+    if not _STATE.nonces.add(str(device["id"]), nonce, int(timestamp) + MAX_SKEW_S + 1, now):
         raise _Unauthorized
     with db.connect() as conn:
         conn.execute("UPDATE devices SET last_seen = ? WHERE id = ?", (now, device["id"]))
@@ -754,10 +855,18 @@ def _owner(device_id: int) -> str:
     return f"{REMOTE}{int(device_id)}"
 
 
-def _release_locked(conn: sqlite3.Connection, task_id: int, attempts: int, note: str) -> str:
-    """Inside a transaction: give a device-leased task back (or fail it after MAX_ATTEMPTS)."""
+def _release_locked(conn: sqlite3.Connection, task_id: int, attempts: int, note: str, *, count: bool = False) -> str:
+    """Inside a transaction: give a device-leased task back.
+
+    Claims do not count as attempts (a device cannot burn tasks by claiming and
+    releasing). ``count=True`` is used when a device held the task and went
+    silent (lease expiry): that counts, and after MAX_ATTEMPTS the task fails.
+    """
     conn.execute("DELETE FROM device_claims WHERE task_id = ?", (task_id,))
-    if attempts >= MAX_ATTEMPTS:
+    if count:
+        attempts += 1
+        conn.execute("UPDATE tasks SET attempts = ? WHERE id = ?", (attempts, task_id))
+    if count and attempts >= MAX_ATTEMPTS:
         conn.execute(
             "UPDATE tasks SET status = 'failed', lease_owner = NULL, finished_at = ?, error = ? "
             "WHERE id = ? AND status = 'running'",
@@ -767,7 +876,7 @@ def _release_locked(conn: sqlite3.Connection, task_id: int, attempts: int, note:
     conn.execute(
         "UPDATE tasks SET status = 'pending', lease_owner = NULL, started_at = NULL, finished_at = NULL, "
         "result_path = NULL, error = ? WHERE id = ? AND status = 'running'",
-        (f"{note}; queued again automatically (attempt {attempts} of {MAX_ATTEMPTS} used)."[:db.MAX_ERROR_CHARS], task_id),
+        (f"{note}; queued again automatically ({attempts} of {MAX_ATTEMPTS} attempts used)."[:db.MAX_ERROR_CHARS], task_id),
     )
     return "pending"
 
@@ -810,7 +919,7 @@ def sweep_leases() -> list[int]:
                 note = "The device working on this task was removed"
             else:
                 note = f"Device {row['name']!r} stopped responding for more than {LEASE_REQUEUE_S} s"
-            _release_locked(conn, row["id"], row["attempts"], note)
+            _release_locked(conn, row["id"], row["attempts"], note, count=True)
             changed.append(int(row["id"]))
     if changed:
         log.warning("Device lease(s) expired for task(s) %s", changed)
@@ -847,7 +956,7 @@ def claim_for_device(device: dict, context_chars: int, max_tokens: int) -> dict 
                 return None
             conn.execute(
                 "UPDATE tasks SET status = 'running', lease_owner = ?, started_at = ?, finished_at = NULL, "
-                "error = NULL, attempts = attempts + 1 WHERE id = ? AND status = 'pending'",
+                "error = NULL WHERE id = ? AND status = 'pending'",
                 (owner, db.utcnow(), row["id"]),
             )
         task = db.task_dict(conn.execute("SELECT * FROM tasks WHERE id = ?", (row["id"],)).fetchone())
@@ -908,15 +1017,21 @@ def submit_result(device: dict, task_id: int, content: str, duration_s: float | 
         "created_at": db.utcnow(),
         "device": {"id": device["id"], "name": device["name"], "platform": device["platform"]},
     }
-    path = artifacts.write_task_result(task["project_id"], task_id, content, metadata)
+    # A name per attempt: a late answer can never overwrite the result of whoever holds the task now.
+    folder = artifacts.project_dir(task["project_id"])
+    stem = f"task_{int(task_id)}_device{int(device['id'])}_{secrets.token_hex(4)}"
+    path = artifacts.write_text_atomic(folder / f"{stem}.md", content.rstrip() + "\n")
+    sidecar = artifacts.write_json_atomic(folder / f"{stem}.json", metadata)
     with db.connect() as conn:
         with db.transaction(conn):
             cur = conn.execute(
-                "UPDATE tasks SET status = 'done', result_path = ?, error = NULL, finished_at = ?, lease_owner = NULL "
-                "WHERE id = ? AND status = 'running' AND lease_owner = ?",
+                "UPDATE tasks SET status = 'done', result_path = ?, error = NULL, finished_at = ?, lease_owner = NULL, "
+                "attempts = attempts + 1 WHERE id = ? AND status = 'running' AND lease_owner = ?",
                 (str(path), db.utcnow(), task_id, _owner(device["id"])),
             )
             if cur.rowcount != 1:
+                for leftover in (path, sidecar):
+                    leftover.unlink(missing_ok=True)
                 raise HTTPError(HTTPStatus.CONFLICT, f"This device no longer holds task #{task_id}; the answer was discarded.")
             conn.execute(
                 "UPDATE devices SET tasks_done = tasks_done + 1, model = COALESCE(?, model) WHERE id = ?",
@@ -938,8 +1053,8 @@ def submit_failure(device: dict, task_id: int, error: str, release: bool) -> dic
             else:
                 conn.execute("DELETE FROM device_claims WHERE task_id = ?", (task_id,))
                 conn.execute(
-                    "UPDATE tasks SET status = 'failed', lease_owner = NULL, finished_at = ?, error = ? "
-                    "WHERE id = ? AND status = 'running'",
+                    "UPDATE tasks SET status = 'failed', lease_owner = NULL, finished_at = ?, error = ?, "
+                    "attempts = attempts + 1 WHERE id = ? AND status = 'running'",
                     (db.utcnow(), f"Failed on device {device['name']!r}: {error}"[:db.MAX_ERROR_CHARS], task_id),
                 )
         task = db.task_dict(conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone())
@@ -1047,11 +1162,7 @@ def encode_secret(secret: bytes) -> str:
 
 
 def _pair(data: dict, client_ip: str) -> dict:
-    name = clean_device_name(data.get("name"))
-    platform_text = clean_text(data.get("platform") or "", 64)
-    ram = data.get("ram_total_bytes")
-    if ram is not None and (isinstance(ram, bool) or not isinstance(ram, int) or not 0 <= ram <= 2**50):
-        raise ValueError("ram_total_bytes must be a whole number of bytes")
+    name, platform_text, ram = _validated_device_info(data)
     secret = _decode_secret(data.get("secret"))
     with _STATE.lock:
         pairing = _active_pairing()
@@ -1073,13 +1184,7 @@ def _pair(data: dict, client_ip: str) -> dict:
         if count >= MAX_DEVICES:
             raise HTTPError(HTTPStatus.CONFLICT, f"At most {MAX_DEVICES} devices can be paired; remove one first.")
         _STATE.pairing = None  # one-time
-    key = secrets.token_bytes(32)
-    with db.connect() as conn:
-        cur = conn.execute(
-            "INSERT INTO devices (name, key_b64, platform, ram_total_bytes, paired_at, last_seen) VALUES (?, ?, ?, ?, ?, ?)",
-            (name, base64.b64encode(key).decode("ascii"), platform_text, ram, db.utcnow(), _now()),
-        )
-        device_id = int(cur.lastrowid)
+    device_id, key = _insert_device(name, platform_text, ram)
     log.info("Paired device #%s (%s) from %s", device_id, name, client_ip)
     return {
         "device_id": device_id,
@@ -1087,6 +1192,444 @@ def _pair(data: dict, client_ip: str) -> dict:
         "host_name": host_display_name(),
         "server_time": int(_now()),
     }
+
+
+# --------------------------------------------------------------------------- discovery (UDP beacons)
+
+
+@dataclass(frozen=True)
+class NearbyHost:
+    id: str
+    name: str
+    addresses: tuple[str, ...]
+    port: int
+    fp_prefix: bytes  # first 8 bytes of the certificate SHA-256 (from the beacon; unauthenticated)
+
+
+_HOST_IDS: dict[str, str] = {}
+_ID_RE = re.compile(r"[0-9a-f]{8,32}")
+_FP16_RE = re.compile(r"[0-9a-f]{16}")
+
+
+def host_id() -> str:
+    """Stable, non-secret id of this installation (``<home>/cluster/host_id``)."""
+    path = cluster_dir() / "host_id"
+    cached = _HOST_IDS.get(str(path))
+    if cached:
+        return cached
+    try:
+        text = path.read_text(encoding="ascii").strip()
+    except (OSError, UnicodeDecodeError):
+        text = ""
+    if not re.fullmatch(r"[0-9a-f]{16}", text):
+        text = secrets.token_hex(8)
+        artifacts.write_text_atomic(path, text + "\n")
+    _HOST_IDS[str(path)] = text
+    return text
+
+
+def encode_beacon(hid: str, name: str, port: int, fingerprint: bytes) -> bytes:
+    name = clean_text(name, 64)
+    while True:
+        raw = json.dumps(
+            {"app": "lowram", "v": 1, "id": hid, "name": name, "port": port, "fp": fingerprint.hex()[:16]},
+            separators=(",", ":"), ensure_ascii=True,
+        ).encode("ascii")
+        if len(raw) <= MAX_BEACON_BYTES or not name:
+            return raw
+        name = name[:-8]
+
+
+def decode_beacon(raw: bytes) -> dict | None:
+    """Validated beacon fields, or None for anything that is not a well-formed LowRAM beacon."""
+    if not isinstance(raw, (bytes, bytearray)) or len(raw) > MAX_BEACON_BYTES:
+        return None
+    try:
+        data = json.loads(bytes(raw).decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return None
+    if not isinstance(data, dict) or data.get("app") != "lowram" or data.get("v") != 1:
+        return None
+    hid, port, fp, name = data.get("id"), data.get("port"), data.get("fp"), data.get("name")
+    if not isinstance(hid, str) or not _ID_RE.fullmatch(hid):
+        return None
+    if isinstance(port, bool) or not isinstance(port, int) or not 1024 <= port <= 65535:
+        return None
+    if not isinstance(fp, str) or not _FP16_RE.fullmatch(fp):
+        return None
+    return {"id": hid, "name": clean_device_name(name if isinstance(name, str) else None, "LowRAM AI"),
+            "port": port, "fp": fp}
+
+
+def _listener_own_id() -> str:
+    return host_id()
+
+
+class DiscoveryListener:
+    """Collects beacons of hosts seen in the last NEARBY_TTL_S seconds. Never raises."""
+
+    def __init__(self, port: int, bind_host: str = "", own_id: str | None = None):
+        self.port, self.bind_host, self.own_id = port, bind_host, own_id
+        self.error: str | None = None
+        self._hosts: dict[str, dict] = {}
+        self._last_packet: dict[str, float] = {}
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._sock: socket.socket | None = None
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> bool:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if hasattr(socket, "SO_REUSEPORT"):
+                try:
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+                except OSError:
+                    pass
+            sock.bind((self.bind_host, self.port))
+        except OSError as exc:
+            sock.close()
+            self.error = f"Cannot listen for nearby devices on UDP port {self.port}: {exc.strerror or exc}"
+            log.warning("%s", self.error)
+            return False
+        try:
+            mreq = socket.inet_aton(DISCOVERY_GROUP) + socket.inet_aton("0.0.0.0")
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+        except OSError:
+            pass  # multicast is optional; broadcast still works
+        sock.settimeout(0.5)
+        self._sock = sock
+        self._thread = threading.Thread(target=self._run, name="lowram-discovery", daemon=True)
+        self._thread.start()
+        return True
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(3)
+        if self._sock is not None:
+            self._sock.close()
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                data, addr = self._sock.recvfrom(2048)  # type: ignore[union-attr]
+            except socket.timeout:
+                continue
+            except OSError:
+                if self._stop.is_set():
+                    break
+                time.sleep(0.5)
+                continue
+            try:
+                self.handle(data, addr[0])
+            except Exception:  # a hostile packet must never stop discovery
+                log.debug("Ignoring a bad discovery packet from %s", addr[0], exc_info=True)
+
+    def handle(self, data: bytes, ip: str) -> bool:
+        mono = time.monotonic()
+        with self._lock:
+            last = self._last_packet.get(ip)
+            if last is not None and mono - last < BEACON_MIN_GAP_S:
+                return False  # rate limit per source address
+            if len(self._last_packet) > 1024:
+                self._last_packet.clear()
+            self._last_packet[ip] = mono
+        beacon = decode_beacon(data)
+        if beacon is None or beacon["id"] == (self.own_id or _listener_own_id()):
+            return False
+        now = _now()
+        with self._lock:
+            entry = self._hosts.get(beacon["id"])
+            if entry is None or entry["fp"] != beacon["fp"]:
+                self._prune(now)
+                if len(self._hosts) >= MAX_NEARBY:
+                    return False
+                entry = self._hosts[beacon["id"]] = {"id": beacon["id"], "addresses": {}}
+            entry.update(name=beacon["name"], port=beacon["port"], fp=beacon["fp"], last_seen=now)
+            entry["addresses"][ip] = now
+            if len(entry["addresses"]) > 8:
+                oldest = min(entry["addresses"], key=entry["addresses"].get)
+                entry["addresses"].pop(oldest)
+        return True
+
+    def _prune(self, now: float) -> None:
+        for key in [k for k, e in self._hosts.items() if now - e["last_seen"] > NEARBY_TTL_S]:
+            self._hosts.pop(key)
+
+    def hosts(self) -> list[dict]:
+        now = _now()
+        with self._lock:
+            self._prune(now)
+            result = []
+            for entry in sorted(self._hosts.values(), key=lambda e: e["name"].lower()):
+                fresh = [ip for ip, seen in sorted(entry["addresses"].items(), key=lambda kv: -kv[1])
+                         if now - seen <= NEARBY_TTL_S]
+                result.append({"id": entry["id"], "name": entry["name"], "addresses": fresh, "port": entry["port"],
+                               "fingerprint_short": entry["fp"], "last_seen": _iso(entry["last_seen"])})
+            return result
+
+
+def start_discovery_listener() -> None:
+    with _STATE.lock:
+        if _STATE.discovery is not None:
+            return
+        listener = DiscoveryListener(DISCOVERY_PORT, DISCOVERY_BIND)
+        listener.start()
+        _STATE.discovery = listener
+
+
+def stop_discovery_listener() -> None:
+    with _STATE.lock:
+        listener, _STATE.discovery = _STATE.discovery, None
+    if listener is not None:
+        listener.stop()
+
+
+def nearby_hosts() -> list[dict]:
+    with _STATE.lock:
+        listener = _STATE.discovery
+    return listener.hosts() if listener is not None else []
+
+
+def find_nearby(host_id_value: object) -> NearbyHost:
+    if not isinstance(host_id_value, str) or not _ID_RE.fullmatch(host_id_value):
+        raise ValueError("host_id must be the id of a nearby device")
+    for host in nearby_hosts():
+        if host["id"] == host_id_value and host["addresses"]:
+            return NearbyHost(host["id"], host["name"], tuple(host["addresses"]), host["port"],
+                              bytes.fromhex(host["fingerprint_short"]))
+    raise HTTPError(
+        HTTPStatus.NOT_FOUND,
+        "That device is not visible any more. Make sure both computers are on the same Wi-Fi (some routers "
+        "isolate Wi-Fi clients) and Devices is on there – or use the pairing code instead.",
+    )
+
+
+def _beacon_targets() -> list[tuple[str, int]]:
+    """Broadcast address of every LAN interface, the global broadcast and the multicast group."""
+    targets: list[tuple[str, int]] = []
+    try:
+        interfaces = psutil.net_if_addrs()
+    except Exception:
+        interfaces = {}
+    for _name, addrs in sorted(interfaces.items()):
+        for addr in addrs:
+            if addr.family != socket.AF_INET or not addr.broadcast:
+                continue
+            try:
+                ip = ipaddress.IPv4Address(addr.address)
+                ipaddress.IPv4Address(addr.broadcast)
+            except ValueError:
+                continue
+            if ip.is_loopback or ip.is_link_local:
+                continue
+            if (addr.broadcast, DISCOVERY_PORT) not in targets:
+                targets.append((addr.broadcast, DISCOVERY_PORT))
+    targets += [("255.255.255.255", DISCOVERY_PORT), (DISCOVERY_GROUP, DISCOVERY_PORT)]
+    return targets
+
+
+def _beacon_main(stop: threading.Event) -> None:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        try:
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 1)
+        except OSError:
+            pass
+        while not stop.is_set():
+            try:
+                port, fingerprint = listening_port(), certificate_fingerprint()
+                if port is not None and fingerprint is not None and settings.get("cluster", "discoverable"):
+                    payload = encode_beacon(host_id(), host_display_name(), port, fingerprint)
+                    for target in _beacon_targets():
+                        try:
+                            sock.sendto(payload, target)
+                        except OSError:
+                            pass  # e.g. no route for one interface; the others still work
+            except Exception:
+                log.debug("Beacon round failed", exc_info=True)
+            stop.wait(BEACON_INTERVAL_S)
+    finally:
+        sock.close()
+
+
+def _start_beacon() -> None:
+    with _STATE.lock:
+        if _STATE.beacon is not None and _STATE.beacon.is_alive():
+            return
+        _STATE.beacon_stop = threading.Event()
+        _STATE.beacon = threading.Thread(target=_beacon_main, args=(_STATE.beacon_stop,),
+                                         name="lowram-beacon", daemon=True)
+        _STATE.beacon.start()
+
+
+def _stop_beacon() -> None:
+    with _STATE.lock:
+        thread, _STATE.beacon = _STATE.beacon, None
+        _STATE.beacon_stop.set()
+    if thread is not None:
+        thread.join(3)
+
+
+# --------------------------------------------------------------------------- pairing requests (numeric comparison)
+#
+# 1. helper → pair-request {…, client_commit = sha256(client_nonce)}   → {request_id, host_nonce}
+# 2. helper → pair-status {request_id, client_nonce}   (reveals the nonce; polled every 2 s)
+# Both sides show verification_code(full certificate fingerprint, client_nonce, host_nonce).
+# The commitment stops a man-in-the-middle from picking nonces until the two numbers match.
+
+
+def verification_code(fingerprint: bytes, client_nonce: bytes, host_nonce: bytes) -> str:
+    number = int.from_bytes(hashlib.sha256(fingerprint + client_nonce + host_nonce).digest()[:8], "big") % 1_000_000
+    text = f"{number:06d}"
+    return f"{text[:3]} {text[3:]}"
+
+
+def _b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
+
+
+def _from_b64url(value: object, length: int) -> bytes | None:
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", value):
+        return None
+    try:
+        raw = base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+    except (binascii.Error, ValueError):
+        return None
+    return raw if len(raw) == length else None
+
+
+def _purge_requests(now: float) -> None:
+    """Inside _STATE.lock: expire old requests; forget them 2 minutes later."""
+    for rid, item in list(_STATE.requests.items()):
+        if item["state"] in ("pending", "approved") and not item["delivered"] and now > item["expires"]:
+            item["state"] = "expired"
+        if now > item["expires"] + REQUEST_TTL_S:
+            _STATE.requests.pop(rid)
+
+
+def _validated_device_info(data: dict) -> tuple[str, str, int | None]:
+    name = clean_device_name(data.get("name"))
+    platform_text = clean_text(data.get("platform") or "", 64)
+    ram = data.get("ram_total_bytes")
+    if ram is not None and (isinstance(ram, bool) or not isinstance(ram, int) or not 0 <= ram <= 2**50):
+        raise ValueError("ram_total_bytes must be a whole number of bytes")
+    return name, platform_text, ram
+
+
+def _device_count() -> int:
+    with db.connect() as conn:
+        return int(conn.execute("SELECT COUNT(*) FROM devices").fetchone()[0])
+
+
+def _insert_device(name: str, platform_text: str, ram: int | None) -> tuple[int, bytes]:
+    key = secrets.token_bytes(32)
+    with db.connect() as conn:
+        cur = conn.execute(
+            "INSERT INTO devices (name, key_b64, platform, ram_total_bytes, paired_at, last_seen) VALUES (?, ?, ?, ?, ?, ?)",
+            (name, base64.b64encode(key).decode("ascii"), platform_text, ram, db.utcnow(), _now()),
+        )
+        return int(cur.lastrowid), key
+
+
+def _too_many(message: str, retry_after: float) -> HTTPError:
+    return HTTPError(HTTPStatus.TOO_MANY_REQUESTS, f"{message} (try again in {max(1, round(retry_after))} s)")
+
+
+def _pair_request(data: dict, ip: str) -> dict:
+    if not settings.get("cluster", "discoverable"):
+        raise HTTPError(HTTPStatus.FORBIDDEN, "This computer does not accept pairing requests (it is hidden). "
+                                              "Use the pairing code from its Devices page instead.")
+    name, platform_text, ram = _validated_device_info(data)
+    commit = _from_b64url(data.get("client_commit"), 32)
+    if commit is None:
+        raise ValueError("client_commit must be the base64url SHA-256 of the client nonce")
+    if _device_count() >= MAX_DEVICES:
+        raise HTTPError(HTTPStatus.CONFLICT, f"At most {MAX_DEVICES} devices can be paired; remove one first.")
+    now, mono = _now(), time.monotonic()
+    with _STATE.lock:
+        _purge_requests(now)
+        last = _STATE.request_last_by_ip.get(ip)
+        if last is not None and mono - last < REQUEST_MIN_INTERVAL_S:
+            raise _too_many("Too many pairing requests from this computer", REQUEST_MIN_INTERVAL_S - (mono - last))
+        for item in _STATE.requests.values():  # one open request per address: a new one replaces it
+            if item["address"] == ip and item["state"] == "pending":
+                item["state"], item["expires"] = "expired", now
+        pending = [r for r in _STATE.requests.values() if r["state"] == "pending"]
+        if len(pending) >= MAX_PENDING_REQUESTS:
+            raise _too_many("Too many pairing requests are waiting on the host", min(r["expires"] for r in pending) - now)
+        if len(_STATE.request_last_by_ip) > 256:
+            _STATE.request_last_by_ip.clear()
+        _STATE.request_last_by_ip[ip] = mono
+        _STATE.request_seq += 1
+        rid = _STATE.request_seq
+        host_nonce = secrets.token_bytes(16)
+        _STATE.requests[rid] = {
+            "id": rid, "name": name, "platform": platform_text, "ram_total_bytes": ram, "address": ip,
+            "commit": commit, "client_nonce": None, "host_nonce": host_nonce, "code": None,
+            "state": "pending", "created": now, "expires": now + REQUEST_TTL_S, "delivered": False, "device_id": None,
+        }
+    log.info("Pairing request #%s from %s (%s)", rid, ip, name)
+    return {"request_id": rid, "host_nonce": _b64url(host_nonce), "expires_in": REQUEST_TTL_S}
+
+
+def _pair_status(data: dict) -> dict:
+    rid = data.get("request_id")
+    nonce = _from_b64url(data.get("client_nonce"), 16)
+    unknown = HTTPError(HTTPStatus.NOT_FOUND, "Unknown or expired pairing request; start pairing again.")
+    if isinstance(rid, bool) or not isinstance(rid, int) or nonce is None:
+        raise unknown
+    now = _now()
+    with _STATE.lock:
+        _purge_requests(now)
+        item = _STATE.requests.get(rid)
+        if item is None or not hmac.compare_digest(hashlib.sha256(nonce).digest(), item["commit"]):
+            raise unknown  # only the helper that made the request knows the nonce
+        if item["client_nonce"] is None and item["state"] == "pending":
+            item["client_nonce"] = nonce
+            item["code"] = verification_code(certificate_fingerprint() or b"", nonce, item["host_nonce"])
+        if item["state"] != "approved":
+            return {"state": item["state"]}
+        if item["delivered"]:
+            return {"state": "approved", "device_id": item["device_id"]}  # the key is handed out once
+        if _device_count() >= MAX_DEVICES:
+            item["state"] = "denied"
+            return {"state": "denied"}
+        device_id, key = _insert_device(item["name"], item["platform"], item["ram_total_bytes"])
+        item.update(delivered=True, device_id=device_id)
+    log.info("Paired device #%s (%s) via request #%s", device_id, item["name"], rid)
+    return {"state": "approved", "device_id": device_id, "device_key": base64.b64encode(key).decode("ascii"),
+            "host_name": host_display_name(), "server_time": int(now)}
+
+
+def pending_requests() -> list[dict]:
+    now = _now()
+    with _STATE.lock:
+        _purge_requests(now)
+        return [
+            {"id": r["id"], "name": r["name"], "platform": r["platform"], "ram_total_bytes": r["ram_total_bytes"],
+             "address": r["address"], "verification_code": r["code"], "expires_at": _iso(r["expires"])}
+            for r in sorted(_STATE.requests.values(), key=lambda r: r["id"]) if r["state"] == "pending"
+        ]
+
+
+def answer_request(request_id: int, approve: bool) -> None:
+    now = _now()
+    with _STATE.lock:
+        _purge_requests(now)
+        item = _STATE.requests.get(request_id)
+        if item is None or item["state"] != "pending":
+            raise db.NotFound(f"Pairing request #{request_id} no longer exists (it expired or was answered)")
+        if approve and item["code"] is None:
+            raise HTTPError(HTTPStatus.CONFLICT, "The helper has not finished its request yet; wait a moment.")
+        if approve:
+            item["state"], item["expires"] = "approved", max(item["expires"], now + 30)
+        else:
+            item["state"] = "denied"
+    log.info("Pairing request #%s %s", request_id, "approved" if approve else "denied")
 
 
 # --------------------------------------------------------------------------- distributed projects and merge
@@ -1407,6 +1950,8 @@ def status() -> dict:
         "devices": list_devices(),
         "pairing": {"code": pairing["code"], "expires_at": _iso(pairing["expires"])} if pairing else None,
         "pairing_error": pairing_error,
+        "requests": pending_requests(),
+        "discoverable": bool(settings.get("cluster", "discoverable")),
         "error": error,
         "host_name": host_display_name(),
         "projects": distributed_projects(),
@@ -1439,6 +1984,7 @@ def reset() -> None:
     worker.stop_app_worker(forget=True)
     _stop_coordinator()
     stop_lan_server()
+    stop_discovery_listener()
     global _STATE
     _STATE = _State()
 
@@ -1447,6 +1993,7 @@ def reset() -> None:
 def on_app_startup(server: Any) -> None:
     with _STATE.lock:
         _STATE.app_server = server
+    start_discovery_listener()  # never raises; a taken port only means "no nearby devices"
     if settings.get("cluster", "enabled"):
         _ensure_coordinator()
         start_lan_server()  # a ClusterError becomes a startup error shown in /api/status
@@ -1464,6 +2011,7 @@ def on_app_shutdown(server: Any) -> None:
     worker.stop_app_worker()
     _stop_coordinator()
     stop_lan_server()
+    stop_discovery_listener()
 
 
 # --------------------------------------------------------------------------- UI routes (127.0.0.1)
@@ -1542,9 +2090,36 @@ def post_join(req: Request) -> Response:
 
     data = req.json()
     percent = memory.validate_percent(data.get("percent", settings.get("budget_percent")))
+    if data.get("host_id") is not None:
+        host = find_nearby(data.get("host_id"))
+        return Response(
+            {"worker": worker.start_app_worker(None, data.get("name"), percent, host=host)}, HTTPStatus.ACCEPTED
+        )
     return Response(
         {"worker": worker.start_app_worker(data.get("code"), data.get("name"), percent)}, HTTPStatus.ACCEPTED
     )
+
+
+@route("GET", r"/api/cluster/nearby")
+def get_nearby(req: Request) -> Response:
+    with _STATE.lock:
+        listener = _STATE.discovery
+    error = listener.error if listener is not None else None
+    return Response({"hosts": nearby_hosts(), "error": error})
+
+
+@route("POST", r"/api/cluster/requests/(\d+)/approve")
+def post_approve_request(req: Request, request_id: int) -> Response:
+    req.json()
+    answer_request(request_id, True)
+    return Response({"approved": True})
+
+
+@route("POST", r"/api/cluster/requests/(\d+)/deny")
+def post_deny_request(req: Request, request_id: int) -> Response:
+    req.json()
+    answer_request(request_id, False)
+    return Response({"denied": True})
 
 
 @route("POST", r"/api/cluster/leave")
@@ -1577,6 +2152,16 @@ def lan_pair(req: Request) -> Response:
     return Response(_pair(_lan_json(req), req.handler.client_address[0]))
 
 
+@route("POST", r"/cluster/v1/pair-request", scope=LAN_SCOPE)
+def lan_pair_request(req: Request) -> Response:
+    return Response(_pair_request(_lan_json(req), req.handler.client_address[0]))
+
+
+@route("POST", r"/cluster/v1/pair-status", scope=LAN_SCOPE)
+def lan_pair_status(req: Request) -> Response:
+    return Response(_pair_status(_lan_json(req)))
+
+
 @route("POST", r"/cluster/v1/heartbeat", scope=LAN_SCOPE)
 def lan_heartbeat(req: Request) -> Response:
     device = _device(req)
@@ -1601,6 +2186,13 @@ def lan_claim(req: Request) -> Response:
     context_chars = _clamp_int(data.get("context_chars"), memory.MIN_CONTEXT_CHARS, memory.MAX_CONTEXT_CHARS,
                                memory.MIN_CONTEXT_CHARS)
     max_tokens = _clamp_int(data.get("max_tokens"), memory.MIN_MAX_TOKENS, memory.MAX_MAX_TOKENS, memory.MIN_MAX_TOKENS)
+    now = time.monotonic()
+    with _STATE.lock:
+        wait = CLAIM_MIN_INTERVAL_S - (now - _STATE.last_claim.get(device["id"], -1e9))
+        if wait > 0:
+            return Response({"error": "Too many claims; slow down.", "task": None, "retry_after": round(wait, 2)},
+                            HTTPStatus.TOO_MANY_REQUESTS)
+        _STATE.last_claim[device["id"]] = now
     task = claim_for_device(device, context_chars, max_tokens)
     return Response({"task": task, "retry_after": None if task else 5})
 

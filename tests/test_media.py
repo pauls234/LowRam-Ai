@@ -1,3 +1,4 @@
+import hashlib
 import os
 import time
 import unittest
@@ -186,14 +187,31 @@ class RuntimeDiscoveryTests(MediaTestCase):
         impostor = write_script(self.tmp / "pathbin" / "sd", "#!/usr/bin/env python3\nprint('sd 1.0.0')\n")
         with mock.patch.dict(os.environ, {"PATH": f"{impostor.parent}{os.pathsep}{os.environ['PATH']}"}), \
                 mock.patch.object(media, "HOMEBREW_DIRS", ()):
-            info = media.find_runtime()
+            info = media.find_runtime(refresh=True)
         self.assertFalse(info["installed"])
 
-    def test_restores_executable_bit(self):
+    def test_status_polling_neither_chmods_nor_reprobes(self):
         self.sd.chmod(0o644)
-        media._probe_cache.clear()
-        self.assertTrue(media.find_runtime()["installed"])
-        self.assertTrue(os.access(self.sd, os.X_OK))
+        self.assertFalse(media.find_runtime()["installed"])  # not executable: skipped, never chmod'ed here
+        self.assertFalse(os.access(self.sd, os.X_OK))
+        self.sd.chmod(0o755)
+        with mock.patch.object(media, "_probe_binary", wraps=media._probe_binary) as probe:
+            for _ in range(5):
+                media.find_runtime()  # cached result (TTL)
+            probe.assert_not_called()
+            self.assertTrue(media.find_runtime(refresh=True)["installed"])
+            self.assertEqual(probe.call_count, 1)
+
+    def test_on_complete_makes_binaries_executable_and_invalidates(self):
+        extracted = self.tmp / "extracted"
+        binary = write_script(extracted / "bin" / "sd-cli", "#!/bin/sh\n")
+        binary.chmod(0o644)
+        media.find_runtime()
+        media._runtime_installed(extracted)
+        self.assertTrue(os.access(binary, os.X_OK))
+        self.assertIsNone(media._runtime_cache)
+        with self.assertRaises(media.MediaJobError):
+            media._runtime_installed(self.tmp / "empty-archive")
 
 
 @unittest.skipUnless(POSIX, "fake executables are POSIX scripts")
@@ -329,6 +347,11 @@ class WorkerTests(MediaTestCase):
         job = media.get_job(job["id"])
         self.assertEqual(job["status"], "failed")
         self.assertIn("closed", job["error"])
+        # the pause context was left inside stop() (before the engine's own shutdown hook runs);
+        # media itself never starts the engine
+        self.assertEqual(self.engine.events, ["pause", "resume"])
+        self.assertFalse(media.WORKER.is_alive())
+        self.assertIsNone(db.busy_reason())
 
     def test_video_native_webm_without_ffmpeg(self):
         job = self.wait_status(media.submit_job({"kind": "video", "prompt": "waves", "frames": 17})["id"])
@@ -431,7 +454,7 @@ class ApiTests(MediaAppTestCase):
 
     def test_job_refused_without_runtime(self):
         self.sd.unlink()
-        media._probe_cache.clear()
+        media.invalidate_runtime_cache()
         with mock.patch.object(media, "HOMEBREW_DIRS", ()), mock.patch.object(media.shutil, "which", return_value=None):
             status, data = self.api("POST", "/api/media/jobs", image_job())
         self.assertEqual(status, 409)
@@ -461,11 +484,58 @@ class ApiTests(MediaAppTestCase):
         root = self.home / "bin" / "stable-diffusion.cpp"
         self.assertEqual(Path(call["extract"]), root / "master-500-abcdef0")
         self.assertEqual(call["dest"].parent, root)
+        self.assertIs(call["on_complete"], media._runtime_installed)
         self.assertEqual(data["download"]["id"], "media-runtime")
         # an active download is returned instead of starting a second one
         with mock.patch.object(media, "fetch_json") as fetch:
             self.assertEqual(self.api("POST", "/api/media/runtime/install")[0], 202)
             fetch.assert_not_called()
+
+    def test_runtime_install_refuses_missing_digest(self):
+        release = {"tag_name": "master-1-abc", "assets": [
+            {"name": "sd-master-abc-bin-Linux-Ubuntu-24.04-x86_64.zip", "size": 10,
+             "browser_download_url": media.RELEASE_DOWNLOAD_PREFIX + "master-1-abc/linux.zip"}]}
+        for digest in (None, "sha1:" + "a" * 40, "sha256:xyz"):
+            asset = dict(release["assets"][0], **({"digest": digest} if digest else {}))
+            with self.subTest(digest=digest), \
+                    mock.patch.object(media, "fetch_json", return_value=dict(release, assets=[asset])), \
+                    mock.patch.object(media, "_platform_key", return_value=("linux", "x86_64")):
+                status, data = self.api("POST", "/api/media/runtime/install")
+                self.assertEqual(status, 502)
+                self.assertIn("unverified", data["error"])
+        self.assertEqual(self.downloads.started, [])
+
+    def test_models_drive_not_connected(self):
+        drive = self.tmp / "ExternalSSD" / "models"
+        with mock.patch.dict(os.environ, {"LOWRAM_MODELS_DIR": str(drive)}):
+            status, data = self.api("GET", "/api/media/status")
+            self.assertEqual(status, 200)
+            self.assertFalse(data["models_available"])
+            self.assertIn("not connected", data["models_message"])
+            for model in data["image_models"] + data["video_models"]:
+                self.assertEqual((model["available"], model["installed"]), (False, False))
+                self.assertEqual(model["unavailable_reason"], media.DRIVE_MISSING_MESSAGE)
+            status, data = self.api("POST", "/api/media/jobs", image_job())
+            self.assertEqual((status, data["error"]), (409, media.DRIVE_MISSING_MESSAGE))
+            status, data = self.api("POST", "/api/media/models/sd15/install")
+            self.assertEqual(status, 409)
+            self.assertIn("not connected", data["error"])
+        self.assertEqual(self.downloads.started, [])
+        self.assertFalse(drive.exists())  # never created on the boot disk
+        self.assertEqual(media.list_jobs(), [])
+
+    def test_queued_job_fails_cleanly_when_drive_unplugged(self):
+        drive = self.tmp / "ssd"
+        drive.mkdir()
+        with mock.patch.dict(os.environ, {"LOWRAM_MODELS_DIR": str(drive)}):
+            self.install_model_files("sd-turbo")
+            with db.inference_slot("chat"):  # keep it queued while the drive is "unplugged"
+                job = media.submit_job(image_job())
+                self.rmtree(drive)
+            job = self.wait_status(job["id"])
+        self.assertEqual(job["status"], "failed")
+        self.assertIn("not connected", job["error"])
+        self.assertEqual(self.argv_calls(), [])
 
     def test_runtime_install_errors(self):
         with mock.patch.object(media, "fetch_json", side_effect=media.MediaSourceError("Could not reach api.github.com")):
@@ -525,6 +595,67 @@ class ApiTests(MediaAppTestCase):
     def test_installed_model_needs_no_download(self):
         status, data = self.api("POST", "/api/media/models/sd-turbo/install")
         self.assertEqual((status, data), (202, {"downloads": [], "installed": True}))
+
+
+@unittest.skipUnless(POSIX, "fake executables are POSIX scripts")
+class RealDownloadsTests(MediaTestCase):
+    """install_runtime / install_model against the real backend.downloads (network faked by FakeHub)."""
+
+    def setUp(self):
+        super().setUp()
+        from backend import downloads
+        from tests.engine_helpers import FakeHub
+
+        self.real = downloads
+        self.inject_module("backend.downloads", downloads)
+        self.hub = FakeHub()
+        self.addCleanup(self.hub.close)
+        downloads.set_opener(self.hub.opener)
+        self.addCleanup(downloads.set_opener, None)
+        self.addCleanup(downloads._reset_for_tests)
+
+    def test_runtime_install_extracts_and_is_found(self):
+        from tests.engine_helpers import make_zip
+        from tests.media_helpers import FAKE_SD
+
+        archive = make_zip([("file", "sd-cli", FAKE_SD.encode(), 0o644), ("file", "libstable-diffusion.so", b"x")])
+        name = "sd-master-abc-bin-Linux-Ubuntu-24.04-x86_64.zip"
+        url = media.RELEASE_DOWNLOAD_PREFIX + "master-7-abc/" + name
+        self.hub.files["github.com" + url.split("github.com", 1)[1]] = archive
+        release = {"tag_name": "master-7-abc", "assets": [{
+            "name": name, "size": len(archive), "browser_download_url": url,
+            "digest": "sha256:" + hashlib.sha256(archive).hexdigest()}]}
+        self.sd.unlink()
+        media.invalidate_runtime_cache()
+        with mock.patch.object(media, "fetch_json", return_value=release), \
+                mock.patch.object(media, "_platform_key", return_value=("linux", "x86_64")):
+            download = media.install_runtime()
+        final = self.real.wait(download["id"], 15)
+        self.assertEqual(final["state"], "done", final)
+        info = media.find_runtime()  # cache was invalidated by on_complete
+        self.assertTrue(info["installed"], info)
+        binary = self.home / "bin" / "stable-diffusion.cpp" / "master-7-abc" / "sd-cli"
+        self.assertEqual(info["path"], str(binary))
+        self.assertTrue(os.access(binary, os.X_OK))
+        self.assertEqual(self.wait_status(media.submit_job(image_job())["id"])["status"], "done")
+
+    def test_model_install_verified_and_bad_hash_rejected(self):
+        data = b"weights" * 1000
+        key = "huggingface.co/stable-diffusion-v1-5/stable-diffusion-v1-5/resolve/main/v1-5-pruned-emaonly-fp16.safetensors"
+        self.hub.files[key] = data
+        tree = [{"type": "file", "path": "v1-5-pruned-emaonly-fp16.safetensors",
+                 "lfs": {"oid": hashlib.sha256(b"something else").hexdigest(), "size": len(data)}}]
+        model = media.CATALOG_BY_ID["sd15"]
+        with mock.patch.object(media, "fetch_json", return_value=tree):
+            started = media.install_model("sd15")
+        self.assertEqual(self.real.wait(started[0]["id"], 15)["state"], "failed")
+        self.assertFalse(media.model_installed(model))
+        tree[0]["lfs"]["oid"] = hashlib.sha256(data).hexdigest()
+        with mock.patch.object(media, "fetch_json", return_value=tree):
+            started = media.install_model("sd15")
+        self.assertEqual(self.real.wait(started[0]["id"], 15)["state"], "done")
+        self.assertTrue(media.model_installed(model))
+        self.assertEqual(media.install_model("sd15"), [])
 
 
 class SourceSafetyTests(unittest.TestCase):

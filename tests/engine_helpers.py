@@ -212,7 +212,8 @@ def opt(name):
     return args[args.index(name) + 1] if name in args else None
 
 host, port = opt("--host"), int(opt("--port"))
-print(f"fake llama-server model={opt('-m')} host={host} port={port} ctx={opt('-c')}", flush=True)
+print(f"fake llama-server model={opt('-m')} host={host} port={port} ctx={opt('-c')} parallel={opt('--parallel')} "
+      f"secret_env={sorted(k for k in os.environ if 'SECRET' in k or 'TOKEN' in k)}", flush=True)
 if mode == "crash":
     print("error: failed to load model: fake corrupt file", flush=True)
     sys.exit(3)
@@ -243,6 +244,9 @@ class H(BaseHTTPRequestHandler):
 
     def do_POST(self):
         self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        key = opt("--api-key")
+        if key and self.headers.get("Authorization") != "Bearer " + key:
+            return self._send(401, {"error": {"code": 401, "message": "Invalid API Key"}})
         self._send(200, {"choices": [{"message": {"role": "assistant", "content": "fake llama reply"}}]})
 
 srv = HTTPServer((host, port), H)

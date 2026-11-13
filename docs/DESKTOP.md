@@ -50,27 +50,66 @@ python lowram.py app [--browser]         # same via the CLI
 
 ## What the launcher does
 
-* Looks for a running LowRAM AI on ports 8765–8785 (`GET /api/status`) and
-  opens it instead of starting another one.
+* Opens the LowRAM AI that is already running for this user instead of
+  starting another one – but only if it can prove it is ours:
+  `~/.lowram-ai/instance.json` (mode 0600, written atomically, removed on
+  clean shutdown) records port, pid, process start time and the SHA-256 of
+  the server's per-process page token. The file must be owned by you and not
+  writable by others, the process must still be alive with the same start
+  time, and the server on that port must serve the matching token. Anything
+  else listening on 127.0.0.1 (another user's LowRAM AI, a stale or foreign
+  program) is never shown in the window; LowRAM AI then starts its own
+  server on the next free port.
 * Otherwise starts the server on **127.0.0.1 only**, on 8765 or the next free
   port up to 8785 (`--port` or `LOWRAM_PORT` select one exact port), and
   waits until `/api/status` answers (20 s).
 * Shows a native window (pywebview, 1280×820, minimum 900×600) with a short
   start screen; if the server cannot start, the window explains why and where
   the log is. Without a native web view it opens the default browser.
-* Closing the window, Ctrl+C, SIGTERM or closing the terminal runs a clean
-  shutdown (stops the task loop and a managed llama-server).
+* Closing the window, Ctrl+C, SIGTERM or closing the terminal (SIGHUP) runs a
+  clean shutdown (stops the task loop and a managed llama-server). With the
+  window open, a watcher thread reacts to these signals immediately (Python's
+  wakeup fd), shuts the server down first and then closes the window, so
+  llama-server is never left running. Only a force quit (SIGKILL) skips this.
+* The window's JavaScript can call exactly two functions, nothing else:
+  `window.pywebview.api.pick_folder(title)` and
+  `window.pywebview.api.pick_file(title, ["*.gguf"])`. Both open a native
+  dialog and return an absolute path or `null` (cancelled). In the browser
+  `window.pywebview` does not exist; the UI falls back to a text field.
 
 ## Where things are
 
 | What | Where |
 | --- | --- |
-| Models, chats, projects, settings | `~/.lowram-ai/` (change with `LOWRAM_HOME`) |
+| Chats, projects, settings | `~/.lowram-ai/` (change with `LOWRAM_HOME`) |
+| Models | `~/.lowram-ai/models/` by default – see below |
+| Running instance (port, pid) | `~/.lowram-ai/instance.json` |
 | Log file (send it with bug reports) | `~/.lowram-ai/logs/app.log` (rotating, 5 × 1 MB) |
 | Window data (theme, drafts) | `~/.lowram-ai/webview/` |
 | App (macOS) | `/Applications/LowRAM AI.app` – deleting it keeps your data |
 
-To remove everything, delete the app and the `~/.lowram-ai` folder.
+To remove everything, delete the app and the `~/.lowram-ai` folder (and a
+custom models folder, if you chose one).
+
+### Models on an external drive
+
+Models are large (2–10 GB each). In **Models & Settings** you can choose a
+different models folder – for example `/Volumes/MySSD/LowRAM models` on an
+external SSD (in the app window a native folder dialog opens) – and let
+LowRAM AI move the models that are already installed. You can also import a
+`.gguf` file you already have; it is registered, not copied. Keep the drive connected while you use those
+models – when it is missing, LowRAM AI says so instead of failing silently.
+`LOWRAM_MODELS_DIR` overrides the setting.
+
+### Devices (other computers)
+
+The first time you turn on **Devices**, macOS asks *"Do you want the
+application "LowRAM AI" to accept incoming network connections?"* – click
+**Allow**. Other computers on your network need this to connect; LowRAM AI
+then listens on your local network with TLS and per-device keys, only while
+Devices is on. Windows shows a similar firewall prompt – allow it for
+*private* networks only. If you clicked *Deny* by mistake: System Settings →
+Network → Firewall → Options → LowRAM AI → Allow incoming connections.
 
 ## Build the app yourself
 
