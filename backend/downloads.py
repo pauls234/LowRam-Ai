@@ -414,17 +414,31 @@ def _clean_label(label: object) -> str:
     return re.sub(r"[\x00-\x1f\x7f]", " ", label).strip()[:200]
 
 
+def _inside(path: Path, root: Path) -> bool:
+    return path == root or root in path.parents
+
+
 def _validate_dest(dest: Path | str) -> Path:
-    """``dest`` must be below LOWRAM_HOME and must not be a symlink."""
+    """``dest`` must be below LOWRAM_HOME or the models folder and must not be a symlink.
+
+    A custom models folder (e.g. on an external drive) is never created: if it
+    is missing, the drive is probably unplugged and we must not silently fill
+    the boot disk instead.
+    """
     path = Path(dest).expanduser()
     if not path.is_absolute():
         raise ValueError("Download destination must be an absolute path")
     if path.name in ("", ".", "..") or ".." in path.parts:
         raise ValueError("Download destination is not a valid file name")
     home = config.home_dir().resolve()
+    models = Path(config.models_dir()).expanduser()
+    models_resolved = models.resolve()
     parent = path.parent.resolve()
-    if parent != home and home not in parent.parents:
-        raise ValueError("Downloads may only be saved inside the LowRAM AI data folder")
+    if not _inside(parent, home):
+        if not _inside(parent, models_resolved):
+            raise ValueError("Downloads may only be saved inside the LowRAM AI data folder or the models folder")
+        if not models.is_dir():
+            raise ValueError(f"The models folder {models} is not available (external drive not connected?)")
     parent.mkdir(parents=True, exist_ok=True)
     final = parent / path.name
     for candidate in (final, Path(str(final) + ".part")):
@@ -481,6 +495,8 @@ def start(
         sha256 = sha256.lower()
     if size is not None and (isinstance(size, bool) or not isinstance(size, int) or size <= 0):
         raise ValueError("size must be a positive integer")
+    if kind in ("runtime", "media-runtime") and sha256 is None:
+        raise ValueError("The release has no checksum – refusing to install an unverified program")
     try:
         check_url(url)
     except DownloadError as exc:
