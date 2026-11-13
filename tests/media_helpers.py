@@ -127,6 +127,12 @@ class FakeEngine(types.ModuleType):
         finally:
             self.events.append("resume")
 
+    def start(self, *args, **kwargs):  # media must never (re)start the engine itself
+        self.events.append("start")
+
+    def ensure_running(self, *args, **kwargs):
+        self.events.append("ensure_running")
+
 
 class FakeDownloads(types.ModuleType):
     """Stand-in for backend.downloads that records start() calls."""
@@ -136,10 +142,10 @@ class FakeDownloads(types.ModuleType):
         self.started: list[dict] = []
         self.jobs: dict[str, dict] = {}
 
-    def start(self, job_id, url, dest, *, sha256=None, size=None, label, kind, extract=None):
+    def start(self, job_id, url, dest, *, sha256=None, size=None, label, kind, extract=None, on_complete=None):
         self.started.append(
             {"id": job_id, "url": url, "dest": Path(dest), "sha256": sha256, "size": size, "label": label,
-             "kind": kind, "extract": extract}
+             "kind": kind, "extract": extract, "on_complete": on_complete}
         )
         job = {"id": job_id, "label": label, "kind": kind, "state": "queued", "bytes_done": 0,
                "bytes_total": size, "error": None, "started_at": None, "finished_at": None}
@@ -165,7 +171,8 @@ class MediaTestCase(LowRAMTestCase):
             patcher = mock.patch.object(media, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
-        media._probe_cache.clear()
+        media.invalidate_runtime_cache()
+        self.addCleanup(media.invalidate_runtime_cache)
         self.engine = FakeEngine()
         self.downloads = FakeDownloads()
         self.inject_module("backend.engine", self.engine)

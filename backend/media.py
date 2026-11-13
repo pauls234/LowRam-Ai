@@ -488,8 +488,27 @@ def media_tmp_dir() -> Path:
     return _private_dir(media_dir() / "tmp")
 
 
+DRIVE_MISSING_MESSAGE = "The drive with this model is not connected"
+
+
+def models_available() -> bool:
+    """False when the (possibly external) models folder is missing, e.g. an unplugged drive."""
+    try:
+        return config.models_dir().is_dir()
+    except Exception:  # unreadable settings / bad path
+        return False
+
+
 def media_models_dir() -> Path:
-    return _private_dir(config.models_dir() / "media")
+    """``<models_dir>/media`` – never created here: the models folder may be an unplugged drive."""
+    return config.models_dir() / "media"
+
+
+def _require_models_dir() -> Path:
+    """The media models folder for writing; 409 when the models drive is not connected."""
+    if not models_available():
+        raise HTTPError(HTTPStatus.CONFLICT, f"{DRIVE_MISSING_MESSAGE} ({config.models_dir()}).")
+    return _private_dir(media_models_dir())
 
 
 def _job_tmp_dir(job_id: int) -> Path:
@@ -627,7 +646,8 @@ def _download_active(download_id: str) -> bool:
 
 def public_model(model: dict, ram_total: int | None = None) -> dict:
     """A CatalogModel-like dict for the UI."""
-    installed = model_installed(model)
+    available = models_available()
+    installed = available and model_installed(model)
     downloading = (not installed) and any(_download_active(_download_id(model, f["role"])) for f in model["files"])
     data = {
         key: model[key]
@@ -635,6 +655,8 @@ def public_model(model: dict, ram_total: int | None = None) -> dict:
     }
     data.update(
         installed=installed,
+        available=available,
+        unavailable_reason=None if available else DRIVE_MISSING_MESSAGE,
         downloading=downloading,
         fits_ram=None if ram_total is None else ram_total >= model["min_ram_gb"] * GIB * 0.95,
         warning=model.get("warning"),
@@ -680,7 +702,7 @@ def _runtime_candidates() -> list[tuple[Path, str]]:
                     if path.is_symlink() or not path.is_file():
                         continue
                     if os.name != "nt" and not os.access(path, os.X_OK):
-                        path.chmod(0o755)  # zip extraction loses the executable bit
+                        continue  # made executable once after extraction (_runtime_installed)
                     found.append((-path.stat().st_mtime, index, str(path), path))
                 except OSError:
                     continue
@@ -750,8 +772,57 @@ def _probe_binary(path: Path) -> dict | None:
     return info
 
 
-def find_runtime() -> dict:
-    """``{installed, path, version, source}`` of the stable-diffusion.cpp binary to use."""
+RUNTIME_CACHE_TTL_S = 30.0
+_runtime_cache: tuple[float, dict] | None = None
+
+
+def invalidate_runtime_cache() -> None:
+    """Forget discovery results (after an install, or in tests)."""
+    global _runtime_cache
+    with _probe_lock:
+        _runtime_cache = None
+        _probe_cache.clear()
+
+
+def _runtime_installed(path: Path) -> None:
+    """downloads ``on_complete`` for the runtime archive: make the binaries executable once.
+
+    Raising makes the download fail (and removes the extracted files).
+    """
+    root = Path(path)
+    binaries = [
+        candidate
+        for name in (*RUNTIME_NAMES, "sd-server")
+        for candidate in root.rglob(_exe(name))
+        if candidate.is_file() and not candidate.is_symlink()
+    ]
+    if not any(Path(b).name in {_exe(n) for n in RUNTIME_NAMES} for b in binaries):
+        raise MediaJobError("The downloaded archive contains no sd-cli / sd executable")
+    if os.name != "nt":
+        for binary in binaries:
+            binary.chmod(0o755)  # zip extraction may drop the executable bit
+    invalidate_runtime_cache()
+
+
+def find_runtime(refresh: bool = False) -> dict:
+    """``{installed, path, version, source}`` of the stable-diffusion.cpp binary to use.
+
+    Cached for RUNTIME_CACHE_TTL_S (status polling never re-scans or re-probes);
+    an install invalidates the cache, the worker always refreshes.
+    """
+    global _runtime_cache
+    now = time.monotonic()
+    with _probe_lock:
+        cached = _runtime_cache
+    if not refresh and cached is not None and now - cached[0] < RUNTIME_CACHE_TTL_S:
+        return dict(cached[1])
+    result = _discover_runtime()
+    with _probe_lock:
+        _runtime_cache = (now, result)
+    return dict(result)
+
+
+def _discover_runtime() -> dict:
     seen: set[str] = set()
     for path, source in _runtime_candidates():
         try:
@@ -1188,9 +1259,11 @@ class MediaWorker:
         tmp: Path | None = None
         started = time.monotonic()
         try:
-            runtime = find_runtime()
+            runtime = find_runtime(refresh=True)
             if not runtime["installed"]:
                 raise MediaJobError("stable-diffusion.cpp is not installed. Install it under Images & Video first.")
+            if not models_available():
+                raise MediaJobError(f"{DRIVE_MISSING_MESSAGE}. Reconnect it and submit the job again.")
             model = get_catalog_model(job["model_id"])
             files = model_file_paths(model)
             missing = [path.name for path in files.values() if not _file_ready(path)]
@@ -1415,6 +1488,8 @@ def installed_models(kind: str) -> list[dict]:
 
 
 def _resolve_model(kind: str, model_id: object) -> dict:
+    if not models_available():
+        raise HTTPError(HTTPStatus.CONFLICT, DRIVE_MISSING_MESSAGE)
     if model_id is None or model_id == "":
         try:
             preferred = settings.get("media", f"{kind}_model_id")
@@ -1719,11 +1794,15 @@ def install_runtime() -> dict:
     size = size if isinstance(size, int) and not isinstance(size, bool) and size > 0 else None
     sha256 = _parse_digest(asset)
     if sha256 is None:
-        log.warning("Release asset %s has no SHA-256 digest; relying on HTTPS and the size check", name)
+        raise MediaSourceError(
+            f"GitHub lists no SHA-256 digest for {name}; refusing an unverified download. "
+            "Install stable-diffusion.cpp manually (sd-cli on your PATH) or try again later."
+        )
     root = _private_dir(_managed_root())
     return downloads.start(
         "media-runtime", url, root / name, sha256=sha256, size=size,
         label=f"stable-diffusion.cpp {tag}", kind="media-runtime", extract=root / tag,
+        on_complete=_runtime_installed,
     )
 
 
@@ -1731,6 +1810,7 @@ def install_model(model_id: str) -> list[dict]:
     """Start (verified) downloads for every missing file of a catalog model."""
     model = get_catalog_model(model_id)
     downloads = _downloads_module()
+    _require_models_dir()  # 409 instead of writing to the boot disk when the drive is unplugged
     paths = model_file_paths(model)
     planned = []
     for item in model["files"]:
@@ -1777,6 +1857,8 @@ def status() -> dict:
         "active_job_id": active,
         "ffmpeg": find_ffmpeg() is not None,
         "ram_total_bytes": ram_total,
+        "models_available": models_available(),
+        "models_message": None if models_available() else f"{DRIVE_MISSING_MESSAGE} ({config.models_dir()}).",
         "settings": settings.get("media"),
     }
 
