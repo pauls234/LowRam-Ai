@@ -73,6 +73,7 @@
     if (server.state === 'ready') line = (name || 'The model') + ' is ready.';
     else if (server.state === 'starting') line = 'Loading ' + (name || 'the model') + ' into memory – this can take a minute.';
     else if (server.state === 'error') line = 'The engine stopped with an error.';
+    if (eng.paused) line = 'Paused while an image or video is generated – the model restarts by itself afterwards.';
     out.push(h('div', { class: 'engine-row' }, [
       h('span', { class: 'dot dot-' + st[0] + (server.state === 'starting' ? ' is-pulsing' : ''), 'aria-hidden': 'true' }),
       h('div', { class: 'engine-text' }, [h('p', { class: 'engine-state', text: line }), h('p', { class: 'muted small', text: st[1] + (server.port ? ' · port ' + server.port : '') + (server.ctx_size ? ' · context ' + fmt.int(server.ctx_size) + ' tokens' : '') + (server.started_at ? ' · since ' + fmt.time(server.started_at) : '') })]),
@@ -154,6 +155,10 @@
   /* ------------------------------------------------------------ models */
 
   function downloadFor(model) {
+    if (Array.isArray(model.download_ids) && model.download_ids.length) {
+      const own = LR.downloads.list.find((d) => LR.downloads.isActive(d) && model.download_ids.includes(d.id));
+      if (own) return own;
+    }
     return LR.downloads.list.find((d) => LR.downloads.isActive(d) && (d.kind === 'model' || d.kind === 'media-model') &&
       (String(d.id).includes(model.id) || (d.label && model.name && String(d.label).includes(model.name))));
   }
@@ -163,10 +168,14 @@
   function modelCard(m, o) {
     const opts = o || {};
     const totalRam = opts.ramTotal || 0;
-    const tooBig = totalRam && LR.isNum(m.min_ram_gb) && m.min_ram_gb * GB > totalRam;
+    const tooBig = m.fits_ram === false || (totalRam && LR.isNum(m.min_ram_gb) && m.min_ram_gb * GB > totalRam);
     const active = Boolean(opts.activeId && opts.activeId === m.id);
+    const unavailable = m.available === false;
     const badges = [];
-    if (m.recommended) badges.push(LR.badge('Recommended', 'accent'));
+    if (m.source === 'custom') badges.push(LR.badge('Your model', 'info'));
+    else if (m.source === 'local') badges.push(LR.badge('Local file', 'neutral'));
+    else if (m.recommended) badges.push(LR.badge('Recommended', 'accent'));
+    if (unavailable) badges.push(h('span', { class: 'badge badge-warn' }, [icon('alert'), h('span', { text: 'Drive not connected' })]));
     if (active) badges.push(LR.badge(opts.activeLabel || 'In use', 'ok'));
     else if (m.installed) badges.push(LR.badge('Installed', 'neutral'));
     if (m.purpose === 'code') badges.push(LR.badge('Code', 'info'));
@@ -184,9 +193,9 @@
     } else if (!m.installed) {
       actions.append(LR.button({ text: 'Install', icon: 'download', variant: tooBig ? 'secondary' : 'primary', size: 'sm', onclick: (ev) => opts.onInstall(m, ev.currentTarget) }));
     } else {
-      if (!active && opts.onUse) actions.append(LR.button({ text: opts.useLabel || 'Use this model', icon: 'play', variant: 'primary', size: 'sm', onclick: (ev) => opts.onUse(m, ev.currentTarget) }));
+      if (!active && opts.onUse) actions.append(LR.button({ text: opts.useLabel || 'Use this model', icon: 'play', variant: 'primary', size: 'sm', disabled: unavailable, title: unavailable ? 'Connect the drive first' : null, onclick: (ev) => opts.onUse(m, ev.currentTarget) }));
       if (opts.extra) opts.extra(m, actions);
-      if (opts.onDelete) actions.append(LR.button({ text: 'Delete', icon: 'trash', variant: 'ghost', size: 'sm', disabled: active, title: active ? 'Stop the model before deleting it' : null, onclick: (ev) => opts.onDelete(m, ev.currentTarget) }));
+      if (opts.onDelete) actions.append(LR.button({ text: m.source === 'local' ? 'Remove' : 'Delete', icon: 'trash', variant: 'ghost', size: 'sm', disabled: active, title: active ? 'Stop the model before deleting it' : null, onclick: (ev) => opts.onDelete(m, ev.currentTarget) }));
     }
     return h('article', { class: 'model-card' + (m.recommended ? ' is-recommended' : '') + (active ? ' is-active' : ''), 'aria-label': m.name || m.id }, [
       h('div', { class: 'model-head' }, [h('h3', { class: 'model-name', text: m.name || m.id }), h('div', { class: 'badges' }, badges)]),
@@ -194,6 +203,8 @@
       m.description ? h('p', { class: 'model-desc', text: m.description }) : null,
       facts,
       tooBig ? h('p', { class: 'model-warn' }, [icon('alert'), h('span', { text: 'Needs more memory than this computer has – it may be very slow or fail.' })]) : null,
+      m.warning ? h('p', { class: 'model-warn' }, [icon('clock'), h('span', { text: LR.str(m.warning) })]) : null,
+      unavailable ? h('p', { class: 'model-warn' }, [icon('folder'), h('span', { text: 'The file is on a drive that is not connected' + (m.path ? ': ' + m.path : '.') })]) : null,
       progressSlot,
       actions.childElementCount ? actions : null,
     ]);
@@ -260,11 +271,12 @@
   }
 
   async function deleteModel(m) {
+    const local = m.source === 'local';
     const ok = await LR.confirm({
-      title: 'Delete ' + (m.name || m.id) + '?',
-      message: 'This frees ' + fmt.bytes(m.size_bytes) + ' of disk space. You can download it again later.',
-      confirmText: 'Delete model',
-      danger: true,
+      title: (local ? 'Remove ' : 'Delete ') + (m.name || m.id) + '?',
+      message: local ? 'LowRAM AI forgets this model. The file itself stays where it is.' : 'This frees ' + fmt.bytes(m.size_bytes) + ' of disk space. You can download it again later.',
+      confirmText: local ? 'Remove' : 'Delete model',
+      danger: !local,
     });
     if (!ok) return;
     try {
@@ -439,6 +451,238 @@
     );
   }
 
+  /* ------------------------------------------------------------ own models (v0.3.1) */
+
+  const desktop = () => (window.pywebview && window.pywebview.api) || null;
+  const hasOwnModels = () => {
+    const cat = LR.state.catalog;
+    return Boolean(cat && Array.isArray(cat.models) && cat.models.some((m) => 'source' in m));
+  };
+
+  function pathField(label, placeholder, picker, pickerTitle) {
+    const input = h('input', { class: 'input mono', type: 'text', placeholder, spellcheck: 'false', autocomplete: 'off' });
+    const field = LR.field({ label, control: input });
+    const row = h('div', { class: 'input-row' });
+    input.replaceWith(row);
+    row.append(input);
+    const api = desktop();
+    if (api && typeof api[picker] === 'function') {
+      const choose = LR.button({ text: 'Choose…', icon: 'folder', variant: 'secondary', onclick: async () => {
+        try {
+          const picked = await api[picker](pickerTitle);
+          if (picked) input.value = String(picked);
+        } catch (_) { /* dialog closed */ }
+      } });
+      row.append(choose);
+    }
+    return { field, input, row };
+  }
+
+  function buildOwnModels() {
+    const sec = section('Add your own model', 'Any GGUF model from Hugging Face, or a model file you already have.');
+    ui.own = sec;
+    const source = h('input', { class: 'input', type: 'text', placeholder: 'e.g. bartowski/Llama-3.2-3B-Instruct-GGUF or a Hugging Face link', spellcheck: 'false', autocomplete: 'off' });
+    const fSource = LR.field({ label: 'Hugging Face model', control: source, hint: 'Paste the name or the link. LowRAM AI lists the files and recommends one that fits your memory.' });
+    const find = LR.button({ text: 'Find files', icon: 'eye', variant: 'primary', type: 'submit' });
+    const results = h('div', { class: 'resolve-results', 'aria-live': 'polite' });
+    const sourceRow = h('div', { class: 'input-row' });
+    source.replaceWith(sourceRow);
+    sourceRow.append(source, find);
+    const form = h('form', { class: 'form own-form', novalidate: true }, [fSource.el, results]);
+    form.addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      fSource.setError('');
+      const value = source.value.trim();
+      if (!value) {
+        fSource.setError('Paste a model name like owner/model-GGUF or a link.');
+        source.focus();
+        return;
+      }
+      LR.setBusy(find, true, 'Looking…');
+      results.replaceChildren(LR.skeleton(3));
+      try {
+        const data = await LR.post('/api/engine/custom/resolve', { source: value });
+        renderResolved(results, data);
+      } catch (err) {
+        results.replaceChildren();
+        fSource.setError(err.message);
+      } finally {
+        LR.setBusy(find, false);
+      }
+    });
+
+    const local = pathField('Use a model file I already have', '/Volumes/External/models/my-model.gguf', 'pick_file', 'Choose a GGUF model file');
+    const add = LR.button({ text: 'Add file', icon: 'plus', variant: 'secondary', type: 'submit' });
+    local.row.append(add);
+    const localForm = h('form', { class: 'form own-form', novalidate: true }, [
+      local.field.el,
+      h('p', { class: 'help', text: 'The file stays where it is (an external drive works). LowRAM AI only remembers where to find it.' }),
+    ]);
+    localForm.addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      local.field.setError('');
+      const path = local.input.value.trim();
+      if (!/\.gguf$/i.test(path) || !/^(\/|~|[A-Za-z]:[\\/])/.test(path)) {
+        local.field.setError('Enter the full path of a .gguf file.');
+        local.input.focus();
+        return;
+      }
+      LR.setBusy(add, true, 'Adding…');
+      try {
+        const data = await LR.post('/api/engine/custom/import', { path });
+        LR.toast('Added ' + LR.str(data.model && data.model.name, 'your model'));
+        local.input.value = '';
+        await LR.loadCatalog().catch(() => {});
+      } catch (err) {
+        local.field.setError(err.message);
+      } finally {
+        LR.setBusy(add, false);
+      }
+    });
+    sec.body.append(form, h('div', { class: 'or-rule', 'aria-hidden': 'true' }, h('span', { text: 'or' })), localForm);
+    return sec.el;
+  }
+
+  function renderResolved(container, data) {
+    const files = Array.isArray(data.files) ? data.files : [];
+    if (!files.length) {
+      container.replaceChildren(LR.callout({ tone: 'info', title: 'No GGUF files found', text: 'This repository has no GGUF model files. Look for a repository whose name ends in “GGUF”.' }));
+      return;
+    }
+    const sorted = [...files].sort((a, b) => (b.recommended - a.recommended) || ((a.size_bytes || 0) - (b.size_bytes || 0)));
+    container.replaceChildren(
+      h('p', { class: 'muted small', text: LR.str(data.repo) + (data.revision ? ' · ' + String(data.revision).slice(0, 12) : '') + ' · ' + fmt.plural(files.length, 'file') }),
+      h('ul', { class: 'file-list' }, sorted.map((f) => h('li', { class: 'file-row' + (f.recommended ? ' is-recommended' : '') }, [
+        h('div', { class: 'file-main' }, [
+          h('p', { class: 'file-name', text: LR.str(f.filename) }),
+          h('p', { class: 'badges' }, [
+            f.quant ? LR.badge(f.quant, 'neutral') : null,
+            LR.badge(fmt.bytes(f.size_bytes), 'neutral'),
+            f.fits_ram === false ? LR.badge('Too big for this computer', 'error') : LR.badge('Fits your RAM', 'ok'),
+            f.recommended ? LR.badge('Recommended', 'accent') : null,
+          ]),
+        ]),
+        LR.button({ text: 'Install', icon: 'download', size: 'sm', variant: f.recommended ? 'primary' : 'secondary', onclick: (ev) => installCustom(data.repo, f, ev.currentTarget) }),
+      ]))),
+    );
+  }
+
+  async function installCustom(repo, file, btn) {
+    LR.setBusy(btn, true, 'Starting…');
+    try {
+      await LR.post('/api/engine/custom/install', { repo, filename: file.filename });
+      LR.toast('Downloading ' + file.filename);
+      LR.downloads.refresh();
+      btn.replaceChildren(icon('check'), h('span', { text: 'Downloading' }));
+    } catch (err) {
+      LR.toast('Could not start the download: ' + err.message, 'error');
+      LR.setBusy(btn, false);
+    }
+  }
+
+  /* ------------------------------------------------------------ storage (v0.3.1) */
+
+  let storageTimer = 0;
+
+  function buildStorage() {
+    const sec = section('Storage', 'Where model files are kept. An external drive works too.');
+    ui.storage = sec;
+    sec.body.append(LR.skeleton(3));
+    return sec.el;
+  }
+
+  async function loadStorage() {
+    if (!ui.storage || ui.storage.el.hidden) return;
+    try {
+      const data = await LR.get('/api/engine/storage');
+      renderStorage(data.storage || data);
+    } catch (err) {
+      ui.storage.body.replaceChildren(LR.callout({ tone: 'error', title: 'Could not read the storage settings', text: err.message }));
+    }
+  }
+
+  function renderStorage(sto) {
+    window.clearTimeout(storageTimer);
+    const out = [];
+    out.push(h('div', { class: 'storage-row' }, [
+      h('span', { class: 'machine-icon', 'aria-hidden': 'true' }, icon('folder')),
+      h('div', { class: 'storage-main' }, [
+        h('p', { class: 'storage-path' }, [h('code', { text: LR.str(sto.models_dir) }), LR.badge(sto.custom ? 'Custom folder' : 'Default', sto.custom ? 'info' : 'neutral')]),
+        LR.isNum(sto.total_bytes) && sto.total_bytes > 0 ? (() => {
+          const bar = LR.progress({ size: 'sm', label: 'Disk space used', value: 1 - (sto.free_bytes || 0) / sto.total_bytes });
+          return h('div', { class: 'storage-bar' }, [bar.el, h('p', { class: 'muted small', text: fmt.bytes(sto.free_bytes) + ' free of ' + fmt.bytes(sto.total_bytes) })]);
+        })() : null,
+      ]),
+    ]));
+    if (sto.available === false) out.push(LR.callout({ tone: 'warn', title: 'Drive not connected', text: 'The models folder is not reachable. Plug the drive in again, or choose another folder.' }));
+    else if (sto.writable === false) out.push(LR.callout({ tone: 'warn', title: 'Read-only folder', text: 'LowRAM AI cannot save new models here. Choose another folder.' }));
+    const mv = sto.moving;
+    if (mv && mv.state && mv.state !== 'done') {
+      if (mv.state === 'failed') out.push(LR.callout({ tone: 'error', title: 'Moving the models failed', text: LR.str(mv.error, 'Unknown error.') + ' Your files were not deleted.' }));
+      else {
+        const bar = LR.progress({ label: 'Moving models', value: mv.bytes_total ? mv.bytes_done / mv.bytes_total : null });
+        out.push(h('div', { class: 'dl-row is-active' }, [
+          h('div', { class: 'dl-head' }, [LR.spinner(), h('span', { class: 'dl-label', text: 'Moving your models…' })]),
+          bar.el,
+          h('p', { class: 'dl-meta', text: mv.bytes_total ? fmt.bytes(mv.bytes_done) + ' of ' + fmt.bytes(mv.bytes_total) : 'Preparing…' }),
+        ]));
+        storageTimer = window.setTimeout(loadStorage, 1000);
+      }
+    }
+    const change = pathField('New models folder', '/Volumes/External/LowRAM models', 'pick_folder', 'Choose a folder for models');
+    change.input.value = sto.custom ? LR.str(sto.models_dir) : '';
+    const moveId = LR.uid('move');
+    const move = h('input', { type: 'checkbox', class: 'checkbox', id: moveId, checked: true });
+    const save = LR.button({ text: 'Use this folder', variant: 'primary', type: 'submit' });
+    const form = h('form', { class: 'form storage-form', novalidate: true, hidden: true }, [
+      change.field.el,
+      h('label', { class: 'check-row', for: moveId }, [move, h('span', { text: 'Move my existing models there' })]),
+      h('p', { class: 'help', text: 'The engine stops while models are moved. The folder must already exist.' }),
+      h('div', { class: 'form-actions' }, [save, LR.button({ text: 'Cancel', variant: 'ghost', onclick: () => { form.hidden = true; toggle.hidden = false; } })]),
+    ]);
+    const submit = async (dir) => {
+      change.field.setError('');
+      if (dir !== null && !/^(\/|~|[A-Za-z]:[\\/])/.test(dir)) {
+        change.field.setError('Enter the full path of an existing folder.');
+        change.input.focus();
+        return;
+      }
+      LR.setBusy(save, true, 'Saving…');
+      try {
+        const data = await LR.post('/api/engine/storage', { models_dir: dir, move_existing: move.checked });
+        LR.toast(dir === null ? 'Using the default folder' : 'Models folder changed');
+        renderStorage(data.storage || data);
+        LR.loadCatalog().catch(() => {});
+        LR.refreshStatus();
+      } catch (err) {
+        change.field.setError(err.message);
+        LR.setBusy(save, false);
+      }
+    };
+    form.addEventListener('submit', (ev) => { ev.preventDefault(); submit(change.input.value.trim()); });
+    const toggle = LR.button({ text: 'Change folder…', icon: 'folder', variant: 'secondary', onclick: () => { form.hidden = false; toggle.hidden = true; change.input.focus(); } });
+    const actions = [toggle];
+    if (sto.custom) actions.push(LR.button({ text: 'Reset to default', variant: 'ghost', onclick: async () => {
+      const ok = await LR.confirm({ title: 'Use the default folder again?', message: 'Your models will be moved back to ' + LR.str(sto.default_dir, 'the default folder') + '.', confirmText: 'Reset' });
+      if (ok) {
+        move.checked = true;
+        submit(null);
+      }
+    } }));
+    out.push(h('div', { class: 'row-actions' }, actions), form);
+    ui.storage.body.replaceChildren(...out);
+  }
+
+  function syncExtras() {
+    const on = LR.has('engine') && hasOwnModels();
+    if (ui.own) ui.own.el.hidden = !on;
+    if (ui.storage) {
+      const wasHidden = ui.storage.el.hidden;
+      ui.storage.el.hidden = !on;
+      if (on && wasHidden) loadStorage();
+    }
+  }
+
   /* ------------------------------------------------------------ view */
 
   function create() {
@@ -452,7 +696,11 @@
     ui.downloadsList = h('div', { class: 'dl-list' });
     ui.downloads.body.append(ui.downloadsList);
     ui.about = section('About this build');
-    page.append(head, ui.engine.el, ui.models.el, ui.downloads.el, buildMemory(), buildPrefs(), ui.about.el);
+    const own = buildOwnModels();
+    const storage = buildStorage();
+    own.hidden = true;
+    storage.hidden = true;
+    page.append(head, ui.engine.el, ui.models.el, own, ui.downloads.el, storage, buildMemory(), buildPrefs(), ui.about.el);
     root.append(page);
     return root;
   }
@@ -468,6 +716,8 @@
       renderModels();
       renderAbout();
       syncPrefs();
+      ui.storage.el.hidden = true;
+      syncExtras();
       renderMemory(LR.state.memory);
       if (engineOk) LR.loadCatalog().catch(() => {});
       if (!unmountDownloads && !ui.downloads.el.hidden) {
@@ -475,7 +725,7 @@
       }
       offs.push(
         LR.on('engine', renderEngine),
-        LR.on('catalog', () => { renderModels(); renderEngine(); }),
+        LR.on('catalog', () => { renderModels(); renderEngine(); syncExtras(); }),
         LR.on('memory', (m) => { if (document.activeElement !== ui.range) renderMemory(m); }),
         LR.on('settings', syncPrefs),
         LR.on('status', renderAbout),
@@ -491,6 +741,7 @@
       );
     },
     hide() {
+      window.clearTimeout(storageTimer);
       while (offs.length) offs.pop()();
       if (unmountDownloads) { unmountDownloads(); unmountDownloads = null; }
     },

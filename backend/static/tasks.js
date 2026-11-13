@@ -18,7 +18,9 @@
     stop_requested: ['info', 'Stopped on request.'],
     busy: ['warn', 'Did not start: something else was running.'],
     error: ['error', 'Stopped because of an unexpected error.'],
+    no_model: ['warn', 'Stopped: no model is running.'],
   };
+  const MERGE_TEXT = { waiting: 'Waiting for all tasks before combining the results…', running: 'Combining the results on this computer…', failed: 'Combining the results failed.' };
   const ERROR_PREVIEW = 240;
   const ui = {};
   const st = {
@@ -51,7 +53,7 @@
     try {
       const data = await LR.get('/api/projects/' + encodeURIComponent(id));
       if (id !== st.selected) return;
-      const sig = JSON.stringify([data.project, data.tasks, isLoopActive() ? st.loop.current_task_id : null]);
+      const sig = JSON.stringify([data.project, data.tasks, isLoopActive() ? st.loop.current_task_id : null, st.shared ? st.shared.get(id) || null : null]);
       if (sig !== st.detailSig || !st.detail) {
         st.detailSig = sig;
         st.detail = { project: data.project, tasks: Array.isArray(data.tasks) ? data.tasks : [] };
@@ -66,6 +68,12 @@
     }
     // The merged result only exists for shared projects (404 until merged), so
     // only ask for projects shared via "Run on all devices".
+    const shared = st.shared ? st.shared.get(id) : null;
+    if (st.shared) {
+      // Newer backend: it tells us when the merged result exists (no 404 polling).
+      if (shared && shared.final_available && !(st.finalFor === id && st.final)) loadFinal(id);
+      return;
+    }
     const settled = st.detail && st.detail.tasks.length && !st.detail.tasks.some((t) => t.status === 'pending' || t.status === 'running');
     if (!settled) {
       st.settledAt = 0;
@@ -102,9 +110,18 @@
     applyLoop(data.loop || null);
   }
 
+  async function loadShared() {
+    if (!LR.has('cluster')) return;
+    const data = await LR.get('/api/cluster');
+    const c = data.cluster || data;
+    if (!Array.isArray(c.projects)) return; // older backend: fall back to local memory
+    st.shared = new Map(c.projects.map((p) => [p.project_id, p]));
+    for (const p of c.projects) st.distributed.add(p.project_id);
+  }
+
   const poller = LR.poller(async () => {
     try {
-      await Promise.all([loadLoop(), loadProjects()]);
+      await Promise.all([loadLoop(), loadProjects(), loadShared().catch(() => {})]);
       await loadDetail();
     } catch (_) { /* banner handles outages */ }
     const running = isLoopActive() || st.run || (st.detail && st.detail.tasks.some((t) => t.status === 'running')) || st.distributed.has(st.selected);
@@ -198,6 +215,7 @@
     } else if (loop.stop_requested) parts.push('ends after the current task');
     const actions = [];
     if (project && project.id !== st.selected) actions.push(LR.button({ text: 'View project', size: 'sm', variant: 'ghost', onclick: () => LR.go('#/tasks/' + project.id) }));
+    if (!active && loop.stopped_because === 'no_model') actions.push(...modelsButton());
     if (active) actions.push(LR.button({ text: loop.stop_requested ? 'Stopping…' : 'Stop loop', icon: 'stop', size: 'sm', variant: 'secondary', disabled: loop.stop_requested, onclick: stopLoop }));
     else actions.push(LR.button({ text: 'Dismiss', size: 'sm', variant: 'ghost', onclick: () => { st.loopDismissed = loopKey(loop); LR.store.set('lowram.loopDismissed', st.loopDismissed); renderLoop(); } }));
     ui.loop.className = 'loop-banner tone-' + tone + (active ? ' is-active' : '');
@@ -278,12 +296,18 @@
     const mergeId = LR.uid('merge');
     const merge = h('input', { type: 'checkbox', id: mergeId, class: 'checkbox', checked: LR.store.get('lowram.merge') !== '0' });
     merge.addEventListener('change', () => LR.store.set('lowram.merge', merge.checked ? '1' : '0'));
-    const on = st.distributed.has(p.id);
+    const shared = st.shared ? st.shared.get(p.id) : null;
+    const on = shared ? true : st.distributed.has(p.id);
+    const merge_state = shared ? shared.merge_state : null;
+    const mergeNote = merge_state && MERGE_TEXT[merge_state]
+      ? h('p', { class: 'small' + (merge_state === 'failed' ? ' is-error-text' : ' muted') }, [merge_state === 'failed' ? LR.icon('alert') : LR.spinner(), ' ', MERGE_TEXT[merge_state] + (merge_state === 'failed' && shared.merge_error ? ' ' + shared.merge_error : '')])
+      : null;
     return h('div', { class: 'distribute' }, [
       h('div', { class: 'distribute-text' }, [
         h('p', { class: 'strong' }, [icon('devices'), h('span', { text: on ? 'Shared with your devices' : 'Run on all devices' })]),
         h('p', { class: 'muted small', text: on ? 'Paired computers pick up pending tasks while this one works too.' : 'Paired computers on your network help work through the pending tasks.' }),
         h('label', { class: 'check-row', for: mergeId }, [merge, h('span', { text: 'Combine all results into one final answer at the end' })]),
+        mergeNote,
       ]),
       LR.button({ text: on ? 'Share again' : 'Run on all devices', icon: 'merge', variant: 'secondary', disabled: busy, onclick: (ev) => distribute(p, merge.checked, ev.currentTarget) }),
     ]);
@@ -347,6 +371,10 @@
     ]));
   }
 
+  function modelsButton() {
+    return LR.has('engine') ? [LR.button({ text: 'Open Models', icon: 'sliders', size: 'sm', variant: 'primary', onclick: () => LR.go('#/settings') })] : [];
+  }
+
   function showOutcome(tone, title, text, actions) {
     ui.outcome.replaceChildren(LR.callout({ tone, title, text, actions, role: tone === 'error' ? 'alert' : null }));
   }
@@ -369,6 +397,7 @@
       else if (data.status === 'failed') showOutcome('error', label + ' failed', LR.str(data.error || data.reason, 'Unknown error.'), task ? [LR.button({ text: 'Retry task', size: 'sm', onclick: (ev) => retryTask(task, ev.currentTarget) })] : []);
       else if (data.status === 'paused') showOutcome('warn', 'Paused – low RAM', LR.str(data.reason, 'Not enough free memory to start a task.'));
       else if (data.status === 'empty') showOutcome('info', 'Nothing to run', LR.str(data.reason, 'This project has no pending tasks.'));
+      else if (data.status === 'no_model') showOutcome('warn', 'No model is running', LR.str(data.reason, 'Start a model first.'), modelsButton());
       else showOutcome('info', 'Run finished', 'Status: ' + LR.str(data.status));
     } catch (err) {
       showOutcome(err.status === 409 ? 'warn' : 'error', err.status === 409 ? 'Busy' : 'Run failed', err.network ? 'LowRAM AI could not be reached. The task may still be running.' : err.message);
@@ -449,6 +478,7 @@
     try {
       await LR.post('/api/cluster/projects/' + p.id + '/distribute', { percent: LR.budgetPercent(), merge });
       st.distributed.add(p.id);
+      await loadShared().catch(() => {});
       LR.store.set('lowram.distributed', [...st.distributed].slice(-50).join(','));
       if (st.finalFor === p.id) { st.final = null; st.finalFor = null; renderFinal(); }
       showOutcome('ok', 'Shared with your devices', merge ? 'Helpers pick up pending tasks now. The combined final answer appears here when everything is done.' : 'Helpers pick up pending tasks now.');

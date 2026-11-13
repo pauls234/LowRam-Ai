@@ -81,6 +81,7 @@
     def.show(params);
     updateNav();
     closeDrawer(false);
+    renderBanners();
     if (prev && prev !== name && name !== 'chat') {
       const heading = el.querySelector('h1');
       if (heading) {
@@ -137,6 +138,7 @@
     if (eng.external) return { tone: 'ok', text: 'External model' };
     const server = eng.server || {};
     const name = LR.modelName(server.model_id);
+    if (eng.paused) return { tone: 'warn', text: 'Paused for image generation' };
     switch (server.state) {
       case 'ready': return { tone: 'ok', text: name || 'Model ready' };
       case 'starting': return { tone: 'warn', text: 'Starting ' + (name || 'model') + '…', pulse: true };
@@ -225,6 +227,41 @@
         actions: [LR.button({ text: 'Dismiss', size: 'sm', variant: 'ghost', onclick: () => { app.startupDismissed = true; renderBanners(); } })],
       });
     } else banner('startup', null);
+
+    // Pairing requests from other computers: visible on every page (the Devices page shows them inline).
+    const c = LR.state.cluster;
+    const requests = c && Array.isArray(c.requests) ? c.requests : [];
+    const devicesLink = document.querySelector('.nav-link[data-route="devices"]');
+    let badge = devicesLink.querySelector('.nav-badge');
+    if (requests.length && !badge) {
+      badge = h('span', { class: 'nav-badge' });
+      devicesLink.append(badge);
+    }
+    if (badge) {
+      badge.textContent = requests.length ? String(requests.length) : '';
+      badge.hidden = !requests.length;
+      badge.setAttribute('aria-label', requests.length + ' pairing request' + (requests.length === 1 ? '' : 's'));
+    }
+    const r = requests[0];
+    if (r && app.route !== 'devices') {
+      const key = 'pair-' + r.id + '-' + (r.verification_code || '');
+      if (app.pairKey !== key) {
+        app.pairKey = key;
+        banner('pair', {
+          tone: 'accent',
+          icon: 'devices',
+          title: LR.str(r.name, 'A computer') + ' wants to help.',
+          text: r.verification_code ? 'Allow it only if it shows the number ' + LR.str(r.verification_code) + '.' : 'Waiting for its verification number…',
+          actions: [
+            LR.button({ text: 'Deny', size: 'sm', variant: 'ghost', onclick: (ev) => LR.cluster.answerRequest(r, false, ev.currentTarget) }),
+            LR.button({ text: 'Allow', icon: 'check', size: 'sm', variant: 'primary', disabled: !r.verification_code, onclick: (ev) => LR.cluster.answerRequest(r, true, ev.currentTarget) }),
+          ],
+        });
+      }
+    } else {
+      app.pairKey = null;
+      banner('pair', null);
+    }
   }
 
   /* ------------------------------------------------------------ polling */
@@ -251,6 +288,9 @@
       const jobs = [
         LR.get('/api/memory?percent=' + encodeURIComponent(LR.budgetPercent())).then((m) => { LR.state.memory = m; LR.emit('memory', m); }).catch(() => {}),
       ];
+      if (LR.has('cluster')) {
+        jobs.push(LR.get('/api/cluster').then((c) => { LR.state.cluster = c.cluster || c; }).catch(() => {}));
+      }
       if (LR.has('engine')) {
         jobs.push(LR.get('/api/engine/status').then((e) => { LR.state.engine = e; LR.emit('engine', e); }).catch(() => {}));
         if (!LR.state.catalog) jobs.push(LR.loadCatalog().catch(() => {}));

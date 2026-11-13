@@ -8,11 +8,113 @@
   const icon = LR.icon;
   const fmt = LR.fmt;
   const ui = {};
-  const st = { cluster: null, loaded: false, pairingModal: null, sig: '' };
+  const st = { cluster: null, loaded: false, pairingModal: null, sig: '', nearby: null, nearbySig: '' };
+  const easyPairing = () => Boolean(st.cluster && Array.isArray(st.cluster.requests));
+
+  const nearbyPoller = LR.poller(async () => {
+    if (!easyPairing()) return 3000;
+    try {
+      const data = await LR.get('/api/cluster/nearby');
+      st.nearby = Array.isArray(data.hosts) ? data.hosts : [];
+      st.nearbyError = data.error ? LR.str(data.error) : null;
+      renderNearby();
+    } catch (_) { /* keep the last list */ }
+    return 3000;
+  }, 3000);
+
+  /** Allow / deny a pairing request (also used by the global banner in app.js). */
+  async function answerRequest(req, allow, btn) {
+    if (btn) LR.setBusy(btn, true);
+    try {
+      await LR.post('/api/cluster/requests/' + encodeURIComponent(req.id) + '/' + (allow ? 'approve' : 'deny'), {});
+      LR.toast(allow ? LR.str(req.name, 'The device') + ' can now help' : 'Request declined', allow ? null : 'info');
+    } catch (err) {
+      LR.toast('Could not answer the request: ' + err.message, 'error');
+      if (btn && btn.isConnected) LR.setBusy(btn, false);
+    } finally {
+      poller.now();
+      LR.refreshStatus();
+    }
+  }
+  LR.cluster = { answerRequest };
+
+  function requestCard(r) {
+    const facts = [r.platform, LR.isNum(r.ram_total_bytes) ? fmt.gb(r.ram_total_bytes) + ' RAM' : '', r.address].filter(Boolean).join(' · ');
+    return h('div', { class: 'request-card', role: 'group', 'aria-label': 'Pairing request from ' + LR.str(r.name, 'a device') }, [
+      h('div', { class: 'request-head' }, [
+        h('span', { class: 'device-icon', 'aria-hidden': 'true' }, icon('laptop')),
+        h('div', { class: 'device-main' }, [
+          h('p', { class: 'strong', text: LR.str(r.name, 'A computer') + ' wants to help' }),
+          facts ? h('p', { class: 'muted small', text: facts }) : null,
+        ]),
+      ]),
+      r.verification_code
+        ? h('p', { class: 'verify-code', 'aria-label': 'Verification number ' + LR.str(r.verification_code), text: LR.str(r.verification_code) })
+        : h('p', { class: 'verify-code is-pending' }, [LR.spinner(), h('span', { class: 'small muted', text: ' Waiting for the number…' })]),
+      h('p', { class: 'verify-help', text: 'Only allow it if the other computer shows exactly the same number.' }),
+      h('div', { class: 'row-actions request-actions' }, [
+        LR.button({ text: 'Deny', variant: 'secondary', onclick: (ev) => answerRequest(r, false, ev.currentTarget) }),
+        LR.button({ text: 'Allow', icon: 'check', variant: 'primary', disabled: !r.verification_code, title: r.verification_code ? null : 'Wait until the number is shown', onclick: (ev) => answerRequest(r, true, ev.currentTarget) }),
+      ]),
+    ]);
+  }
+
+  function renderNearby() {
+    if (!ui.nearby) return;
+    const hosts = st.nearby;
+    const sig = JSON.stringify([hosts, st.nearbyError]);
+    if (sig === st.nearbySig && ui.nearby.childElementCount) return;
+    st.nearbySig = sig;
+    if (hosts === null) {
+      ui.nearby.replaceChildren(h('p', { class: 'muted small' }, [LR.spinner(), ' Looking for computers nearby…']));
+      return;
+    }
+    const errorNote = st.nearbyError ? LR.callout({ tone: 'warn', title: 'Searching for computers is not working right now', text: st.nearbyError + ' You can still join with a code.' }) : null;
+    if (!hosts.length) {
+      ui.nearby.replaceChildren(errorNote || '', h('div', { class: 'nearby-empty' }, [
+        h('span', { class: 'scan', 'aria-hidden': 'true' }, icon('wifi')),
+        h('p', { class: 'strong', text: 'No computers found yet' }),
+        h('p', { class: 'muted small', text: 'Open LowRAM AI on the other computer and turn on Devices there.' }),
+        h('ul', { class: 'hint-list' }, [
+          h('li', { text: 'Both computers need to be on the same Wi-Fi or network.' }),
+          h('li', { text: 'If it still does not appear, allow LowRAM AI in the firewall – or use a code instead.' }),
+        ]),
+      ]));
+      return;
+    }
+    ui.nearby.replaceChildren(errorNote || '', h('ul', { class: 'nearby-list', 'aria-label': 'Nearby computers' }, hosts.map((host) => h('li', { class: 'nearby-host' }, [
+      h('span', { class: 'device-icon', 'aria-hidden': 'true' }, icon('laptop')),
+      h('div', { class: 'device-main' }, [
+        h('p', { class: 'strong', text: LR.str(host.name, 'LowRAM AI computer') }),
+        h('p', { class: 'muted small', text: [Array.isArray(host.addresses) ? host.addresses[0] : '', host.fingerprint_short ? 'ID ' + host.fingerprint_short : ''].filter(Boolean).join(' · ') }),
+      ]),
+      LR.button({ text: 'Join', icon: 'link', variant: 'primary', cls: 'btn-join', label: 'Join ' + LR.str(host.name, 'this computer'), onclick: (ev) => joinHost(host, ev.currentTarget) }),
+    ]))));
+  }
+
+  async function joinHost(host, btn) {
+    LR.setBusy(btn, true, 'Joining…');
+    try {
+      const data = await LR.post('/api/cluster/join', { host_id: host.id });
+      if (data.worker && st.cluster) st.cluster.worker = data.worker;
+      st.sig = '';
+      render();
+      const verify = ui.worker.el.querySelector('.verify');
+      if (verify) verify.scrollIntoView({ behavior: LR.reducedMotion() ? 'auto' : 'smooth', block: 'center' });
+    } catch (err) {
+      LR.toast('Could not join: ' + err.message, 'error');
+      if (btn.isConnected) LR.setBusy(btn, false);
+      const fallback = ui.worker.el.querySelector('.code-fallback');
+      if (fallback) fallback.open = true;
+    } finally {
+      poller.now();
+    }
+  }
 
   const poller = LR.poller(async () => {
     try { await load(); } catch (_) { return 5000; }
-    return st.pairingModal || (st.cluster && st.cluster.worker && st.cluster.worker.state === 'pairing') ? 1500 : 4000;
+    const w = st.cluster && st.cluster.worker;
+    return st.pairingModal || (w && (w.state === 'pairing' || w.state === 'awaiting_approval')) || (st.cluster && st.cluster.requests && st.cluster.requests.length) ? 1500 : 4000;
   }, 4000);
 
   async function load() {
@@ -22,7 +124,7 @@
     const sig = JSON.stringify(st.cluster);
     if (sig !== st.sig) {
       st.sig = sig;
-      render();
+      render(true);
     }
     if (st.pairingModal) st.pairingModal.update(st.cluster);
   }
@@ -55,7 +157,23 @@
       checked: enabled,
       onChange: (on, input) => toggle(on, input),
     });
-    const out = [sw.el];
+    const out = [];
+    const requests = Array.isArray(c.requests) ? c.requests : [];
+    if (requests.length) out.push(h('div', { class: 'requests', 'aria-live': 'polite' }, requests.map(requestCard)));
+    out.push(sw.el);
+    if (enabled && 'discoverable' in c) {
+      out.push(LR.switchRow({
+        label: 'Show this computer to nearby devices',
+        description: 'Lets other computers find it in their list. When off, they can still join with a code.',
+        checked: c.discoverable !== false,
+        onChange: async (on, input) => {
+          if (!(await LR.saveSetting('cluster', { discoverable: on }, on ? 'Visible to nearby computers' : 'Hidden from nearby computers'))) input.checked = !on;
+          poller.now();
+        },
+      }).el);
+    }
+    if (c.host_name && enabled) out.push(h('p', { class: 'muted small' }, ['Other computers see this one as ', h('strong', { text: LR.str(c.host_name) }), '.']));
+    if (c.pairing_error) out.push(LR.callout({ tone: 'warn', title: 'Pairing problem', text: LR.str(c.pairing_error) }));
     if (c.error) out.push(LR.callout({ tone: 'error', title: 'The device server has a problem', text: LR.str(c.error), role: 'alert' }));
     if (enabled) {
       const listen = c.listening;
@@ -194,6 +312,16 @@
     const w = c.worker || { state: 'idle' };
     const out = [];
     const stateText = { idle: 'Not helping anyone', pairing: 'Connecting…', working: 'Helping', error: 'Problem', stopped: 'Stopped' };
+    if (w.state === 'awaiting_approval') {
+      ui.worker.body.replaceChildren(h('div', { class: 'verify' }, [
+        h('p', { class: 'verify-label', text: 'Verification number' }),
+        h('p', { class: 'verify-code verify-big', 'aria-label': 'Verification number ' + LR.str(w.verification_code), text: LR.str(w.verification_code, '— — —') }),
+        h('p', { class: 'verify-help', text: 'Check that ' + LR.str(w.host, 'the other computer') + ' shows the same number, then click Allow there.' }),
+        h('p', { class: 'muted small verify-wait' }, [LR.spinner(), ' Waiting for approval…']),
+        LR.button({ text: 'Cancel', variant: 'ghost', onclick: (ev) => leave(ev.currentTarget) }),
+      ]));
+      return;
+    }
     if (w.state === 'working' || w.state === 'pairing') {
       const task = w.current_task;
       const taskText = task === null || task === undefined || task === '' ? 'Waiting for a task' : typeof task === 'object' ? 'Working on ' + LR.str(task.title || ('task ' + task.id)) : 'Working on task ' + task;
@@ -201,7 +329,7 @@
         h('span', { class: 'dot dot-' + (w.state === 'working' ? 'busy' : 'warn') + ' is-pulsing', 'aria-hidden': 'true' }),
         h('div', null, [
           h('p', { class: 'strong', text: w.state === 'pairing' ? 'Connecting to ' + LR.str(w.host, 'the host') + '…' : 'Helping ' + LR.str(w.host, 'another computer') }),
-          h('p', { class: 'muted small', text: w.state === 'working' ? taskText + ' · ' + fmt.plural(w.tasks_done || 0, 'task') + ' done' : 'Checking the code…' }),
+          h('p', { class: 'muted small', text: w.state === 'working' ? taskText + ' · ' + fmt.plural(w.tasks_done || 0, 'task') + ' done' : LR.str(w.message, 'Checking the code…') }),
         ]),
         LR.button({ text: 'Leave', icon: 'power', size: 'sm', variant: 'secondary', onclick: (ev) => leave(ev.currentTarget) }),
       ]));
@@ -238,7 +366,18 @@
         LR.setBusy(join, false);
       }
     });
-    out.push(form);
+    if (easyPairing()) {
+      if (!ui.nearby) ui.nearby = h('div', { class: 'nearby', 'aria-live': 'polite' });
+      st.nearbySig = '';
+      renderNearby();
+      out.push(h('h3', { class: 'section-label', text: 'Nearby computers' }), ui.nearby);
+      out.push(h('details', { class: 'more-options code-fallback' }, [
+        h('summary', null, [icon('chevron-right', 'summary-chevron'), h('span', { text: 'Use a code instead' })]),
+        h('div', { class: 'details-body' }, form),
+      ]));
+    } else {
+      out.push(form);
+    }
     ui.worker.body.replaceChildren(...out);
   }
 
@@ -263,16 +402,21 @@
     return { el: h('section', { class: 'card', 'aria-labelledby': id }, [h('div', { class: 'card-head' }, h('div', null, [h('h2', { class: 'card-title', id, text: title }), sub ? h('p', { class: 'card-sub', text: sub }) : null])), body]), body };
   }
 
-  function render() {
+  function render(incremental) {
     if (!ui.host) return;
     if (!st.loaded) {
       ui.host.body.replaceChildren(LR.skeleton(3));
       ui.worker.body.replaceChildren(LR.skeleton(2));
       return;
     }
+    const c = st.cluster || {};
+    const hostSig = JSON.stringify({ ...c, worker: null });
+    const workerSig = JSON.stringify([c.worker || null, Array.isArray(c.requests)]);
     const focusedLabel = document.activeElement && ui.page.contains(document.activeElement) ? document.activeElement.getAttribute('aria-label') || document.activeElement.textContent : null;
-    renderHost();
-    renderWorker();
+    if (!incremental || hostSig !== ui.hostSig) renderHost();
+    if (!incremental || workerSig !== ui.workerSig) renderWorker();
+    ui.hostSig = hostSig;
+    ui.workerSig = workerSig;
     if (focusedLabel) {
       const again = [...ui.page.querySelectorAll('button, input')].find((el) => (el.getAttribute('aria-label') || el.textContent) === focusedLabel);
       if (again) again.focus();
@@ -302,9 +446,11 @@
       st.sig = '';
       render();
       poller.start();
+      nearbyPoller.start();
     },
     hide() {
       poller.stop();
+      nearbyPoller.stop();
     },
   });
 })();

@@ -382,7 +382,7 @@
     const started = Date.now();
     const waitTimer = window.setInterval(() => {
       const sec = (Date.now() - started) / 1000;
-      if (sec > 6) waitText.textContent = 'Still working – local models can take a moment · ' + fmt.clock(Date.now() - started);
+      if (sec > 6) waitText.textContent = (statusText || 'Still working – local models can take a moment') + ' · ' + fmt.clock(Date.now() - started);
     }, 1000);
 
     function setExpanded(open) {
@@ -421,9 +421,15 @@
       li.classList.toggle('is-streaming', streaming);
     }
 
+    let statusText = '';
     return {
       li,
       setRetry(fn) { retryFn = fn; },
+      /** Backend progress note ("Loading the model…") shown until tokens arrive. */
+      status(text) {
+        statusText = text;
+        if (text) waitText.textContent = text;
+      },
       /** Throttled to one render per animation frame. */
       stream(reasoning, answer) {
         pending = [reasoning, answer];
@@ -566,9 +572,19 @@
       await LR.stream('/api/chats/' + encodeURIComponent(ctx.chatId) + '/messages', { content, percent }, {
         signal: ctx.controller.signal,
         onEvent(ev) {
+          if (ev.type === 'ping') return;
           if (ev.type === 'start') {
             ctx.gotStart = true;
+            if (ev.chat && ev.chat.id === ctx.chatId) {
+              pane.chat = ev.chat;
+              S.chats = [ev.chat, ...S.chats.filter((c) => c.id !== ev.chat.id)];
+              renderHistory();
+              if (S.currentId === ctx.chatId) renderChrome();
+            }
             LR.emit('status-refresh');
+          } else if (ev.type === 'status') {
+            ctx.gotStart = true;
+            a.status(LR.str(ev.text));
           } else if (ev.type === 'token') {
             ctx.gotStart = true;
             ctx.tokens += LR.str(ev.text);
@@ -617,6 +633,7 @@
       updateSend();
       refreshList();
       LR.emit('status-refresh');
+      window.setTimeout(() => LR.emit('status-refresh'), 900);
     }
   }
 

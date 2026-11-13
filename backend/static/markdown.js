@@ -550,7 +550,8 @@
         if (streaming) {
           caret = h('span', { class: 'caret', 'aria-hidden': 'true' });
           const last = prev.length ? prev[prev.length - 1].node : root;
-          caretHost(last).append(caret);
+          if (last !== root && (last.classList.contains('table-wrap') || last.tagName === 'HR')) root.append(caret);
+          else caretHost(last).append(caret);
         }
       },
       reset() {

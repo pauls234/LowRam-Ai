@@ -15,9 +15,9 @@
       { id: 'landscape', label: 'Landscape', w: 768, h: 512 },
     ],
     video: [
-      { id: 'wide', label: 'Wide', w: 512, h: 320 },
-      { id: 'square', label: 'Square', w: 384, h: 384 },
-      { id: 'tall', label: 'Tall', w: 320, h: 512 },
+      { id: 'wide', label: 'Wide', w: 832, h: 480 },
+      { id: 'square', label: 'Square', w: 512, h: 512 },
+      { id: 'tall', label: 'Tall', w: 480, h: 832 },
     ],
   };
   const ACTIVE = new Set(['queued', 'running']);
@@ -97,7 +97,7 @@
     const models = modelsOf(kind);
     if (models.length) {
       parts.push(h('div', { class: 'model-grid' }, models.map((m) => LR.modelCard(m, {
-        ramTotal: LR.state.memory && LR.state.memory.total_bytes,
+        ramTotal: s.ram_total_bytes || (LR.state.memory && LR.state.memory.total_bytes),
         onInstall: (model, btn) => install('/api/media/models/' + encodeURIComponent(model.id) + '/install', btn),
       }))));
     } else {
@@ -109,7 +109,12 @@
   async function install(path, btn) {
     LR.setBusy(btn, true, 'Starting…');
     try {
-      await LR.post(path, {});
+      const data = await LR.post(path, {});
+      if (data && data.installed) {
+        LR.toast('Already installed');
+        await loadStatus();
+        return;
+      }
       LR.toast('Download started');
       await LR.downloads.refresh();
     } catch (err) {
@@ -137,10 +142,10 @@
     ui.negative = h('input', { class: 'input', type: 'text', placeholder: 'blurry, text, watermark', maxlength: '1000' });
     ui.steps = h('input', { class: 'input input-number', type: 'number', min: '1', max: '100', step: '1', value: '8', inputmode: 'numeric' });
     ui.seed = h('input', { class: 'input input-number', type: 'number', min: '0', step: '1', placeholder: 'Random', inputmode: 'numeric' });
-    ui.frames = h('input', { class: 'input input-number', type: 'number', min: '4', max: '96', step: '1', value: '16', inputmode: 'numeric' });
+    ui.frames = h('input', { class: 'input input-number', type: 'number', min: '5', max: '161', step: '4', value: '33', inputmode: 'numeric' });
     ui.model = h('select', { class: 'input select' });
     const dice = LR.button({ icon: 'dice', variant: 'ghost', cls: 'btn-icon', label: 'Random seed', onclick: () => { ui.seed.value = String(Math.floor(Math.random() * 2147483647)); } });
-    ui.fFrames = LR.field({ label: 'Frames', control: ui.frames, hint: 'About 8 frames per second.' });
+    ui.fFrames = LR.field({ label: 'Frames', control: ui.frames, hint: 'Use 17, 33, 49 or 81 (4n+1). 33 frames ≈ 2 seconds.' });
     const seedField = LR.field({ label: 'Seed', control: ui.seed, optional: true, hint: 'Same seed + prompt = same picture.' });
     seedField.el.querySelector('input').after(dice);
     seedField.el.classList.add('field-seed');
@@ -203,6 +208,16 @@
     const preferred = LR.state.settings && LR.state.settings.media ? LR.state.settings.media[kind + '_model_id'] : null;
     ui.model.replaceChildren(...(models.length ? models : [{ id: '', name: 'No model installed' }]).map((m) => h('option', { value: m.id, text: m.name || m.id })));
     ui.model.value = models.some((m) => m.id === current) ? current : models.some((m) => m.id === preferred) ? preferred : (models[0] ? models[0].id : '');
+    const selected = models.find((m) => m.id === ui.model.value);
+    if (selected && ui.lastModel !== selected.id) {
+      ui.lastModel = selected.id;
+      const d = selected.defaults || {};
+      if (LR.isNum(d.steps)) ui.steps.value = String(d.steps);
+      if (kind === 'video' && LR.isNum(d.frames)) ui.frames.value = String(d.frames);
+    }
+    const noFfmpeg = kind === 'video' && st.status && st.status.ffmpeg === false;
+    ui.videoHint.querySelector('.callout-text').textContent = 'A two-second clip can take an hour on a CPU-only machine. You can keep using LowRAM AI meanwhile.' +
+      (noFfmpeg ? ' ffmpeg was not found, so videos are saved as WebM/AVI instead of MP4.' : '');
     ui.generate.disabled = !ready(kind);
     ui.generate.title = ready(kind) ? '' : 'Install the engine and a model first';
   }
@@ -230,7 +245,13 @@
     }
     if (kind === 'video') {
       const frames = Number(ui.frames.value);
-      if (Number.isInteger(frames) && frames > 0) body.frames = frames;
+      if (!Number.isInteger(frames) || frames < 5 || (frames - 1) % 4) {
+        ui.fFrames.setError('Use a frame count like 17, 33, 49 or 81 (a multiple of 4, plus 1).');
+        ui.frames.focus();
+        return;
+      }
+      ui.fFrames.setError('');
+      body.frames = frames;
     }
     if (ui.model.value) body.model_id = ui.model.value;
     LR.setBusy(ui.generate, true, 'Queuing…');
@@ -386,7 +407,8 @@
   function openLightbox(job) {
     const p = job.params || {};
     const url = fileUrl(job);
-    const ext = isVideo(job) ? (LR.str(job.output_type).includes('webm') ? 'webm' : 'mp4') : 'png';
+    const type = LR.str(job.output_type);
+    const ext = isVideo(job) ? (type.includes('webm') ? 'webm' : type.includes('avi') ? 'avi' : 'mp4') : 'png';
     const details = [
       LR.isNum(p.width) && LR.isNum(p.height) ? p.width + '×' + p.height : '',
       LR.isNum(p.steps) ? p.steps + ' steps' : '',
@@ -396,7 +418,7 @@
     ].filter(Boolean).join(' · ');
     const del = LR.button({ text: 'Delete', icon: 'trash', variant: 'ghost', onclick: async (ev) => { if (await deleteJob(job, ev.currentTarget)) m.close(); } });
     const use = LR.button({ text: 'Use prompt', variant: 'secondary', onclick: () => { m.close(); reuse(job); } });
-    const download = url ? h('a', { class: 'btn btn-primary', href: url, download: 'lowram-' + job.id + '.' + ext }, [icon('download'), h('span', { text: 'Download' })]) : null;
+    const download = url ? h('a', { class: 'btn btn-primary', href: url + (url.includes('?') ? '&' : '?') + 'download=1', download: 'lowram-' + job.id + '.' + ext }, [icon('download'), h('span', { text: 'Download' })]) : null;
     const m = LR.modal({
       title: isVideo(job) ? 'Video' : 'Image',
       sub: details,
