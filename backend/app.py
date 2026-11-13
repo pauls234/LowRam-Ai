@@ -302,7 +302,7 @@ class Handler(BaseHTTPRequestHandler):
     do_GET = do_HEAD = do_POST = do_PUT = do_PATCH = do_DELETE = _handle  # noqa: N815
 
 
-class LowRAMServer(ThreadingHTTPServer):
+class LowRAMServer(web.QuickBindMixin, ThreadingHTTPServer):
     daemon_threads = True
 
     def __init__(self, port: int, token: str | None = None):

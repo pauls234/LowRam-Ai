@@ -30,6 +30,23 @@ if TYPE_CHECKING:  # pragma: no cover
 MAX_BODY_BYTES = 1024 * 1024
 
 
+class QuickBindMixin:
+    """Skip ``socket.getfqdn()`` in ``HTTPServer.server_bind``.
+
+    The stdlib does a reverse-DNS lookup of the bind address there, which can
+    hang for many seconds on macOS (mDNS). We only listen on known addresses,
+    so the fully-qualified name is never needed. Use as the FIRST base class.
+    """
+
+    def server_bind(self) -> None:
+        import socketserver
+
+        socketserver.TCPServer.server_bind(self)  # type: ignore[arg-type]
+        host, port = self.server_address[:2]  # type: ignore[attr-defined]
+        self.server_name = str(host)
+        self.server_port = port
+
+
 class HTTPError(Exception):
     def __init__(self, status: HTTPStatus, message: str):
         super().__init__(message)

@@ -663,7 +663,7 @@ class LanHandler(BaseHTTPRequestHandler):
     do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = do_HEAD = _handle  # noqa: N815
 
 
-class LanServer(ThreadingHTTPServer):
+class LanServer(web.QuickBindMixin, ThreadingHTTPServer):
     """TLS server for devices. The handshake runs in the per-connection thread
     (with a timeout), so a silent client cannot block ``accept``."""
 

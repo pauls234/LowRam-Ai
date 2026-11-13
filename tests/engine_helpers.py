@@ -249,7 +249,13 @@ class H(BaseHTTPRequestHandler):
             return self._send(401, {"error": {"code": 401, "message": "Invalid API Key"}})
         self._send(200, {"choices": [{"message": {"role": "assistant", "content": "fake llama reply"}}]})
 
-srv = HTTPServer((host, port), H)
+class QuickHTTPServer(HTTPServer):
+    def server_bind(self):  # skip getfqdn(): slow reverse DNS on macOS runners
+        import socketserver
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = str(self.server_address[0]), self.server_address[1]
+
+srv = QuickHTTPServer((host, port), H)
 if mode == "crash_after_ready":
     def die():
         while state["health"] <= loading:
