@@ -195,16 +195,21 @@
     }
     ui.loop.hidden = false;
     const project = projectById(loop.project_id);
-    const sig = JSON.stringify([loop, project && project.name, st.selected]);
+    const sig = JSON.stringify([loop, project && project.name, project && project.counts, st.selected]);
     if (sig === ui.loopSig) return;
     ui.loopSig = sig;
     const completed = loop.completed || 0;
     const failed = loop.failed || 0;
     const max = LR.isNum(loop.max_tasks) && loop.max_tasks > 0 ? loop.max_tasks : null;
-    const bar = LR.progress({ label: 'Loop progress', value: max ? completed / max : null });
-    bar.set(max ? Math.min(1, (completed + failed) / max) : null, completed + (max ? ' of ' + max : '') + ' tasks completed');
-    const parts = [completed + (max ? ' / ' + max : '') + ' completed'];
+    // Progress against what is actually left in the project (the limit is only a cap).
+    const left = project && project.counts && LR.isNum(project.counts.pending) ? project.counts.pending + (project.counts.running || 0) : null;
+    const planned = left !== null ? Math.min(max || Infinity, completed + failed + left) : max;
+    const bar = LR.progress({ label: 'Loop progress' });
+    bar.set(planned ? Math.min(1, (completed + failed) / planned) : null, completed + ' done' + (planned ? ' of ' + planned : ''));
+    const parts = [completed + ' done'];
     if (failed) parts.push(failed + ' failed');
+    if (active && left !== null) parts.push(left + ' left');
+    if (max) parts.push('limit ' + max);
     let tone = 'accent';
     let title = loop.stop_requested ? 'Loop stopping…' : 'Loop running';
     if (!active) {
