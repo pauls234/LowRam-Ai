@@ -25,12 +25,12 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from . import api_core, artifacts, config, db, runner, web  # noqa: F401 - api_core registers routes
+from . import api_core, artifacts, config, db, power, runner, web  # noqa: F401 - api_core registers routes
 from .web import FileResponse, HTTPError, StreamResponse
 
 # Feature modules register their routes/hooks on import. A module that does not
 # exist yet (built in parallel) is skipped; any other import error is raised.
-FEATURE_MODULES = ("api_coding", "chat", "engine", "media", "cluster")
+FEATURE_MODULES = ("api_coding", "chat", "engine", "media", "cluster", "power")
 LOADED_FEATURES: list[str] = []
 for _name in FEATURE_MODULES:
     try:
@@ -154,6 +154,13 @@ class LoopController:
                 self._state.update(
                     active=False, current_task_id=None, stopped_because=stopped_because,
                     finished_at=db.utcnow(), last_message=(message or stopped_because)[:500],
+                )
+                done, failed = self._state["completed"], self._state["failed"]
+            if done or failed:
+                finished = stopped_because in ("queue_empty", "max_tasks")
+                power.notify(
+                    "Task queue finished" if finished else "Task queue stopped",
+                    f"{done} done, {failed} failed." + ("" if finished else f" {message or stopped_because}"),
                 )
 
 

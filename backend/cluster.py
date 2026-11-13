@@ -92,7 +92,7 @@ from typing import Any
 
 import psutil
 
-from . import artifacts, config, db, llm, memory, runner, settings, web
+from . import artifacts, config, db, llm, memory, power, runner, settings, web
 from .web import HTTPError, Request, Response, route
 
 log = logging.getLogger("lowram.cluster")
@@ -1591,6 +1591,7 @@ def _pair_status(data: dict) -> dict:
         if item["client_nonce"] is None and item["state"] == "pending":
             item["client_nonce"] = nonce
             item["code"] = verification_code(certificate_fingerprint() or b"", nonce, item["host_nonce"])
+            power.notify("Device wants to join", f"{item['name']} wants to join – check the number {item['code']}")
         if item["state"] != "approved":
             return {"state": item["state"]}
         if item["delivered"]:
@@ -1807,6 +1808,7 @@ def run_merge(project_id: int) -> dict:
         return {"status": "waiting", "reason": str(exc)}
     _set_merge_state(project_id, "done", final_path=str(final))
     log.info("Project #%s merged into %s", project_id, final)
+    power.notify("Combined result ready", f"{project['name']}: all devices finished; the merged result is ready.")
     return {"status": "done", "path": str(final)}
 
 
