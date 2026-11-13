@@ -137,6 +137,12 @@
       if (id !== st.selected) return;
       st.detail = { project: data.project, tasks: Array.isArray(data.tasks) ? data.tasks : [] };
       renderDetail();
+      // Reopening a project with an open proposal shows it again right away.
+      const open = st.detail.tasks.find((t) => t.status === 'proposed');
+      if (open && !ui.reviewSlot.childElementCount && st.autoReview !== id + ':' + open.id) {
+        st.autoReview = id + ':' + open.id;
+        review(open);
+      }
     } catch (err) {
       if (err.status === 404) {
         st.selected = null;
@@ -414,12 +420,7 @@
   }
 
   async function approve(pid, taskId, files, btn) {
-    const ok = await LR.confirm({
-      title: 'Write these changes?',
-      message: fmt.plural(files.length || 1, 'file') + ' in your project will be created or overwritten. Backups of the originals are kept.',
-      confirmText: 'Approve & write',
-    });
-    if (!ok) return;
+    // The button itself says "Approve & write N files" – one clear confirmation is enough.
     LR.setBusy(btn, true, 'Writing…');
     try {
       const res = await LR.post('/api/coding/projects/' + pid + '/tasks/' + taskId + '/approve', {});
@@ -530,6 +531,7 @@
       if (id !== st.selected) {
         st.selected = id;
         st.detail = null;
+        st.autoReview = null;
         ui.reviewSlot.replaceChildren();
         showOutcome(null);
       }

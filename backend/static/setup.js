@@ -126,8 +126,56 @@
       h('p', { class: 'card-sub', text: 'You can add or switch models later in Models & Settings.' }),
       models.length ? h('div', { class: 'choice-list' }, choices) : LR.empty({ icon: 'cpu', title: 'No models available', text: 'The catalog of this build is empty.' }),
     ]);
-    ui.inner.replaceChildren(hero(), machine, pick, h('div', { class: 'setup-actions' }, [ui.go, skip]),
+    ui.inner.replaceChildren(hero(), machine, pick, ownModelBox(models), h('div', { class: 'setup-actions' }, [ui.go, skip]),
       h('p', { class: 'setup-note' }, [icon('shield'), h('span', { text: 'Downloads come only from trusted sources over HTTPS and are verified before use.' })]));
+  }
+
+  /** "Use a model file I already have" + link to Hugging Face models (v0.3.1 backends). */
+  function ownModelBox(models) {
+    if (!models.some((m) => 'source' in m)) return null;
+    const input = h('input', { class: 'input mono', type: 'text', placeholder: '/Volumes/External/models/my-model.gguf', spellcheck: 'false', autocomplete: 'off' });
+    const field = LR.field({ label: 'Use a model file I already have', control: input, hint: 'A .gguf file. It stays where it is – an external drive works too.' });
+    const row = h('div', { class: 'input-row' });
+    input.replaceWith(row);
+    row.append(input);
+    const api = window.pywebview && window.pywebview.api;
+    if (api && typeof api.pick_file === 'function') {
+      row.append(LR.button({ text: 'Choose…', icon: 'folder', onclick: async () => {
+        try {
+          const picked = await api.pick_file('Choose a GGUF model file');
+          if (picked) input.value = String(picked);
+        } catch (_) { /* dialog closed */ }
+      } }));
+    }
+    const add = LR.button({ text: 'Use this file', icon: 'plus', variant: 'secondary', type: 'submit' });
+    row.append(add);
+    const form = h('form', { class: 'form', novalidate: true }, field.el);
+    form.addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      field.setError('');
+      const path = input.value.trim();
+      if (!/\.gguf$/i.test(path) || !/^(\/|~|[A-Za-z]:[\\/])/.test(path)) {
+        field.setError('Enter the full path of a .gguf file.');
+        input.focus();
+        return;
+      }
+      LR.setBusy(add, true, 'Adding…');
+      try {
+        const data = await LR.post('/api/engine/custom/import', { path });
+        if (data.model && data.model.id) st.selected = data.model.id;
+        LR.toast('Added ' + LR.str(data.model && data.model.name, 'your model'));
+        await LR.loadCatalog();
+        render();
+      } catch (err) {
+        field.setError(err.message);
+        LR.setBusy(add, false);
+      }
+    });
+    return h('section', { class: 'card setup-card setup-own', 'aria-labelledby': 'setup-own-title' }, [
+      h('h2', { class: 'card-title', id: 'setup-own-title', text: 'Already have a model?' }),
+      form,
+      h('p', { class: 'muted small' }, ['Looking for something else? ', h('a', { href: '#/settings', text: 'Add a model from Hugging Face' }), ' in Models & Settings.']),
+    ]);
   }
 
   function goLabel(models) {

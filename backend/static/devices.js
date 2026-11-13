@@ -97,6 +97,7 @@
     try {
       const data = await LR.post('/api/cluster/join', { host_id: host.id });
       if (data.worker && st.cluster) st.cluster.worker = data.worker;
+      st.fastUntil = Date.now() + 15000;
       st.sig = '';
       render();
       const verify = ui.worker.el.querySelector('.verify');
@@ -112,15 +113,23 @@
   }
 
   const poller = LR.poller(async () => {
-    try { await load(); } catch (_) { return 5000; }
+    try { await load(); } catch (_) { return 4000; }
     const w = st.cluster && st.cluster.worker;
-    return st.pairingModal || (w && (w.state === 'pairing' || w.state === 'awaiting_approval')) || (st.cluster && st.cluster.requests && st.cluster.requests.length) ? 1500 : 4000;
-  }, 4000);
+    const urgent = st.pairingModal || (w && (w.state === 'pairing' || w.state === 'awaiting_approval')) || Date.now() < (st.fastUntil || 0) ||
+      (st.cluster && st.cluster.requests && st.cluster.requests.length);
+    return urgent ? 1000 : 2000; // devices and the helper state refresh by themselves while this page is open
+  }, 2000);
+
+  /** A helper is connected once the host knows it (host / device id) – whatever the exact state. */
+  const isConnected = (w) => Boolean(w) && w.state !== 'stopped' && w.state !== 'awaiting_approval' && (Boolean(w.host) || (w.device_id !== null && w.device_id !== undefined));
 
   async function load() {
     const data = await LR.get('/api/cluster');
     st.cluster = data.cluster || data;
     st.loaded = true;
+    const w = st.cluster && st.cluster.worker;
+    if (w && st.lastWorkerState === 'awaiting_approval' && w.state !== 'awaiting_approval') st.fastUntil = Date.now() + 10000;
+    st.lastWorkerState = w ? w.state : null;
     const sig = JSON.stringify(st.cluster);
     if (sig !== st.sig) {
       st.sig = sig;
@@ -322,17 +331,20 @@
       ]));
       return;
     }
-    if (w.state === 'working' || w.state === 'pairing') {
+    if (w.state === 'pairing' || isConnected(w)) {
       const task = w.current_task;
-      const taskText = task === null || task === undefined || task === '' ? 'Waiting for a task' : typeof task === 'object' ? 'Working on ' + LR.str(task.title || ('task ' + task.id)) : 'Working on task ' + task;
+      const taskText = task === null || task === undefined || task === '' ? '' : typeof task === 'object' ? 'Working on ' + LR.str(task.title || ('task ' + task.id)) : 'Working on task ' + task;
+      const host = LR.str(w.host, 'the other computer');
+      const working = w.state === 'working' || Boolean(taskText);
+      const title = w.state === 'pairing' && !isConnected(w) ? 'Connecting to ' + host + '…' : working ? 'Helping ' + host : 'Connected to ' + host;
+      const detail = [taskText || LR.str(w.message, w.state === 'pairing' ? 'Checking the code…' : 'Waiting for tasks…')];
+      if (isConnected(w)) detail.push(fmt.plural(w.tasks_done || 0, 'task') + ' done');
       out.push(h('div', { class: 'worker-state' }, [
-        h('span', { class: 'dot dot-' + (w.state === 'working' ? 'busy' : 'warn') + ' is-pulsing', 'aria-hidden': 'true' }),
-        h('div', null, [
-          h('p', { class: 'strong', text: w.state === 'pairing' ? 'Connecting to ' + LR.str(w.host, 'the host') + '…' : 'Helping ' + LR.str(w.host, 'another computer') }),
-          h('p', { class: 'muted small', text: w.state === 'working' ? taskText + ' · ' + fmt.plural(w.tasks_done || 0, 'task') + ' done' : LR.str(w.message, 'Checking the code…') }),
-        ]),
+        h('span', { class: 'dot dot-' + (working ? 'busy' : w.state === 'error' ? 'error' : 'ok') + (working || w.state === 'pairing' ? ' is-pulsing' : ''), 'aria-hidden': 'true' }),
+        h('div', null, [h('p', { class: 'strong', text: title }), h('p', { class: 'muted small', text: detail.join(' · ') })]),
         LR.button({ text: 'Leave', icon: 'power', size: 'sm', variant: 'secondary', onclick: (ev) => leave(ev.currentTarget) }),
       ]));
+      if (w.state === 'error' && w.error) out.push(LR.callout({ tone: 'error', title: 'Connection problem', text: LR.str(w.error), role: 'alert' }));
       ui.worker.body.replaceChildren(...out);
       return;
     }
@@ -359,6 +371,7 @@
       try {
         const data = await LR.post('/api/cluster/join', { code: code.value.trim(), name: name.value.trim() || undefined });
         if (data.worker && st.cluster) st.cluster.worker = data.worker;
+        st.fastUntil = Date.now() + 15000;
         LR.toast('Joining…', 'info');
         poller.now();
       } catch (err) {

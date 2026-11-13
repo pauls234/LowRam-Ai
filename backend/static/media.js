@@ -67,7 +67,34 @@
 
   /* ------------------------------------------------------------ setup */
 
+  function renderRuntime() {
+    if (!ui.runtime) return;
+    const s = st.status;
+    if (!s) {
+      ui.runtime.replaceChildren(LR.spinner(), h('span', { class: 'muted', text: 'Checking the image engine…' }));
+      return;
+    }
+    const rt = s.runtime || {};
+    const dl = LR.downloads.list.find((d) => d.kind === 'media-runtime' && LR.downloads.isActive(d));
+    if (rt.installed) {
+      ui.runtime.replaceChildren(
+        LR.dot('ok'),
+        h('span', { class: 'strong', text: 'Image engine ready' }),
+        h('span', { class: 'muted', text: [rt.version ? 'version ' + rt.version : '', s.ffmpeg === false ? 'videos as WebM (no ffmpeg)' : s.ffmpeg ? 'MP4 videos via ffmpeg' : ''].filter(Boolean).join(' · ') }),
+      );
+    } else if (dl || rt.downloading) {
+      ui.runtime.replaceChildren(LR.spinner(), h('span', { class: 'strong', text: 'Installing the image engine…' }), h('span', { class: 'muted', text: dl ? LR.downloads.summary(dl) : '' }));
+    } else {
+      ui.runtime.replaceChildren(
+        LR.dot('idle'),
+        h('span', { class: 'strong', text: 'Image engine not installed' }),
+        LR.button({ text: 'Install', icon: 'download', size: 'sm', variant: 'secondary', onclick: (ev) => install('/api/media/runtime/install', ev.currentTarget) }),
+      );
+    }
+  }
+
   function renderSetup() {
+    renderRuntime();
     if (!ui.setup) return;
     const s = st.status;
     if (!s) {
@@ -436,6 +463,7 @@
     ui.page = h('div', { class: 'page' });
     root.append(ui.page);
     ui.setup = h('section', { class: 'card media-setup', 'aria-label': 'Setup' });
+    ui.runtime = h('p', { class: 'runtime-line', role: 'status' });
     ui.queue = h('ul', { class: 'jobs', 'aria-live': 'polite', 'aria-label': 'Queue' });
     ui.queueCard = h('section', { class: 'card', 'aria-labelledby': 'queue-title', hidden: true }, [
       h('div', { class: 'card-head' }, h('h2', { class: 'card-title', id: 'queue-title', text: 'Queue' })),
@@ -456,7 +484,7 @@
         return;
       }
       if (!ui.form) buildForm();
-      ui.page.replaceChildren(head, ui.setup, ui.form, ui.queueCard, h('section', { class: 'gallery-section', 'aria-labelledby': 'gallery-title' }, [
+      ui.page.replaceChildren(head, ui.runtime, ui.setup, ui.form, ui.queueCard, h('section', { class: 'gallery-section', 'aria-labelledby': 'gallery-title' }, [
         h('h2', { class: 'section-title', id: 'gallery-title', text: 'Gallery' }),
         ui.gallery,
       ]));
