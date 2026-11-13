@@ -1,4 +1,4 @@
-"""Desktop launcher (no GUI): ports, single instance, browser/window paths, shutdown, frozen paths."""
+"""Desktop launcher (no GUI): ports, single instance, browser/window paths, signals, JS API, frozen paths."""
 
 import json
 import logging
@@ -15,9 +15,11 @@ from unittest import mock
 
 from backend import __version__, app, web
 from desktop import launcher
-from tests.helpers import LowRAMTestCase, wait_until
+from tests.helpers import LowRAMTestCase
 
 REPO = Path(__file__).resolve().parent.parent
+TOKEN = "desktop-test-token-0123456789"
+ABS_DIR = str(Path.home().resolve() / "LowRAM models")
 
 
 def free_port() -> int:
@@ -39,6 +41,14 @@ def answers(port: int) -> bool:
             return True
     except OSError:
         return False
+
+
+def fake_webview(create_window, start) -> types.ModuleType:
+    module = types.ModuleType("webview")
+    module.settings = {"ALLOW_DOWNLOADS": False, "ALLOW_FILE_URLS": True}
+    module.FileDialog = types.SimpleNamespace(OPEN=10, FOLDER=20, SAVE=30)
+    module.create_window, module.start = create_window, start
+    return module
 
 
 class _OtherJSON(BaseHTTPRequestHandler):
@@ -67,9 +77,13 @@ class DesktopTestCase(LowRAMTestCase):
         quiet = mock.patch("desktop.launcher.say")  # keep the test output clean
         quiet.start()
         self.addCleanup(quiet.stop)
+        null = logging.NullHandler()  # expected warnings must not reach stderr (logging.lastResort)
+        logging.getLogger("lowram.desktop").addHandler(null)
+        self.addCleanup(logging.getLogger("lowram.desktop").removeHandler, null)
+        self.home.mkdir(parents=True, exist_ok=True)
 
     def serve_lowram(self):
-        server = app.LowRAMServer(0, token="t")
+        server = app.LowRAMServer(0, token=TOKEN)
         thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
         thread.start()
 
@@ -134,16 +148,53 @@ class InstanceTests(DesktopTestCase):
         self.assertIsNone(launcher.probe_instance(other.server_address[1]))
         self.assertIsNone(launcher.probe_instance(free_port()))
 
-    def test_find_running_instance(self):
+    def test_verified_instance_is_reused_and_file_lifecycle(self):
         port = self.serve_lowram()
-        self.assertEqual(launcher.find_running_instance([free_port(), port]), port)
-        self.assertIsNone(launcher.find_running_instance([free_port()]))
+        path, nonce = launcher.write_instance_file(self.home, port, TOKEN)
+        if os.name != "nt":
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        data = json.loads(path.read_text())
+        self.assertEqual((data["port"], data["pid"]), (port, os.getpid()))
+        self.assertNotIn(TOKEN, path.read_text(), "only a hash of the page token is stored")
+        self.assertEqual(launcher.find_verified_instance(self.home), port)
+        launcher.remove_instance_file(path, "someone-else")
+        self.assertTrue(path.exists(), "a file written by another instance is left alone")
+        launcher.remove_instance_file(path, nonce)
+        self.assertFalse(path.exists())
+        self.assertIsNone(launcher.find_verified_instance(self.home))
 
-    def test_second_launch_opens_running_instance_without_new_server(self):
+    def test_unproven_instances_are_not_reused(self):
         port = self.serve_lowram()
+        path, _ = launcher.write_instance_file(self.home, port, "an-impostor-token-value")
+        self.assertIsNone(launcher.find_verified_instance(self.home), "token hash mismatch")
+        good = {**json.loads(path.read_text()), "token_sha256": launcher._token_digest(TOKEN)}
+        for change in ({"create_time": good["create_time"] + 60}, {"pid": 4_206_649}, {"port": "8765"}, {}):
+            path.write_text(json.dumps({**good, **change}))
+            expected = port if not change else None
+            self.assertEqual(launcher.find_verified_instance(self.home), expected, change)
+        if os.name != "nt":
+            os.chmod(path, 0o666)
+            self.assertIsNone(launcher.find_verified_instance(self.home), "writable by others")
+            os.chmod(path, 0o600)
+            real = self.home / "elsewhere.json"
+            path.rename(real)
+            path.symlink_to(real)
+            self.assertIsNone(launcher.find_verified_instance(self.home), "symlink")
+
+    def test_lowram_without_proof_gets_its_own_server(self):
+        port = self.serve_lowram()  # answers /api/status but wrote no instance.json
+        backend = launcher.start_or_reuse([port, free_port()], self.home, 5)
+        self.addCleanup(backend.stop)
+        self.assertTrue(backend.owned)
+        self.assertNotEqual(backend.port, port)
+        self.assertEqual(launcher.find_verified_instance(self.home), backend.port)
+
+    def test_second_launch_opens_verified_instance_without_new_server(self):
+        port = self.serve_lowram()
+        launcher.write_instance_file(self.home, port, TOKEN)
         with mock.patch("desktop.launcher.webbrowser.open", return_value=True) as opened, \
                 mock.patch("desktop.launcher.start_server", side_effect=AssertionError("must not start")):
-            code = launcher.main(["--no-window", "--port", str(port)])
+            code = launcher.main(["--no-window"])
         self.assertEqual(code, 0)
         opened.assert_called_once_with(f"http://127.0.0.1:{port}/", new=2)
         self.assertIsNotNone(launcher.probe_instance(port), "the running instance must keep running")
@@ -161,11 +212,12 @@ class RunTests(DesktopTestCase):
             return True
 
         def fake_wait(stop=None):
-            seen["root"] = launcher.http.client.HTTPConnection("127.0.0.1", port, timeout=5)
-            seen["root"].request("GET", "/")
-            resp = seen["root"].getresponse()
+            conn = launcher.http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            conn.request("GET", "/")
+            resp = conn.getresponse()
             seen["index"] = (resp.status, b"<html" in resp.read().lower())
-            seen["root"].close()
+            conn.close()
+            seen["instance"] = json.loads((self.home / "instance.json").read_text())
 
         with mock.patch("desktop.launcher.webbrowser.open", side_effect=fake_open), \
                 mock.patch("desktop.launcher.wait_for_stop", side_effect=fake_wait):
@@ -174,6 +226,8 @@ class RunTests(DesktopTestCase):
         self.assertEqual(seen["url"], f"http://127.0.0.1:{port}/")
         self.assertIsNotNone(seen["status"])
         self.assertEqual(seen["index"], (200, True))
+        self.assertEqual((seen["instance"]["port"], seen["instance"]["pid"]), (port, os.getpid()))
+        self.assertFalse((self.home / "instance.json").exists(), "removed on clean shutdown")
         self.assertEqual(self.events, ["startup", "shutdown"])
         self.assertFalse(answers(port), "server socket must be closed after shutdown")
         log_text = (self.home / "logs" / "app.log").read_text(encoding="utf-8")
@@ -191,38 +245,69 @@ class RunTests(DesktopTestCase):
             def load_html(self, html):
                 calls.append(("load_html", html))
 
-        fake = types.ModuleType("webview")
-        fake.settings = {"ALLOW_DOWNLOADS": False, "ALLOW_FILE_URLS": True}
-
         def create_window(title, **kw):
             calls.append(("create", title, kw["width"], kw["height"], kw["min_size"], kw["text_select"],
                           "Starting" in kw["html"]))
+            self.api = kw["js_api"]
             return FakeWindow()
 
         def start(func, **kw):
             calls.append(("start", kw["private_mode"]))
             func()  # the GUI loop runs func in a thread; the "window" closes when it returns
 
-        fake.create_window, fake.start = create_window, start
+        fake = fake_webview(create_window, start)
         with mock.patch.dict(sys.modules, {"webview": fake}), \
                 mock.patch("desktop.launcher.webbrowser.open", side_effect=AssertionError("no browser")):
             code = launcher.main(["--port", str(port)])
         self.assertEqual(code, 0)
         self.assertEqual(calls[0], ("create", "LowRAM AI", 1280, 820, (900, 600), True, True))
         self.assertIn(("load_url", f"http://127.0.0.1:{port}/", True), calls)
+        self.assertIsInstance(self.api, launcher.DesktopApi)
+        self.assertIsInstance(self.api._window, FakeWindow)
         self.assertEqual(fake.settings, {"ALLOW_DOWNLOADS": True, "ALLOW_FILE_URLS": False})
         self.assertEqual(self.events, ["startup", "shutdown"])
         self.assertFalse(answers(port))
+
+    @unittest.skipIf(os.name == "nt", "POSIX signals")
+    def test_sigterm_in_window_mode_stops_server_then_closes_window(self):
+        port = free_port()
+        order = []
+        destroyed = threading.Event()
+
+        class FakeWindow:
+            def load_url(self, url):
+                order.append("loaded")
+
+            def load_html(self, html):
+                order.append("error page")
+
+            def destroy(self):
+                order.append("destroy, server " + ("up" if answers(port) else "down"))
+                destroyed.set()
+
+        def start(func, **kw):  # a GUI loop that only ends when the window is destroyed
+            func()
+            os.kill(os.getpid(), signal.SIGTERM)
+            if not destroyed.wait(10):
+                raise AssertionError("window was not closed after SIGTERM")
+
+        before = signal.getsignal(signal.SIGTERM)
+        fake = fake_webview(lambda title, **kw: FakeWindow(), start)
+        with mock.patch.dict(sys.modules, {"webview": fake}), \
+                mock.patch("desktop.launcher.webbrowser.open", side_effect=AssertionError("no browser")):
+            code = launcher.main(["--port", str(port)])
+        self.assertEqual(code, 0)
+        self.assertEqual(order, ["loaded", "destroy, server down"])
+        self.assertEqual(self.events, ["startup", "shutdown"])
+        self.assertFalse((self.home / "instance.json").exists())
+        self.assertEqual(signal.getsignal(signal.SIGTERM), before)
 
     def test_window_failure_shows_error_page(self):
         busy = listening_socket()
         self.addCleanup(busy.close)
         pages = []
-        fake = types.ModuleType("webview")
-        fake.settings = {}
         window = types.SimpleNamespace(load_url=lambda url: pages.append(url), load_html=pages.append)
-        fake.create_window = lambda title, **kw: window
-        fake.start = lambda func, **kw: func()
+        fake = fake_webview(lambda title, **kw: window, lambda func, **kw: func())
         with mock.patch.dict(sys.modules, {"webview": fake}):
             code = launcher.main(["--port", str(busy.getsockname()[1])])
         self.assertEqual(code, 1)
@@ -233,14 +318,11 @@ class RunTests(DesktopTestCase):
 
     def test_no_native_webview_falls_back_to_browser(self):
         port = free_port()
-        fake = types.ModuleType("webview")
-        fake.settings = {}
-        fake.create_window = lambda title, **kw: types.SimpleNamespace()
 
         def start(func, **kw):
             raise RuntimeError("You must have either QT or GTK")
 
-        fake.start = start
+        fake = fake_webview(lambda title, **kw: types.SimpleNamespace(), start)
         with mock.patch.dict(sys.modules, {"webview": fake}), \
                 mock.patch("desktop.launcher.webbrowser.open", return_value=True) as opened, \
                 mock.patch("desktop.launcher.wait_for_stop"):
@@ -263,6 +345,56 @@ class RunTests(DesktopTestCase):
         threading.Timer(0.1, stop.set).start()
         launcher.wait_for_stop(stop)
         self.assertTrue(stop.is_set())
+
+
+class DesktopApiTests(unittest.TestCase):
+    def make(self, result):
+        api = launcher.DesktopApi(types.SimpleNamespace(FileDialog=types.SimpleNamespace(OPEN=10, FOLDER=20)))
+        calls = []
+
+        def create_file_dialog(kind, **kw):
+            calls.append((kind, kw))
+            return result
+
+        api._window = types.SimpleNamespace(create_file_dialog=create_file_dialog)
+        return api, calls
+
+    def test_only_the_two_dialogs_are_exposed_to_javascript(self):
+        api, _ = self.make(None)
+        # pywebview exposes every attribute whose name does not start with "_".
+        self.assertEqual([name for name in dir(api) if not name.startswith("_")], ["pick_file", "pick_folder"])
+        with self.assertRaises(AttributeError):
+            api.extra = 1  # __slots__: nothing can be added later
+
+    def test_pick_folder(self):
+        api, calls = self.make((ABS_DIR,))
+        self.assertEqual(api.pick_folder("Choose a models folder"), ABS_DIR)
+        self.assertEqual(calls[0][0], 20)
+        self.assertFalse(calls[0][1]["allow_multiple"])
+        for result in (None, (), ("relative/folder",), (42,)):
+            api, _ = self.make(result)
+            self.assertIsNone(api.pick_folder("x"), result)
+
+    def test_pick_file_patterns(self):
+        model = str(Path(ABS_DIR) / "model.gguf")
+        api, calls = self.make([model])
+        self.assertEqual(api.pick_file("Import a model", ["*.gguf", "*.bin"]), model)
+        self.assertEqual(calls[0], (10, {"directory": str(Path.home()), "allow_multiple": False,
+                                         "file_types": ("Supported files (*.gguf;*.bin)",)}))
+        api.pick_file("x", ["evil);(*.*", "*.gguf;rm"])
+        api.pick_file("x", "not-a-list")
+        self.assertEqual([c[1]["file_types"] for c in calls[1:]], [("Supported files (*.gguf)",)] * 2)
+
+    def test_dialog_errors_and_missing_window_give_none(self):
+        api = launcher.DesktopApi(types.SimpleNamespace(OPEN_DIALOG=10, FOLDER_DIALOG=20))
+        self.assertIsNone(api.pick_folder("x"))
+
+        def broken(kind, **kw):
+            raise RuntimeError("no dialog")
+
+        api._window = types.SimpleNamespace(create_file_dialog=broken)
+        with self.assertLogs("lowram.desktop", logging.ERROR):
+            self.assertIsNone(api.pick_file("x"))
 
 
 class FrozenPathTests(DesktopTestCase):
