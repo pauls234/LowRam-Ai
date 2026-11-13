@@ -212,6 +212,13 @@ would have a different certificate and therefore a different number.
 * Host: `GET /api/cluster` adds `requests: [{id, name, platform, ram_total_bytes, address,
   verification_code, expires_at}]`; `POST /api/cluster/requests/<id>/approve {}` / `…/deny {}`.
   Requests expire after 2 minutes, at most 3 pending, rate-limited per address.
+  The helper first sends only a commitment `sha256(client_nonce)`; it reveals
+  the nonce on its first status poll, after it has the host nonce. The host
+  shows the number (and accepts Allow) only after the reveal, so an attacker
+  cannot try host nonces until the numbers happen to match.
+  LAN calls: `POST /cluster/v1/pair-request {name, platform, ram_total_bytes, client_commit}`
+  → `{request_id, host_nonce, expires_in}`; `POST /cluster/v1/pair-status {request_id, client_nonce}`
+  → `{state: pending|approved|denied|expired, device_id?, device_key?}` (key returned once).
 * Desktop window: `window.pywebview.api.pick_folder(title)` → absolute path or `null`
   (only inside the app window; the browser UI falls back to a text field).
 * LAN API (`/cluster/v1/pair|heartbeat|claim|leave`, `/cluster/v1/tasks/<id>/result|fail`): see the `backend/cluster.py` docstring. Device leases are requeued after 90 s without a heartbeat (max 3 attempts) – the only automatic retry in LowRAM AI.
