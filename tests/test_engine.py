@@ -94,7 +94,7 @@ class CatalogTests(EngineTestCase):
     def test_catalog_api_shape_and_installed_flag(self):
         models = engine.catalog()
         keys = {"id", "name", "family", "purpose", "params", "quant", "size_bytes", "min_ram_gb", "recommended",
-                "installed", "license", "description"}
+                "installed", "license", "description", "source", "path", "available", "fits_ram"}
         self.assertTrue(all(set(m) == keys for m in models))
         self.assertEqual(sum(m["recommended"] for m in models), 1)
         self.assertFalse(any(m["installed"] for m in models))
@@ -460,7 +460,7 @@ class ExternalModeTests(EngineTestCase):
 
 class EngineRouteTests(EngineTestCase):
     def setUp(self):
-        super().setUp()
+        EngineTestCase.setUp(self)  # explicit: OwnModelRouteTests borrows this setUp
         self.server = app.LowRAMServer(0, token="t")
         self.port = self.server.server_address[1]
         thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
@@ -533,6 +533,425 @@ class EngineRouteTests(EngineTestCase):
         self.assertEqual(self.api("POST", f"/api/engine/models/{SMALL}/delete")[0], 409)
         status, data = self.api("POST", "/api/engine/stop")
         self.assertEqual((status, data["server"]["state"]), (200, "stopped"))
+
+
+# --------------------------------------------------------------------------- review round 1
+
+
+class HardeningTests(EngineTestCase):
+    def test_runtime_release_needs_checksum_and_official_url(self):
+        with mock.patch.object(engine, "platform_key", return_value="linux-x64"):
+            url = "https://github.com/ggml-org/llama.cpp/releases/download/b1/llama-b1-bin-ubuntu-x64.tar.gz"
+            asset = {"name": "llama-b1-bin-ubuntu-x64.tar.gz", "browser_download_url": url, "size": 10}
+            self.hub.json[RELEASE_KEY] = ({"tag_name": "b1", "assets": [asset]}, None)
+            with self.assertRaises(engine.EngineError) as ctx:
+                engine.install_runtime()
+            self.assertIn("unverified program", str(ctx.exception))
+            asset.update(digest="sha256:" + "a" * 64,
+                         browser_download_url="https://github.com/evil/llama.cpp/releases/download/b1/x.tar.gz")
+            with self.assertRaises(engine.EngineError) as ctx:
+                engine.install_runtime()
+            self.assertIn("unexpected download address", str(ctx.exception))
+        self.assertEqual(downloads.list_jobs(), [])
+
+    def test_staging_dirs_are_ignored_and_status_creates_nothing(self):
+        write_fake_llama_server(engine.runtime_root() / ".b1.extract-1234")
+        self.assertEqual(engine.discover_runtime(), (None, None))
+        shutil.rmtree(engine.runtime_root())
+        engine.status()
+        self.assertFalse((self.home / "bin" / "llama.cpp").exists())
+
+    def test_child_env_scrubs_secrets_and_restores_frozen_library_path(self):
+        binary = engine.runtime_root() / "b1" / "llama-server"
+        env = {"PATH": "/bin", "MY_API_KEY": "k", "GH_TOKEN": "t", "DB_PASSWORD": "p", "X_SECRET": "s",
+               "LD_LIBRARY_PATH": "/bundle", "LD_LIBRARY_PATH_ORIG": "/orig", "LOWRAM_HOME": str(self.home)}
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(engine.sys, "platform", "linux"), \
+                mock.patch.object(engine.sys, "frozen", True, create=True):
+            child = engine._child_env(binary)
+        self.assertEqual(child["PATH"], "/bin")
+        self.assertFalse({"MY_API_KEY", "GH_TOKEN", "DB_PASSWORD", "X_SECRET", "LD_LIBRARY_PATH_ORIG"} & set(child))
+        self.assertEqual(child["LD_LIBRARY_PATH"], os.pathsep.join([str(binary.parent), "/orig"]))
+        with mock.patch.dict(os.environ, {"LD_LIBRARY_PATH": "/x", "LOWRAM_HOME": str(self.home)}, clear=True), \
+                mock.patch.object(engine.sys, "platform", "linux"):
+            self.assertEqual(engine._child_env(self.tmp / "llama-server")["LD_LIBRARY_PATH"], "/x")  # not managed
+
+
+@unittest.skipUnless(POSIX, "the fake llama-server is a shebang script")
+class ServerHardeningTests(EngineTestCase):
+    def setUp(self):
+        super().setUp()
+        self.managed()
+        self.add_fake_runtime()
+        self.add_model()
+
+    def test_api_key_parallel_and_clean_env(self):
+        with mock.patch.dict(os.environ, {"SOME_SECRET": "x", "MY_TOKEN": "y"}):
+            engine.start(SMALL)
+            server = self.wait_state("ready")
+        key = config.llm_api_key()
+        self.assertTrue(key and len(key) >= 32)
+        self.assertEqual(llm.chat([{"role": "user", "content": "hi"}]), "fake llama reply")
+        conn = http.client.HTTPConnection("127.0.0.1", server["port"], timeout=5)
+        conn.request("POST", "/v1/chat/completions", body=b"{}", headers={"Content-Type": "application/json"})
+        self.assertEqual(conn.getresponse().status, 401)  # without the key llama-server does not answer
+        conn.close()
+        logged = engine.log_path().read_text()
+        self.assertIn("parallel=1", logged)
+        self.assertIn("secret_env=[]", logged)
+        self.assertNotIn(key, logged)
+        engine.stop()
+        self.assertIsNone(config.llm_api_key())
+        self.assertEqual(config.llm_url(), config.DEFAULT_LLM_URL)
+
+    def test_nothing_starts_after_shutdown(self):
+        engine.start(SMALL)
+        self.wait_state("ready")
+        with engine.pause_for_heavy_job():
+            engine._on_shutdown(None)
+        self.assertFalse(wait_until(lambda: engine._manager.snapshot()["state"] != "stopped", 0.5))
+        with self.assertRaises(engine.EngineError) as ctx:
+            engine.start(SMALL)
+        self.assertEqual(ctx.exception.status, 503)
+        engine._on_startup(None)
+        self.assertFalse(wait_until(lambda: engine._manager.snapshot()["state"] != "stopped", 0.3))
+
+
+# --------------------------------------------------------------------------- own models and storage
+
+REPO = "someone/Cool-Model-7B-GGUF"
+TREE = f"huggingface.co/api/models/{REPO}/tree/main"
+
+
+def lfs_item(path, size=None, data=None, sha=True):
+    size = len(data) if data is not None else size
+    item = {"type": "file", "path": path, "size": size}
+    if sha:
+        item["lfs"] = {"oid": hashlib.sha256(data if data is not None else path.encode()).hexdigest(), "size": size}
+    return item
+
+
+class SourceParsingTests(unittest.TestCase):
+    def test_accepted_sources(self):
+        cases = {
+            "Qwen/Qwen3-8B-GGUF": ("Qwen/Qwen3-8B-GGUF", "main", None),
+            "https://huggingface.co/Qwen/Qwen3-8B-GGUF": ("Qwen/Qwen3-8B-GGUF", "main", None),
+            "https://huggingface.co/Qwen/Qwen3-8B-GGUF/tree/v1.0": ("Qwen/Qwen3-8B-GGUF", "v1.0", None),
+            "https://huggingface.co/a/b/resolve/main/Q8_0/b-Q8_0.gguf?download=true": ("a/b", "main", "Q8_0/b-Q8_0.gguf"),
+            "https://huggingface.co/a/b/blob/abc123/b-Q4_K_M.gguf": ("a/b", "abc123", "b-Q4_K_M.gguf"),
+        }
+        for source, expected in cases.items():
+            self.assertEqual(engine.parse_hf_source(source), expected, source)
+
+    def test_refused_sources(self):
+        for source in ("", "justaname", "a/b/c", "../x", "datasets/x", "http://huggingface.co/a/b",
+                       "https://evil.com/a/b", "https://huggingface.co.evil.com/a/b", "https://u:p@huggingface.co/a/b",
+                       "https://huggingface.co/datasets/a/b", "https://huggingface.co/a/b/resolve/main/x.bin",
+                       "https://huggingface.co/a/b/resolve/main/../x.gguf", "https://huggingface.co/a/b/raw/main/x.gguf",
+                       "https://huggingface.co/a", None, 5, "a/\nb"):
+            with self.subTest(source=source), self.assertRaises(engine.EngineError) as ctx:
+                engine.parse_hf_source(source)
+            self.assertEqual(ctx.exception.status, 400)
+
+    def test_quant_and_params(self):
+        for name, quant in {"x-Q4_K_M.gguf": "Q4_K_M", "qwen2.5-7b-instruct-q5_k_m-00001-of-00002.gguf": "Q5_K_M",
+                            "m-IQ4_XS.gguf": "IQ4_XS", "m-f16.gguf": "F16", "Model-UD-Q4_K_XL.gguf": "Q4_K_XL",
+                            "m.Q8_0.gguf": "Q8_0", "model.gguf": None, "Qwen2-7B-bf16.gguf": "BF16"}.items():
+            self.assertEqual(engine.parse_quant(name), quant, name)
+        self.assertEqual(engine.parse_params("Qwen2.5-0.5B-Instruct-Q4_K_M.gguf"), "0.5B")
+        self.assertEqual(engine.parse_params("Mixtral-8x7B-Q4_K_M.gguf"), "8x7B")
+        self.assertEqual(engine.parse_params("Llama-3.2-3B-Q4_K_M.gguf"), "3B")
+
+
+class ResolveTests(EngineTestCase):
+    def publish_tree(self):
+        g = 10**9
+        page1 = [lfs_item("README.md", 10), lfs_item("Cool-7B-Q2_K.gguf", 3 * g), lfs_item("Cool-7B-Q4_K_M.gguf", 4.4 * g // 1),
+                 lfs_item("mmproj-Cool-f16.gguf", g)]
+        page2 = [lfs_item("Cool-7B-Q5_K_M.gguf", 5.1 * g // 1), lfs_item("Cool-7B-Q8_0.gguf", 8.1 * g // 1),
+                 lfs_item("F16/Cool-7B-F16-00001-of-00002.gguf", 7.6 * g // 1),
+                 lfs_item("F16/Cool-7B-F16-00002-of-00002.gguf", 7.6 * g // 1),
+                 lfs_item("broken-00001-of-00003.gguf", g)]
+        for item in page1 + page2:
+            item["size"] = int(item["size"])
+            item.get("lfs", {})["size"] = int(item["size"])
+        self.hub.json[TREE] = (page1, f'<https://{TREE}/p2>; rel="next"')
+        self.hub.json[TREE + "/p2"] = (page2, None)
+
+    def test_resolve_groups_splits_and_recommends(self):
+        self.publish_tree()
+        result = engine.resolve_custom(REPO)
+        self.assertEqual((result["repo"], result["revision"]), (REPO, "main"))
+        files = {f["filename"]: f for f in result["files"]}
+        self.assertEqual(list(files), ["Cool-7B-Q2_K.gguf", "Cool-7B-Q4_K_M.gguf", "Cool-7B-Q5_K_M.gguf",
+                                       "Cool-7B-Q8_0.gguf", "F16/Cool-7B-F16-00001-of-00002.gguf"])
+        split = files["F16/Cool-7B-F16-00001-of-00002.gguf"]
+        self.assertEqual((split["parts"], split["size_bytes"], split["quant"], split["fits_ram"]), (2, 15_200_000_000, "F16", False))
+        self.assertEqual([f["filename"] for f in result["files"] if f["recommended"]], ["Cool-7B-Q5_K_M.gguf"])
+        self.assertEqual(files["Cool-7B-Q8_0.gguf"]["fits_ram"], True)  # 16 GiB * 60 % > 8.1 GB
+
+    def test_recommendation_on_small_machine_and_direct_links(self):
+        self.publish_tree()
+        self.set_memory(total_gib=6)
+        result = engine.resolve_custom(f"https://huggingface.co/{REPO}")
+        self.assertEqual([f["filename"] for f in result["files"] if f["recommended"]], ["Cool-7B-Q2_K.gguf"])
+        one = engine.resolve_custom(f"https://huggingface.co/{REPO}/resolve/main/F16/Cool-7B-F16-00002-of-00002.gguf")
+        self.assertEqual([f["filename"] for f in one["files"]], ["F16/Cool-7B-F16-00001-of-00002.gguf"])
+        with self.assertRaises(engine.EngineError) as ctx:
+            engine.resolve_custom(f"https://huggingface.co/{REPO}/resolve/main/missing.gguf")
+        self.assertEqual(ctx.exception.status, 404)
+
+    def test_resolve_errors(self):
+        with self.assertRaises(engine.EngineError) as ctx:
+            engine.resolve_custom(REPO)  # tree answers 404
+        self.assertEqual(ctx.exception.status, 404)
+        self.hub.json[TREE] = ([lfs_item("README.md", 10)], None)
+        with self.assertRaises(engine.EngineError) as ctx:
+            engine.resolve_custom(REPO)
+        self.assertIn("no GGUF", str(ctx.exception))
+
+
+class CustomInstallTests(EngineTestCase):
+    def test_install_single_and_split_models(self):
+        single, part1, part2 = b"GGUF" + b"a" * 3000, b"GGUF" + b"b" * 2000, b"c" * 1500
+        names = ("Cool-7B-Q4_K_M.gguf", "Big/Cool-7B-Q8_0-00001-of-00002.gguf", "Big/Cool-7B-Q8_0-00002-of-00002.gguf")
+        self.hub.json[TREE] = ([lfs_item(n, data=d) for n, d in zip(names, (single, part1, part2), strict=True)], None)
+        for name, data in zip(names, (single, part1, part2), strict=True):
+            self.hub.files[f"huggingface.co/{REPO}/resolve/main/{name}"] = data
+        download, model_id = engine.install_custom(REPO, names[0])
+        self.assertEqual(downloads.wait(download["id"], 15)["state"], "done")
+        model = next(m for m in engine.catalog() if m["id"] == model_id)
+        self.assertEqual((model["source"], model["installed"], model["available"], model["quant"]), ("custom", True, True, "Q4_K_M"))
+        self.assertEqual(model["path"], str(config.models_dir() / names[0]))
+        self.assertEqual(settings.get("engine", "model_id"), model_id)
+        with self.assertRaises(engine.EngineError):
+            engine.install_custom(REPO, names[0])
+        download, split_id = engine.install_custom(REPO, names[1], name="Big one", purpose="code")
+        self.assertTrue(download["id"].endswith("-p01"))
+        for job in downloads.list_jobs():
+            self.assertEqual(downloads.wait(job["id"], 15)["state"], "done", job)
+        entry = engine.get_entry(split_id)
+        self.assertEqual((entry.name, entry.purpose, entry.files),
+                         ("Big one", "code", ("Cool-7B-Q8_0-00001-of-00002.gguf", "Cool-7B-Q8_0-00002-of-00002.gguf")))
+        self.assertEqual(engine.model_path(entry).name, "Cool-7B-Q8_0-00001-of-00002.gguf")
+        registry = json.loads((self.home / "custom_models.json").read_text())
+        self.assertEqual(sorted(m["id"] for m in registry["models"]), sorted([model_id, split_id]))
+        engine.delete_model(split_id)
+        self.assertFalse((config.models_dir() / entry.files[1]).exists())
+        self.assertIsNone(engine.find_entry(split_id))
+
+    def test_install_refuses_unverified_and_collisions(self):
+        self.hub.json[TREE] = ([lfs_item("a-Q4_K_M.gguf", 100, sha=False), lfs_item("b-Q4_K_M.gguf", data=b"x")], None)
+        with self.assertRaises(engine.EngineError) as ctx:
+            engine.install_custom(REPO, "a-Q4_K_M.gguf")
+        self.assertIn("unverified", str(ctx.exception))
+        (config.models_dir() / "b-Q4_K_M.gguf").write_bytes(b"old")
+        with self.assertRaises(engine.EngineError) as ctx:
+            engine.install_custom(REPO, "b-Q4_K_M.gguf")
+        self.assertIn("already exists", str(ctx.exception))
+        for bad in (("../x", "a.gguf"), (REPO, "../a.gguf"), (REPO, "a.bin"), (REPO, None)):
+            with self.subTest(bad=bad), self.assertRaises(engine.EngineError) as ctx:
+                engine.install_custom(*bad)
+            self.assertEqual(ctx.exception.status, 400)
+        self.assertEqual(downloads.list_jobs(), [])
+
+
+class LocalImportTests(EngineTestCase):
+    def setUp(self):
+        super().setUp()
+        self.drive = self.tmp / "ExternalSSD" / "models"
+        self.drive.mkdir(parents=True)
+        self.gguf = self.drive / "My-Model-3B-Q4_K_M.gguf"
+        self.gguf.write_bytes(b"GGUF" + b"\0" * 100)
+
+    def test_import_validation(self):
+        (self.drive / "fake.gguf").write_bytes(b"NOPE1234")
+        (self.drive / "model.bin").write_bytes(b"GGUF1234")
+        for bad in (None, "", "relative/x.gguf", str(self.drive / "missing.gguf"), str(self.drive),
+                    str(self.drive / "fake.gguf"), str(self.drive / "model.bin")):
+            with self.subTest(bad=bad), self.assertRaises(engine.EngineError) as ctx:
+                engine.import_local(bad)
+            self.assertEqual(ctx.exception.status, 400)
+        self.assertEqual(engine.custom_entries(), [])
+
+    def test_import_unplug_and_unregister(self):
+        link = self.tmp / "shortcut.gguf"
+        os.symlink(self.gguf, link)
+        model = engine.import_local(str(link), name="Mine")
+        self.assertEqual((model["source"], model["available"], model["installed"], model["name"]), ("local", True, True, "Mine"))
+        self.assertEqual(model["path"], str(self.gguf.resolve()))
+        self.assertEqual(engine.import_local(str(self.gguf))["id"], model["id"])  # same file, same entry
+        shutil.rmtree(self.tmp / "ExternalSSD")  # unplug the drive
+        listed = next(m for m in engine.catalog() if m["id"] == model["id"])
+        self.assertEqual((listed["available"], listed["installed"]), (False, True))
+        self.managed()
+        with self.assertRaises(engine.EngineError) as ctx:
+            engine.start(model["id"])
+        self.assertIn("drive with this model is not connected", str(ctx.exception))
+        self.assertEqual(len(engine.custom_entries()), 1)  # never dropped automatically
+        engine.delete_model(model["id"])
+        self.assertEqual(engine.custom_entries(), [])
+
+    def test_delete_never_removes_imported_file(self):
+        model = engine.import_local(str(self.gguf))
+        engine.delete_model(model["id"])
+        self.assertTrue(self.gguf.exists())
+
+    @unittest.skipUnless(POSIX, "shebang scripts")
+    def test_start_imported_model(self):
+        self.managed()
+        self.add_fake_runtime()
+        model = engine.import_local(str(self.gguf))
+        engine.start(model["id"])
+        self.wait_state("ready")
+        self.assertIn(f"model={self.gguf.resolve()}", engine.log_path().read_text())
+
+    def test_corrupt_registry_is_kept_aside(self):
+        (config.home_dir() / "custom_models.json").write_text("{broken")
+        self.assertEqual(engine.custom_entries(), [])
+        self.assertTrue((self.home / "custom_models.json.corrupt").exists())
+        self.assertEqual(len(engine.catalog()), len(engine.CATALOG))
+
+
+class StorageTests(EngineTestCase):
+    def setUp(self):
+        super().setUp()
+        self.drive = self.tmp / "SSD"
+        self.drive.mkdir()
+
+    def test_default_storage_info(self):
+        info = engine.storage_info()
+        self.assertEqual((info["custom"], info["available"], info["writable"], info["moving"]), (False, True, True, None))
+        self.assertEqual(info["models_dir"], info["default_dir"])
+        self.assertGreater(info["total_bytes"], 0)
+
+    def test_choose_folder_and_unplug(self):
+        info = engine.set_storage(str(self.drive))
+        self.assertEqual((info["models_dir"], info["custom"]), (str(self.drive.resolve()), True))
+        self.assertEqual(settings.get("engine", "models_dir"), str(self.drive.resolve()))
+        shutil.rmtree(self.drive)  # unplug
+        info = engine.storage_info()
+        self.assertEqual((info["available"], info["free_bytes"]), (False, None))
+        self.assertFalse(any(m["installed"] for m in engine.catalog()))
+        with self.assertRaises(engine.EngineError) as ctx:
+            engine.install_model(SMALL)
+        self.assertIn("not available", str(ctx.exception))
+        with self.assertRaises(ValueError) as ctx:
+            downloads.start("x", "https://huggingface.co/a/b", self.drive / "m.gguf", label="x", kind="model")
+        self.assertIn("external drive not connected", str(ctx.exception))
+        self.assertFalse(self.drive.exists())  # never re-created on the boot disk
+        self.assertFalse(engine.set_storage(None)["custom"])
+
+    def test_invalid_folders(self):
+        (self.drive / "file.txt").write_text("x")
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(engine.__file__)))
+        for bad in ("relative", str(self.tmp / "missing"), str(self.drive / "file.txt"), "/", "/usr", "/etc",
+                    "/usr/local/models", repo_root, str(self.home), 5):
+            with self.subTest(bad=bad), self.assertRaises(engine.EngineError) as ctx:
+                engine.set_storage(bad)
+            self.assertEqual(ctx.exception.status, 400)
+        with mock.patch.dict(os.environ, {"LOWRAM_MODELS_DIR": str(self.drive)}), self.assertRaises(engine.EngineError):
+            engine.set_storage(str(self.drive))
+
+    def test_downloads_may_write_into_custom_models_folder(self):
+        engine.set_storage(str(self.drive))
+        self.hub.files["huggingface.co/a/b/resolve/main/m.gguf"] = b"GGUF data"
+        downloads.start("model-x", "https://huggingface.co/a/b/resolve/main/m.gguf", self.drive / "m.gguf",
+                        label="x", kind="model")
+        self.assertEqual(downloads.wait("model-x", 15)["state"], "done")
+        self.assertEqual((self.drive / "m.gguf").read_bytes(), b"GGUF data")
+        with self.assertRaises(ValueError):
+            downloads.start("y", "https://huggingface.co/a/b", self.tmp / "elsewhere.gguf", label="y", kind="model")
+
+    def put_models(self):
+        catalog_file = self.add_model(data=b"GGUF" * 5000)
+        (config.models_dir() / f"{SMALL}.json").write_text("{}")
+        local = self.tmp / "local.gguf"
+        local.write_bytes(b"GGUF local")
+        engine.import_local(str(local))
+        return catalog_file, local
+
+    def test_move_existing_models(self):
+        catalog_file, local = self.put_models()
+        info = engine.set_storage(str(self.drive), move_existing=True)
+        self.assertEqual(info["moving"]["state"], "copying")
+        self.assertTrue(wait_until(lambda: engine.storage_info()["moving"]["state"] != "copying", 15))
+        info = engine.storage_info()
+        self.assertEqual((info["moving"]["state"], info["moving"]["bytes_done"]), ("done", info["moving"]["bytes_total"]))
+        self.assertEqual(info["models_dir"], str(self.drive.resolve()))
+        self.assertFalse(catalog_file.exists())
+        self.assertEqual((self.drive / catalog_file.name).read_bytes(), b"GGUF" * 5000)
+        self.assertTrue((self.drive / f"{SMALL}.json").exists())
+        self.assertTrue(local.exists())  # imported files are never moved
+        model = next(m for m in engine.catalog() if m["id"] == SMALL)
+        self.assertEqual((model["installed"], model["path"]), (True, str(self.drive / catalog_file.name)))
+
+    def test_failed_move_keeps_everything(self):
+        catalog_file, _ = self.put_models()
+        real_copy = engine._StorageMover._copy
+        calls = []
+
+        def flaky(mover, src, dst):
+            calls.append(src)
+            if len(calls) == 2:
+                raise OSError("disk full")
+            real_copy(mover, src, dst)
+
+        with mock.patch.object(engine._StorageMover, "_copy", flaky):
+            engine.set_storage(str(self.drive), move_existing=True)
+            self.assertTrue(wait_until(lambda: engine.storage_info()["moving"]["state"] != "copying", 15))
+        info = engine.storage_info()
+        self.assertEqual(info["moving"]["state"], "failed")
+        self.assertIn("disk full", info["moving"]["error"])
+        self.assertFalse(info["custom"])  # setting unchanged
+        self.assertTrue(catalog_file.exists())
+        self.assertEqual(list(self.drive.iterdir()), [])
+
+    def test_move_refused_while_downloading_or_running(self):
+        self.hub.files["huggingface.co/a/b/resolve/main/slow.gguf"] = b"x" * 400_000
+        self.hub.chunk, self.hub.delay = 8192, 0.05
+        downloads.start("model-slow", "https://huggingface.co/a/b/resolve/main/slow.gguf",
+                        config.models_dir() / "slow.gguf", label="slow", kind="model")
+        with self.assertRaises(engine.EngineError) as ctx:
+            engine.set_storage(str(self.drive), move_existing=True)
+        self.assertIn("downloads", str(ctx.exception))
+        downloads.cancel("model-slow")
+        self.add_model()
+        with mock.patch.object(engine._manager, "snapshot", return_value={"state": "ready"}), \
+                self.assertRaises(engine.EngineError) as ctx:
+            engine.set_storage(str(self.drive), move_existing=True)
+        self.assertIn("Stop the engine", str(ctx.exception))
+
+
+class OwnModelRouteTests(EngineTestCase):
+    setUp = EngineRouteTests.setUp
+    api = EngineRouteTests.api
+
+    def test_custom_and_storage_routes(self):
+        data = b"GGUF" * 50
+        self.hub.json[TREE] = ([lfs_item("Cool-Q4_K_M.gguf", data=data)], None)
+        self.hub.files[f"huggingface.co/{REPO}/resolve/main/Cool-Q4_K_M.gguf"] = data
+        status, body = self.api("POST", "/api/engine/custom/resolve", {"source": REPO})
+        self.assertEqual((status, body["files"][0]["recommended"]), (200, True))
+        self.assertEqual(self.api("POST", "/api/engine/custom/resolve", {"source": "http://x"})[0], 400)
+        status, body = self.api("POST", "/api/engine/custom/install", {"repo": REPO, "filename": "Cool-Q4_K_M.gguf"})
+        self.assertEqual(status, 202)
+        self.assertEqual(downloads.wait(body["download"]["id"], 15)["state"], "done")
+        self.assertIn(body["model_id"], [m["id"] for m in self.api("GET", "/api/engine/catalog")[1]["models"]])
+        gguf = self.tmp / "x.gguf"
+        gguf.write_bytes(b"GGUF....")
+        status, body = self.api("POST", "/api/engine/custom/import", {"path": str(gguf)})
+        self.assertEqual((status, body["model"]["source"]), (201, "local"))
+        self.assertEqual(self.api("POST", "/api/engine/custom/import", {"path": "x.gguf"})[0], 400)
+        status, body = self.api("GET", "/api/engine/storage")
+        self.assertEqual(set(body), {"models_dir", "default_dir", "custom", "available", "writable", "free_bytes",
+                                     "total_bytes", "moving"})
+        drive = self.tmp / "drive"
+        drive.mkdir()
+        status, body = self.api("POST", "/api/engine/storage", {"models_dir": str(drive), "move_existing": False})
+        self.assertEqual((status, body["storage"]["custom"]), (202, True))
+        self.assertEqual(self.api("POST", "/api/engine/storage", {})[0], 400)
+        self.assertEqual(self.api("POST", "/api/engine/storage", {"models_dir": "/"})[0], 400)
+        self.assertEqual(self.api("POST", "/api/engine/storage", {"models_dir": None, "move_existing": "yes"})[0], 400)
 
 
 if __name__ == "__main__":
