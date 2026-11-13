@@ -233,8 +233,10 @@ class WorkerTests(MediaTestCase):
         self.assertEqual(call["argv"][call["argv"].index("-s") + 1], "11")
         self.assertTrue(Path(call["cwd"]).resolve().is_relative_to((self.home / "media" / "tmp").resolve()))
         self.assertFalse((self.home / "media" / "tmp" / f"job_{job['id']}").exists())  # temp dir removed
-        self.assertEqual(self.engine.events, ["pause", "resume"])  # unload_llm defaults to on
-        self.assertIsNone(db.busy_reason())  # slot released
+        # unload_llm defaults to on; the worker resumes the engine and releases the slot
+        # right after it marks the job done, so wait for both instead of checking once.
+        self.assertTrue(wait_until(lambda: self.engine.events == ["pause", "resume"], 5), self.engine.events)
+        self.assertTrue(wait_until(lambda: db.busy_reason() is None, 5), db.busy_reason())
 
     def test_no_pause_when_disabled_or_engine_missing(self):
         settings.update("media", {"unload_llm": False})
@@ -301,8 +303,10 @@ class WorkerTests(MediaTestCase):
         self.assertLess(time.monotonic() - started, 3.0)
         self.assertEqual(cancelled["status"], "cancelled")
         self.assertTrue(wait_until(lambda: not psutil.pid_exists(pid) or psutil.Process(pid).status() == "zombie", 3))
-        self.assertIsNone(db.busy_reason())
-        self.assertEqual(self.engine.events, ["pause", "resume"])
+        # The worker thread releases the slot and resumes the engine while it unwinds,
+        # shortly after cancel_job() returns – wait for it instead of checking once.
+        self.assertTrue(wait_until(lambda: db.busy_reason() is None, 5), db.busy_reason())
+        self.assertTrue(wait_until(lambda: self.engine.events == ["pause", "resume"], 5), self.engine.events)
         with self.assertRaises(db.InvalidTransition):
             media.cancel_job(job["id"])
 
