@@ -376,6 +376,8 @@
     let userToggled = false;
     let retryFn = null;
     let frame = 0;
+    let throttle = 0;
+    let lastRender = 0;
     let pending = null;
     let thinkStart = 0;
     let thinkSecs = null;
@@ -430,21 +432,34 @@
         statusText = text;
         if (text) waitText.textContent = text;
       },
-      /** Throttled to one render per animation frame. */
-      stream(reasoning, answer) {
-        pending = [reasoning, answer];
-        if (frame) return;
-        frame = window.requestAnimationFrame(() => {
-          frame = 0;
-          const p = pending;
-          pending = null;
-          if (p) apply(p[0], p[1], true);
-          scrollToBottom(false);
-        });
+      /**
+       * Coalesced to one render per animation frame (≤10/s for long answers).
+       * `getView` is only evaluated when a frame actually renders.
+       */
+      stream(getView) {
+        pending = getView;
+        if (frame || throttle) return;
+        const run = () => {
+          throttle = 0;
+          frame = window.requestAnimationFrame(() => {
+            frame = 0;
+            const g = pending;
+            pending = null;
+            if (!g) return;
+            const v = g();
+            lastRender = performance.now();
+            apply(v[0], v[1], true);
+            scrollToBottom(false);
+          });
+        };
+        const wait = answerText.length > 20000 ? Math.max(0, 100 - (performance.now() - lastRender)) : 0;
+        if (wait > 0) throttle = window.setTimeout(run, wait);
+        else run();
       },
       finish(message, extraReasoning) {
         window.clearInterval(waitTimer);
         if (frame) { window.cancelAnimationFrame(frame); frame = 0; }
+        if (throttle) { window.clearTimeout(throttle); throttle = 0; }
         const m = message || {};
         const split = LR.md.splitThinking(LR.str(m.content));
         const reasoning = (extraReasoning || '') + split.reasoning;
@@ -475,6 +490,7 @@
       fail(error, partial) {
         window.clearInterval(waitTimer);
         if (frame) { window.cancelAnimationFrame(frame); frame = 0; }
+        if (throttle) { window.clearTimeout(throttle); throttle = 0; }
         if (partial !== undefined) apply(partial[0], partial[1], false);
         else li.classList.remove('is-streaming');
         wait.hidden = true;
@@ -588,13 +604,11 @@
           } else if (ev.type === 'token') {
             ctx.gotStart = true;
             ctx.tokens += LR.str(ev.text);
-            const v = view();
-            a.stream(v[0], v[1]);
+            a.stream(view);
           } else if (ev.type === 'reasoning') {
             ctx.gotStart = true;
             ctx.reasoning += LR.str(ev.text);
-            const v = view();
-            a.stream(v[0], v[1]);
+            a.stream(view);
           } else if (ev.type === 'done') {
             ctx.done = true;
             const msg = ev.message || { content: ctx.tokens, status: ctx.stopRequested ? 'stopped' : 'complete' };
@@ -804,7 +818,10 @@
       if (save && title && title !== chat.title) {
         try {
           const data = await LR.post('/api/chats/' + encodeURIComponent(chat.id) + '/rename', { title });
-          Object.assign(chat, data.chat || { title });
+          const c = data.chat && typeof data.chat === 'object' ? data.chat : { title };
+          for (const key of ['id', 'title', 'mode', 'updated_at', 'message_count']) {
+            if (key in c) chat[key] = c[key];
+          }
           LR.toast('Chat renamed');
         } catch (err) {
           LR.toast('Could not rename: ' + err.message, 'error');

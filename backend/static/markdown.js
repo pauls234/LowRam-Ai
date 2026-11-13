@@ -4,8 +4,12 @@
  * never inject markup or script. Supports paragraphs, headings, bold/italic/
  * strikethrough, inline code, fenced code blocks (language label, copy button,
  * light highlighting), nested lists, blockquotes, tables, rules and links
- * (http/https/mailto only). The incremental renderer re-renders only the
- * blocks that changed, so streaming answers do not flicker.
+ * (http/https/mailto only).
+ *
+ * Model output is untrusted, so parsing is linear-time by construction:
+ * block regexes cannot backtrack (and very long lines skip them), closer and
+ * bracket scans are memoised, nesting is capped, and while streaming only the
+ * last block is re-parsed.
  */
 (function () {
   'use strict';
@@ -13,34 +17,85 @@
   const LR = window.LR;
   const h = LR.h;
   const SAFE_URL = /^(https?:\/\/|mailto:)/i;
+  const MAX_LINE = 2000; // longer lines are plain paragraph text (no block syntax)
+  const MAX_DEPTH = 8; // deeper quotes / lists / inline nesting render as plain text
+  const MAX_HIGHLIGHT = 20000;
+  const MAX_URL = 2048;
 
   /* ------------------------------------------------------------ block parsing */
 
-  const RE_FENCE = /^ {0,3}(`{3,}|~{3,})\s*([^`\s]*)[^`]*$/;
-  const RE_HEADING = /^ {0,3}(#{1,6})(?:[ \t]+(.*?))?[ \t#]*$/;
-  const RE_HR = /^ {0,3}((\*[ \t]*){3,}|(-[ \t]*){3,}|(_[ \t]*){3,})$/;
+  const RE_FENCE = /^ {0,3}(`{3,}|~{3,})([^`\n]*)$/;
+  const RE_HEADING = /^ {0,3}(#{1,6})(?:[ \t]+(.*))?$/;
   const RE_QUOTE = /^ {0,3}>[ ]?(.*)$/;
-  const RE_ITEM = /^( *)([-*+]|\d{1,9}[.)])([ \t]+(.*)|$)/;
-  const RE_TABLE_SEP = /^ *\|? *:?-{1,}:? *(\| *:?-{1,}:? *)*\|? *$/;
+  const RE_ITEM = /^( *)([-*+]|\d{1,9}[.)])(?:[ \t]+(.*)|$)/;
+  const RE_TABLE_SEP = /^ *\|? *:?-+:? *(?:\| *:?-+:? *)*\|? *$/;
 
-  function isBlank(line) {
-    return !line || !line.trim();
-  }
+  const isBlank = (line) => !line || !line.trim();
+  const tooLong = (line) => line.length > MAX_LINE;
   function indentOf(line) {
-    const m = /^ */.exec(line);
-    return m ? m[0].length : 0;
+    let i = 0;
+    while (line.charCodeAt(i) === 32) i++;
+    return i;
   }
+  const isSpace = (c) => c === ' ' || c === '\t';
+
+  /** Thematic break: 3+ of the same of * - _ with optional spaces (checked by hand). */
+  function isHr(line) {
+    if (tooLong(line) || indentOf(line) > 3) return false;
+    let mark = '';
+    let count = 0;
+    for (let i = 0; i < line.length; i++) {
+      const c = line[i];
+      if (isSpace(c)) continue;
+      if (c !== '*' && c !== '-' && c !== '_') return false;
+      if (mark && c !== mark) return false;
+      mark = c;
+      count++;
+    }
+    return count >= 3;
+  }
+
+  /** "## Title ##" -> "Title" without a backtracking regex. */
+  function headingText(raw) {
+    const t = raw || '';
+    let end = t.length;
+    while (end && isSpace(t[end - 1])) end--;
+    let j = end;
+    while (j && t[j - 1] === '#') j--;
+    if (j < end && (j === 0 || isSpace(t[j - 1]))) {
+      end = j;
+      while (end && isSpace(t[end - 1])) end--;
+    }
+    return t.slice(0, end);
+  }
+
+  function fenceOf(line) {
+    if (tooLong(line)) return null;
+    const m = RE_FENCE.exec(line);
+    if (!m) return null;
+    const info = m[2].trim().split(/\s+/)[0] || '';
+    return { fence: m[1], lang: info.toLowerCase().replace(/[^a-z0-9+#._-]/g, '').slice(0, 24) };
+  }
+
+  function itemOf(line) {
+    return tooLong(line) ? null : RE_ITEM.exec(line);
+  }
+
+  function isTableStart(lines, i) {
+    const a = lines[i];
+    const b = lines[i + 1];
+    return b !== undefined && !tooLong(a) && !tooLong(b) && a.includes('|') && b.includes('-') && RE_TABLE_SEP.test(b);
+  }
+
   function startsBlock(lines, i) {
     const line = lines[i];
-    if (RE_FENCE.test(line) || RE_HEADING.test(line) || RE_HR.test(line) || RE_QUOTE.test(line)) return true;
-    const item = RE_ITEM.exec(line);
-    if (item && item[4] !== undefined && item[4].trim() && indentOf(line) < 4) {
+    if (tooLong(line)) return false;
+    if (fenceOf(line) || RE_HEADING.test(line) || isHr(line) || RE_QUOTE.test(line)) return true;
+    const item = itemOf(line);
+    if (item && item[3] !== undefined && item[3].trim() && indentOf(line) < 4) {
       return !/^\d/.test(item[2]) || /^1[.)]$/.test(item[2]);
     }
     return isTableStart(lines, i);
-  }
-  function isTableStart(lines, i) {
-    return lines[i].includes('|') && i + 1 < lines.length && lines[i + 1].includes('-') && RE_TABLE_SEP.test(lines[i + 1]);
   }
 
   function splitRow(line) {
@@ -58,23 +113,22 @@
       cur += c;
     }
     cells.push(cur.trim());
-    return cells;
+    return cells.slice(0, 64);
   }
 
-  /** Split text into blocks: {type, raw, ...}. */
-  function parseBlocks(text) {
-    const lines = text.split('\n');
+  /** Parse lines[from..] into blocks: {type, raw, line, ...}. */
+  function parseLines(lines, from) {
     const blocks = [];
-    let i = 0;
+    let i = from || 0;
     while (i < lines.length) {
       const line = lines[i];
       if (isBlank(line)) { i++; continue; }
       const start = i;
       let m;
+      const long = tooLong(line);
 
-      if ((m = RE_FENCE.exec(line))) {
-        const fence = m[1];
-        const lang = (m[2] || '').toLowerCase().replace(/[^a-z0-9+#._-]/g, '').slice(0, 24);
+      const fence = long ? null : fenceOf(line);
+      if (fence) {
         const fenceIndent = indentOf(line);
         const body = [];
         let closed = false;
@@ -82,43 +136,44 @@
         while (i < lines.length) {
           const l = lines[i];
           const t = l.trim();
-          if (t.startsWith(fence[0].repeat(fence.length)) && /^[`~]+$/.test(t) && t.length >= fence.length) {
+          if (t.length >= fence.fence.length && t[0] === fence.fence[0] && !t.split('').some((c) => c !== t[0])) {
             closed = true;
             i++;
             break;
           }
-          body.push(fenceIndent ? l.replace(new RegExp('^ {0,' + fenceIndent + '}'), '') : l);
+          body.push(fenceIndent ? l.slice(Math.min(fenceIndent, indentOf(l))) : l);
           i++;
         }
-        blocks.push({ type: 'code', lang, text: body.join('\n'), closed, raw: lines.slice(start, i).join('\n') });
+        blocks.push({ type: 'code', lang: fence.lang, text: body.join('\n'), closed, raw: lines.slice(start, i).join('\n'), line: start });
         continue;
       }
-      if ((m = RE_HEADING.exec(line))) {
-        blocks.push({ type: 'heading', level: m[1].length, text: m[2] || '', raw: line });
+      if (!long && (m = RE_HEADING.exec(line))) {
+        blocks.push({ type: 'heading', level: m[1].length, text: headingText(m[2]), raw: line, line: start });
         i++;
         continue;
       }
-      if (RE_HR.test(line)) {
-        blocks.push({ type: 'hr', raw: line });
+      if (!long && isHr(line)) {
+        blocks.push({ type: 'hr', raw: line, line: start });
         i++;
         continue;
       }
-      if (RE_QUOTE.test(line)) {
+      if (!long && RE_QUOTE.test(line)) {
         const inner = [];
         while (i < lines.length && !isBlank(lines[i])) {
-          const q = RE_QUOTE.exec(lines[i]);
+          const q = tooLong(lines[i]) ? null : RE_QUOTE.exec(lines[i]);
           if (q) inner.push(q[1]);
           else if (startsBlock(lines, i)) break;
           else inner.push(lines[i]);
           i++;
         }
-        blocks.push({ type: 'quote', text: inner.join('\n'), raw: lines.slice(start, i).join('\n') });
+        blocks.push({ type: 'quote', text: inner.join('\n'), raw: lines.slice(start, i).join('\n'), line: start });
         continue;
       }
-      if ((m = RE_ITEM.exec(line)) && indentOf(line) < 4) {
+      if (!long && itemOf(line) && indentOf(line) < 4) {
         const list = parseList(lines, i);
         i = list.end;
         list.raw = lines.slice(start, i).join('\n');
+        list.line = start;
         blocks.push(list);
         continue;
       }
@@ -127,11 +182,11 @@
         const align = splitRow(lines[i + 1]).map((c) => (c.startsWith(':') && c.endsWith(':') ? 'center' : c.endsWith(':') ? 'right' : c.startsWith(':') ? 'left' : null));
         const rows = [];
         i += 2;
-        while (i < lines.length && !isBlank(lines[i]) && lines[i].includes('|')) {
+        while (i < lines.length && !isBlank(lines[i]) && lines[i].includes('|') && !tooLong(lines[i])) {
           rows.push(splitRow(lines[i]));
           i++;
         }
-        blocks.push({ type: 'table', header, align, rows, raw: lines.slice(start, i).join('\n') });
+        blocks.push({ type: 'table', header, align, rows, raw: lines.slice(start, i).join('\n'), line: start });
         continue;
       }
       const para = [line];
@@ -140,13 +195,17 @@
         para.push(lines[i]);
         i++;
       }
-      blocks.push({ type: 'para', text: para.join('\n'), raw: para.join('\n') });
+      blocks.push({ type: 'para', text: para.join('\n'), raw: para.join('\n'), line: start });
     }
     return blocks;
   }
 
+  function parseBlocks(text) {
+    return parseLines(text.split('\n'), 0);
+  }
+
   function parseList(lines, i) {
-    const first = RE_ITEM.exec(lines[i]);
+    const first = itemOf(lines[i]);
     const baseIndent = first[1].length;
     const ordered = /^\d/.test(first[2]);
     const start = ordered ? parseInt(first[2], 10) : 1;
@@ -162,12 +221,11 @@
         i++;
         continue;
       }
-      const m = RE_ITEM.exec(line);
+      const m = itemOf(line);
       const indent = indentOf(line);
       if (m && indent >= baseIndent && indent < baseIndent + 2 && /^\d/.test(m[2]) === ordered) {
         if (sawBlank && items.length) loose = true;
-        const content = m[4] === undefined ? '' : m[4];
-        current = { lines: [content], contentIndent: indent + m[2].length + 1 };
+        current = { lines: [m[3] === undefined ? '' : m[3]], contentIndent: indent + m[2].length + 1 };
         items.push(current);
         sawBlank = false;
         i++;
@@ -197,8 +255,31 @@
   /* ------------------------------------------------------------ inline parsing */
 
   const PUNCT = /[!-/:-@[-`{-~]/;
+  const URL_TRAIL = new Set(['.', ',', ';', ':', '!', '?', "'", '"', '*', '_']);
+  const RE_AUTOLINK = /<((?:https?:\/\/|mailto:)[^\s<>]{1,2048})>/iy;
+  const RE_BR = /<br\s{0,8}\/?>/iy;
+  const RE_URL = /https?:\/\/[^\s<>]{1,2048}/iy;
+  const RE_HTTP = /https?:\/\//iy;
 
-  function findClosing(text, delim, from) {
+  /** Matching closer index for every opener (one linear pass, escapes skipped). */
+  function matchPairs(text, open, close, lineBound) {
+    const match = new Map();
+    const stack = [];
+    for (let j = 0; j < text.length; j++) {
+      const c = text[j];
+      if (c === '\\') { j++; continue; }
+      if (lineBound && c === '\n') { stack.length = 0; continue; }
+      if (c === open) stack.push(j);
+      else if (c === close && stack.length) match.set(stack.pop(), j);
+    }
+    return match;
+  }
+
+  /** First valid closing delimiter at or after `from`; failures are remembered. */
+  function findClosing(ctx, delim, from) {
+    const failedFrom = ctx.noClose[delim];
+    if (failedFrom !== undefined && from >= failedFrom) return -1;
+    const text = ctx.text;
     let j = from;
     while ((j = text.indexOf(delim, j)) !== -1) {
       if (text[j - 1] === '\\') { j += delim.length; continue; }
@@ -210,51 +291,71 @@
       }
       j += delim.length;
     }
+    ctx.noClose[delim] = failedFrom === undefined ? from : Math.min(failedFrom, from);
     return -1;
   }
 
-  function findBracket(text, from) {
-    let depth = 0;
-    for (let j = from; j < text.length; j++) {
-      const c = text[j];
-      if (c === '\\') { j++; continue; }
-      if (c === '[') depth++;
-      else if (c === ']') {
-        depth--;
-        if (depth === 0) return j;
-      }
+  /** Closing backtick run of exactly `len` at or after `from` (memoised failures). */
+  function findCodeClose(ctx, len, from) {
+    const key = '`' + len;
+    const failedFrom = ctx.noClose[key];
+    if (failedFrom !== undefined && from >= failedFrom) return -1;
+    const text = ctx.text;
+    const run = '`'.repeat(len);
+    let p = from;
+    while ((p = text.indexOf(run, p)) !== -1) {
+      if (text[p + len] !== '`' && text[p - 1] !== '`') return p;
+      while (text[p] === '`') p++;
     }
+    ctx.noClose[key] = failedFrom === undefined ? from : Math.min(failedFrom, from);
     return -1;
   }
 
-  function findParen(text, from) {
-    let depth = 0;
-    for (let j = from; j < text.length; j++) {
-      const c = text[j];
-      if (c === '\\') { j++; continue; }
-      if (c === '(') depth++;
-      else if (c === ')') {
-        depth--;
-        if (depth === 0) return j;
-      }
-      else if (c === '\n') return -1;
+  function trimUrl(u) {
+    let opens = 0;
+    let closes = 0;
+    for (let k = 0; k < u.length; k++) {
+      if (u[k] === '(') opens++;
+      else if (u[k] === ')') closes++;
     }
-    return -1;
+    let end = u.length;
+    for (;;) {
+      const c = u[end - 1];
+      if (URL_TRAIL.has(c)) { end--; continue; }
+      if (c === ')' && closes > opens) { closes--; end--; continue; }
+      break;
+    }
+    return u.slice(0, end);
   }
 
-  function link(url, children) {
-    return h('a', { href: url, rel: 'noopener noreferrer', target: '_blank' }, children);
+  function hostOf(url) {
+    try {
+      return new URL(url).hostname.replace(/^www\./, '').toLowerCase();
+    } catch (_) {
+      return '';
+    }
   }
 
-  function trimUrl(url) {
-    let u = url;
-    while (/[.,;:!?'"*_]$/.test(u)) u = u.slice(0, -1);
-    while (u.endsWith(')') && (u.match(/\(/g) || []).length < (u.match(/\)/g) || []).length) u = u.slice(0, -1);
-    return u;
+  /** Host named by a link label that looks like a URL ("example.com/x"), else ''. */
+  function labelHost(label) {
+    const t = label.trim();
+    if (!t || t.length > 300 || /\s/.test(t)) return '';
+    const m = /^(?:https?:\/\/)?((?:[a-z0-9-]+\.)+[a-z]{2,})(?:[/:?#].*)?$/i.exec(t);
+    return m ? m[1].replace(/^www\./, '').toLowerCase() : '';
+  }
+
+  function link(url, label) {
+    return h('a', { href: url, rel: 'noopener noreferrer', target: '_blank', title: url.length > 300 ? url.slice(0, 300) + '…' : url }, label === undefined ? null : label);
   }
 
   /** Append inline content of `text` to `parent`. */
-  function inline(text, parent, noLinks) {
+  function inline(text, parent, noLinks, depth) {
+    const level = depth || 0;
+    if (level > MAX_DEPTH) {
+      parent.append(text);
+      return;
+    }
+    const ctx = { text, noClose: Object.create(null), brackets: null, parens: null };
     let buf = '';
     const flush = () => {
       if (buf) { parent.append(buf); buf = ''; }
@@ -262,7 +363,6 @@
     let i = 0;
     while (i < text.length) {
       const c = text[i];
-      const rest = text.slice(i);
 
       if (c === '\\' && i + 1 < text.length && PUNCT.test(text[i + 1])) {
         buf += text[i + 1];
@@ -270,46 +370,60 @@
         continue;
       }
       if (c === '\n') {
-        buf = buf.replace(/ +$/, '');
+        let end = buf.length;
+        while (end && buf[end - 1] === ' ') end--;
+        buf = buf.slice(0, end);
         flush();
         parent.append(h('br'));
         i++;
         continue;
       }
       if (c === '`') {
-        const run = /^`+/.exec(rest)[0];
-        const close = text.indexOf(run, i + run.length);
-        if (close !== -1 && text[close + run.length] !== '`') {
-          let code = text.slice(i + run.length, close).replace(/\n/g, ' ');
-          if (code.startsWith(' ') && code.endsWith(' ') && code.trim()) code = code.slice(1, -1);
+        let k = i;
+        while (text[k] === '`') k++;
+        const len = k - i;
+        const close = findCodeClose(ctx, len, k);
+        if (close !== -1) {
+          let code = text.slice(k, close).replace(/\n/g, ' ');
+          if (code.length > 1 && code[0] === ' ' && code[code.length - 1] === ' ' && code.trim()) code = code.slice(1, -1);
           flush();
           parent.append(h('code', { class: 'md-code', text: code }));
-          i = close + run.length;
+          i = close + len;
           continue;
         }
-        buf += run;
-        i += run.length;
+        buf += text.slice(i, k);
+        i = k;
         continue;
       }
       if (c === '*' || c === '_' || c === '~') {
-        const run = /^(\*+|_+|~+)/.exec(rest)[0];
-        const next = text[i + run.length];
+        let k = i;
+        while (text[k] === c) k++;
+        const runLen = k - i;
+        const next = text[k];
         const prev = text[i - 1];
         const canOpen = next && !/\s/.test(next) && !(c === '_' && prev && /[A-Za-z0-9]/.test(prev));
         if (canOpen) {
           let handled = false;
-          const tries = c === '~' ? (run.length >= 2 ? ['~~'] : []) : run.length >= 3 ? [c.repeat(3), c.repeat(2), c] : run.length === 2 ? [c.repeat(2), c] : [c];
+          const tries = c === '~' ? (runLen >= 2 ? ['~~'] : []) : runLen >= 3 ? [c.repeat(3), c.repeat(2), c] : runLen === 2 ? [c.repeat(2), c] : [c];
           for (const delim of tries) {
-            const close = findClosing(text, delim, i + delim.length);
+            const close = findClosing(ctx, delim, i + delim.length);
             if (close === -1) continue;
             const inner = text.slice(i + delim.length, close);
             if (!inner.trim()) continue;
             flush();
             let el;
-            if (c === '~') el = h('del');
-            else if (delim.length === 3) { el = h('strong'); const em = h('em'); inline(inner, em, noLinks); el.append(em); }
-            else el = h(delim.length === 2 ? 'strong' : 'em');
-            if (delim.length !== 3) inline(inner, el, noLinks);
+            if (c === '~') {
+              el = h('del');
+              inline(inner, el, noLinks, level + 1);
+            } else if (delim.length === 3) {
+              el = h('strong');
+              const em = h('em');
+              inline(inner, em, noLinks, level + 1);
+              el.append(em);
+            } else {
+              el = h(delim.length === 2 ? 'strong' : 'em');
+              inline(inner, el, noLinks, level + 1);
+            }
             parent.append(el);
             i = close + delim.length;
             handled = true;
@@ -317,31 +431,37 @@
           }
           if (handled) continue;
         }
-        buf += run;
-        i += run.length;
+        buf += text.slice(i, k);
+        i = k;
         continue;
       }
       if (!noLinks && (c === '[' || (c === '!' && text[i + 1] === '['))) {
         const image = c === '!';
         const open = image ? i + 1 : i;
-        const closeBracket = findBracket(text, open);
+        if (!ctx.brackets) ctx.brackets = matchPairs(text, '[', ']', false);
+        const closeBracket = ctx.brackets.has(open) ? ctx.brackets.get(open) : -1;
         if (closeBracket !== -1 && text[closeBracket + 1] === '(') {
-          const closeParen = findParen(text, closeBracket + 1);
+          if (!ctx.parens) ctx.parens = matchPairs(text, '(', ')', true);
+          const closeParen = ctx.parens.has(closeBracket + 1) ? ctx.parens.get(closeBracket + 1) : -1;
           if (closeParen !== -1) {
             const label = text.slice(open + 1, closeBracket);
             let target = text.slice(closeBracket + 2, closeParen).trim();
             if (target.startsWith('<') && target.includes('>')) target = target.slice(1, target.indexOf('>'));
             else target = target.split(/\s+/)[0] || '';
             flush();
-            if (SAFE_URL.test(target)) {
-              const a = link(target, null);
+            if (SAFE_URL.test(target) && target.length <= MAX_URL) {
+              const a = link(target);
               if (image) a.textContent = label || target;
-              else inline(label, a, true);
+              else inline(label, a, true, level + 1);
               parent.append(a);
+              // A label that looks like a URL but points elsewhere: show the real destination.
+              const shown = labelHost(label);
+              const real = hostOf(target);
+              if (shown && shown !== real) parent.append(h('span', { class: 'link-host', text: ' (' + (real || target.slice(0, 60)) + ')' }));
             } else if (image) {
               parent.append(label);
             } else {
-              inline(label, parent, true);
+              inline(label, parent, true, level + 1);
             }
             i = closeParen + 1;
             continue;
@@ -352,14 +472,16 @@
         continue;
       }
       if (c === '<') {
-        const auto = /^<((?:https?:\/\/|mailto:)[^\s<>]+)>/i.exec(rest);
-        if (auto && !noLinks) {
+        RE_AUTOLINK.lastIndex = i;
+        const auto = noLinks ? null : RE_AUTOLINK.exec(text);
+        if (auto) {
           flush();
           parent.append(link(auto[1], auto[1]));
           i += auto[0].length;
           continue;
         }
-        const br = /^<br\s*\/?>/i.exec(rest);
+        RE_BR.lastIndex = i;
+        const br = RE_BR.exec(text);
         if (br) {
           flush();
           parent.append(h('br'));
@@ -367,14 +489,18 @@
           continue;
         }
       }
-      if (!noLinks && (c === 'h' || c === 'H') && /^https?:\/\//i.test(rest) && (!text[i - 1] || /[\s(]/.test(text[i - 1]))) {
-        const m = /^https?:\/\/[^\s<>]+/i.exec(rest);
-        const url = trimUrl(m[0]);
-        if (url.length > 8) {
-          flush();
-          parent.append(link(url, url));
-          i += url.length;
-          continue;
+      if (!noLinks && (c === 'h' || c === 'H') && (!text[i - 1] || /[\s(]/.test(text[i - 1]))) {
+        RE_HTTP.lastIndex = i;
+        if (RE_HTTP.test(text)) {
+          RE_URL.lastIndex = i;
+          const m = RE_URL.exec(text);
+          const url = m ? trimUrl(m[0]) : '';
+          if (url.length > 8) {
+            flush();
+            parent.append(link(url, url));
+            i += url.length;
+            continue;
+          }
         }
       }
       buf += c;
@@ -397,7 +523,7 @@
   const NO_HIGHLIGHT = new Set(['', 'text', 'txt', 'plain', 'plaintext', 'markdown', 'md', 'diff', 'log', 'output', 'console']);
 
   function highlight(code, lang, target) {
-    if (NO_HIGHLIGHT.has(lang) || code.length > 60000) {
+    if (NO_HIGHLIGHT.has(lang) || code.length > MAX_HIGHLIGHT) {
       target.textContent = code;
       return;
     }
@@ -433,8 +559,7 @@
 
   function codeBlock(block, final) {
     const codeEl = h('code', { class: block.lang ? 'language-' + block.lang : null });
-    const finished = block.closed || final;
-    if (finished) highlight(block.text, block.lang, codeEl);
+    if (block.closed || final) highlight(block.text, block.lang, codeEl);
     else codeEl.textContent = block.text;
     const pre = h('pre', { tabindex: '0', 'aria-label': (block.lang || 'Code') + ' code block' }, codeEl);
     const head = h('div', { class: 'code-head' }, [
@@ -446,31 +571,35 @@
     return el;
   }
 
-  function renderBlock(block, final, tight) {
+  /** Deeply nested content is shown as plain text instead of recursing further. */
+  const plain = (text) => h('p', { class: 'md-plain', text });
+
+  function renderBlock(block, final, tight, depth) {
+    const level = depth || 0;
     switch (block.type) {
       case 'code':
         return codeBlock(block, final);
       case 'heading': {
-        const level = Math.min(6, block.level + 1); // h1 in answers becomes h2 (the page owns h1)
-        const el = h('h' + level, { class: 'md-h md-h' + block.level });
-        inline(block.text, el);
+        const el = h('h' + Math.min(6, block.level + 1), { class: 'md-h md-h' + block.level }); // the page owns h1
+        inline(block.text, el, false, level);
         return el;
       }
       case 'hr':
         return h('hr');
       case 'quote': {
+        if (level >= MAX_DEPTH) return plain(block.text);
         const el = h('blockquote');
-        for (const b of parseBlocks(block.text)) el.append(renderBlock(b, final));
+        for (const b of parseBlocks(block.text)) el.append(renderBlock(b, final, false, level + 1));
         return el;
       }
       case 'list': {
+        if (level >= MAX_DEPTH) return plain(block.raw);
         const el = h(block.ordered ? 'ol' : 'ul', { start: block.ordered && block.start !== 1 ? String(block.start) : null });
         for (const src of block.items) {
           const li = h('li');
-          const inner = parseBlocks(src);
-          inner.forEach((b, idx) => {
-            if (!block.loose && b.type === 'para' && idx === 0) inline(b.text, li);
-            else li.append(renderBlock(b, final, !block.loose));
+          parseBlocks(src).forEach((b, idx) => {
+            if (!block.loose && b.type === 'para' && idx === 0) inline(b.text, li, false, level + 1);
+            else li.append(renderBlock(b, final, !block.loose, level + 1));
           });
           el.append(li);
         }
@@ -479,19 +608,19 @@
       case 'table': {
         const thead = h('thead', null, h('tr', null, block.header.map((cell, idx) => {
           const th = h('th', { scope: 'col', class: block.align[idx] ? 'align-' + block.align[idx] : null });
-          inline(cell, th);
+          inline(cell, th, false, level);
           return th;
         })));
         const tbody = h('tbody', null, block.rows.map((row) => h('tr', null, block.header.map((_, idx) => {
           const td = h('td', { class: block.align[idx] ? 'align-' + block.align[idx] : null });
-          inline(row[idx] || '', td);
+          inline(row[idx] || '', td, false, level);
           return td;
         }))));
         return h('div', { class: 'table-wrap', tabindex: '0', role: 'group', 'aria-label': 'Table' }, h('table', null, [thead, tbody]));
       }
       default: {
         const el = h('p', { class: tight ? 'md-tight' : null });
-        inline(block.text, el);
+        inline(block.text, el, false, level);
         return el;
       }
     }
@@ -501,11 +630,11 @@
     return String(text || '').replace(/\r\n?/g, '\n').replace(/\t/g, '    ');
   }
 
-  const CARET_HOSTS = new Set(['P', 'LI', 'UL', 'OL', 'BLOCKQUOTE', 'H2', 'H3', 'H4', 'H5', 'H6', 'H7', 'CODE', 'PRE', 'DIV', 'STRONG', 'EM', 'DEL']);
+  const CARET_HOSTS = new Set(['P', 'LI', 'UL', 'OL', 'BLOCKQUOTE', 'H2', 'H3', 'H4', 'H5', 'H6', 'CODE', 'PRE', 'DIV', 'STRONG', 'EM', 'DEL']);
   function caretHost(node) {
     let host = node;
-    for (;;) {
-      if (host.classList && host.classList.contains('code-block')) { host = host._code; break; }
+    for (let guard = 0; guard < 64; guard++) {
+      if (host.classList && host.classList.contains('code-block')) return host._code;
       const last = host.lastElementChild;
       if (!last || !CARET_HOSTS.has(last.tagName) || (last.tagName === 'DIV' && !last.classList.contains('code-block'))) break;
       if (host.lastChild !== last && host.lastChild.nodeType === 3 && host.lastChild.textContent.trim()) break;
@@ -516,26 +645,36 @@
 
   /**
    * Incremental renderer bound to `root`. render(text, streaming) updates only
-   * the blocks that changed since the previous call.
+   * the blocks that changed. While text only grows (streaming), parsing
+   * restarts at the last block instead of the beginning.
    */
   function createRenderer(root) {
     let prev = [];
+    let prevText = null;
     let caret = null;
     return {
       render(text, streaming) {
-        const blocks = parseBlocks(normalize(text));
+        const norm = normalize(text);
+        const lines = norm.split('\n');
+        let blocks;
+        if (prevText !== null && prev.length > 1 && norm.startsWith(prevText)) {
+          const keep = prev.length - 1;
+          blocks = prev.slice(0, keep).map((p) => p.block).concat(parseLines(lines, prev[keep].block.line));
+        } else {
+          blocks = parseLines(lines, 0);
+        }
+        prevText = norm;
         const final = !streaming;
         if (caret) { caret.remove(); caret = null; }
         let i = 0;
-        while (i < blocks.length && i < prev.length && prev[i].raw === blocks[i].raw && (prev[i].final === final || blocks[i].type !== 'code' || blocks[i].closed)) i++;
+        while (i < blocks.length && i < prev.length && prev[i].block.raw === blocks[i].raw && (prev[i].final === final || blocks[i].type !== 'code' || blocks[i].closed)) i++;
         // Fast path: a growing, still-open code block only appends text.
         if (i < blocks.length && i === prev.length - 1 && i === blocks.length - 1 && streaming) {
           const p = prev[i];
           const b = blocks[i];
-          if (p.type === 'code' && b.type === 'code' && !p.closed && !b.closed && p.lang === b.lang && b.text.startsWith(p.text)) {
-            p.node._code.append(b.text.slice(p.text.length));
-            p.raw = b.raw;
-            p.text = b.text;
+          if (p.block.type === 'code' && b.type === 'code' && !p.block.closed && !b.closed && p.block.lang === b.lang && b.text.startsWith(p.block.text)) {
+            p.node._code.append(b.text.slice(p.block.text.length));
+            p.block = b;
             i = blocks.length;
           }
         }
@@ -543,9 +682,9 @@
         prev = prev.slice(0, i);
         for (; i < blocks.length; i++) {
           const b = blocks[i];
-          const node = renderBlock(b, final);
+          const node = renderBlock(b, final, false, 0);
           root.append(node);
-          prev.push({ raw: b.raw, type: b.type, lang: b.lang, text: b.text, closed: b.closed, final, node });
+          prev.push({ block: b, final, node });
         }
         if (streaming) {
           caret = h('span', { class: 'caret', 'aria-hidden': 'true' });
@@ -556,6 +695,7 @@
       },
       reset() {
         prev = [];
+        prevText = null;
         caret = null;
         root.replaceChildren();
       },
@@ -577,7 +717,7 @@
     parseBlocks,
     createRenderer,
     splitThinking,
-    /** One-shot render of trusted-as-text Markdown into el. */
+    /** One-shot render of untrusted Markdown into el. */
     render(el, text) {
       el.replaceChildren();
       createRenderer(el).render(text, false);

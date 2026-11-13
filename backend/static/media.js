@@ -24,8 +24,8 @@
   const ui = {};
   const st = { kind: 'image', status: null, jobs: [], loaded: false, preset: { image: 'square', video: 'wide' }, offs: [] };
 
-  const safeUrl = (url) => (typeof url === 'string' && /^\/api\/media\/[A-Za-z0-9/_.-]+$/.test(url) ? url : null);
-  const fileUrl = (job) => safeUrl(job.output_url) || (job.status === 'done' ? '/api/media/jobs/' + encodeURIComponent(job.id) + '/file' : null);
+  const safeUrl = (url) => (typeof url === 'string' && /^\/api\/media\/jobs\/\d+\/file(\?download=1)?$/.test(url) ? url : null);
+  const fileUrl = (job) => safeUrl(job.output_url) || (job.status === 'done' ? safeUrl('/api/media/jobs/' + job.id + '/file') : null);
   const isVideo = (job) => job.kind === 'video' || /^video\//.test(LR.str(job.output_type));
 
   /* ------------------------------------------------------------ data */
@@ -418,7 +418,7 @@
     ].filter(Boolean).join(' · ');
     const del = LR.button({ text: 'Delete', icon: 'trash', variant: 'ghost', onclick: async (ev) => { if (await deleteJob(job, ev.currentTarget)) m.close(); } });
     const use = LR.button({ text: 'Use prompt', variant: 'secondary', onclick: () => { m.close(); reuse(job); } });
-    const download = url ? h('a', { class: 'btn btn-primary', href: url + (url.includes('?') ? '&' : '?') + 'download=1', download: 'lowram-' + job.id + '.' + ext }, [icon('download'), h('span', { text: 'Download' })]) : null;
+    const download = url ? h('a', { class: 'btn btn-primary', href: url.replace(/\?download=1$/, '') + '?download=1', download: 'lowram-' + job.id + '.' + ext }, [icon('download'), h('span', { text: 'Download' })]) : null;
     const m = LR.modal({
       title: isVideo(job) ? 'Video' : 'Image',
       sub: details,

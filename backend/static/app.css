@@ -682,6 +682,8 @@ p.small .icon, p.muted .icon { width: 15px; height: 15px; vertical-align: -3px; 
 .msg-meta { font-size: 12.5px; color: var(--text-3); margin-left: 6px; }
 .msg-assistant .msg-actions { margin: 4px 0 0 -6px; }
 .msg-body { font-size: 15.5px; line-height: 1.7; overflow-wrap: anywhere; }
+/* Very long answers: let the browser skip layout of blocks that are off screen. */
+.msg-body > * { content-visibility: auto; contain-intrinsic-size: auto 1.7em; }
 .msg-skeleton { list-style: none; }
 .msg-wait { display: flex; align-items: center; gap: 12px; color: var(--text-3); font-size: 14px; min-height: 28px; }
 .typing { display: inline-flex; gap: 5px; }
@@ -793,6 +795,8 @@ p.small .icon, p.muted .icon { width: 15px; height: 15px; vertical-align: -3px; 
 .md a { color: var(--accent-text); text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: 3px; }
 .md a:hover { text-decoration-thickness: 2px; }
 .md strong { font-weight: 650; }
+.md-plain { white-space: pre-wrap; overflow-wrap: anywhere; color: var(--text-2); }
+.link-host { color: var(--text-3); font-size: 0.85em; }
 .md-code { font-size: 0.86em; background: var(--code-bg); padding: 0.14em 0.4em; border-radius: 5px; overflow-wrap: anywhere; }
 .code-block { margin: 0.4em 0 1em; border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; background: var(--codeblock-bg); }
 .code-head { display: flex; align-items: center; justify-content: space-between; padding: 3px 4px 3px 14px; background: var(--codeblock-head); border-bottom: 1px solid var(--border); }
