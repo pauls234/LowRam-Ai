@@ -141,6 +141,7 @@ def chat(
 
 import http.client  # noqa: E402
 import threading  # noqa: E402
+import time  # noqa: E402
 from collections.abc import Iterator  # noqa: E402
 
 MAX_STREAM_LINE_BYTES = 1024 * 1024
@@ -246,15 +247,27 @@ def _sse_fields(response, stop_event: threading.Event | None, timeout: float) ->
             yield name, value[1:] if value.startswith(" ") else value
 
 
-def _read_json_answer(response) -> str:
+def _usage_tokens(data: dict, outcome: dict) -> None:
+    usage = data.get("usage")
+    tokens = usage.get("completion_tokens") if isinstance(usage, dict) else None
+    if isinstance(tokens, int) and not isinstance(tokens, bool) and tokens >= 0:
+        outcome["usage_tokens"] = tokens
+
+
+def _read_json_answer(response, outcome: dict) -> str:
     """Fallback for servers that ignore ``"stream": true`` and answer with plain JSON."""
     raw = response.read(MAX_RESPONSE_BYTES + 1)
     if len(raw) > MAX_RESPONSE_BYTES:
         raise LLMError("The model response exceeded 8 MiB and was discarded")
     try:
-        content = json.loads(raw.decode("utf-8"))["choices"][0]["message"]["content"]
+        data = json.loads(raw.decode("utf-8"))
+        choice = data["choices"][0]
+        content = choice["message"]["content"]
     except (UnicodeDecodeError, json.JSONDecodeError, KeyError, IndexError, TypeError) as exc:
         raise LLMError("The model endpoint returned a response that is not OpenAI chat-completions JSON") from exc
+    if isinstance(choice.get("finish_reason"), str):
+        outcome["finish_reason"] = choice["finish_reason"]
+    _usage_tokens(data, outcome)
     return content if isinstance(content, str) else ""
 
 
@@ -276,6 +289,7 @@ def _stream_deltas(response, stop_event: threading.Event | None, timeout: float,
             raise LLMError(_NOT_OPENAI_STREAM)
         if chunk.get("error"):
             raise LLMError(f"The model endpoint reported an error: {_error_text(chunk['error'], api_key)}")
+        _usage_tokens(chunk, outcome)
         choices = chunk.get("choices")
         if not isinstance(choices, list):
             raise LLMError(_NOT_OPENAI_STREAM)
@@ -289,6 +303,9 @@ def _stream_deltas(response, stop_event: threading.Event | None, timeout: float,
         if content is not None and not isinstance(content, str):
             raise LLMError(_NOT_OPENAI_STREAM)
         reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+        if (isinstance(reasoning, str) and reasoning) or content:
+            outcome["deltas"] = outcome.get("deltas", 0) + 1
+            outcome.setdefault("first_at", time.monotonic())
         if isinstance(reasoning, str) and reasoning:
             if not in_reasoning:
                 in_reasoning = True
@@ -301,6 +318,8 @@ def _stream_deltas(response, stop_event: threading.Event | None, timeout: float,
             yield content
         if choice.get("finish_reason"):
             outcome["complete"] = True
+            if isinstance(choice["finish_reason"], str):
+                outcome["finish_reason"] = choice["finish_reason"]
     if in_reasoning:
         yield "</think>"
 
@@ -313,6 +332,7 @@ def stream_chat(
     url: str | None = None,
     timeout: float | None = None,
     stop_event: threading.Event | None = None,
+    stats: dict | None = None,
 ) -> Iterator[str]:
     """Stream a chat completion and yield the text deltas as they arrive.
 
@@ -324,6 +344,11 @@ def stream_chat(
     data, a connection that ends before the answer is complete, or an empty
     answer. When ``stop_event`` is set the connection is closed promptly and
     the generator simply ends (no error).
+
+    ``stats`` (optional dict) is filled when the generator ends, also on
+    stop or error: ``tokens`` (server-reported ``usage.completion_tokens`` if
+    sent, else the number of text deltas), ``tokens_per_s`` (first delta to
+    end) and ``finish_reason`` (e.g. ``"stop"``/``"length"``, else ``None``).
     """
     url = url or config.llm_url()
     parsed = urlparse(url)
@@ -336,6 +361,7 @@ def stream_chat(
         "max_tokens": int(max_tokens),
         "temperature": float(temperature),
         "stream": True,
+        "stream_options": {"include_usage": True},
     }
     headers = {"Content-Type": "application/json", "Accept": "text/event-stream, application/json"}
     api_key = config.llm_api_key()
@@ -355,17 +381,19 @@ def stream_chat(
         threading.Thread(
             target=_watch_stop, args=(stop_event, finished, lock, response), name="lowram-llm-stop", daemon=True
         ).start()
+    outcome: dict = {"complete": False}
     try:
         content_type = (response.headers.get("Content-Type") or "").split(";")[0].strip().lower()
         visible: list[str] = []
         if content_type == "application/json":
-            text = _read_json_answer(response)
-            outcome = {"complete": True}
+            outcome["first_at"] = time.monotonic()
+            text = _read_json_answer(response, outcome)
+            outcome["complete"] = True
             if text:
+                outcome["deltas"] = 1
                 visible.append(text)
                 yield text
         else:
-            outcome = {"complete": False}
             for piece in _stream_deltas(response, stop_event, timeout, api_key, outcome):
                 visible.append(piece)
                 yield piece
@@ -382,3 +410,11 @@ def stream_chat(
                 response.close()
             except (OSError, ValueError):
                 pass
+        if stats is not None:
+            tokens = outcome.get("usage_tokens", outcome.get("deltas", 0))
+            elapsed = time.monotonic() - outcome["first_at"] if "first_at" in outcome else 0.0
+            stats.update(
+                tokens=tokens,
+                tokens_per_s=round(tokens / elapsed, 2) if tokens and elapsed >= 0.05 else None,
+                finish_reason=outcome.get("finish_reason"),
+            )
