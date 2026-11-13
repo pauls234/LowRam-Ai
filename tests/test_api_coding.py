@@ -31,7 +31,11 @@ class CodingApiTestCase(LowRAMTestCase):
         self.thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
         self.thread.start()
         self.addCleanup(self._shutdown)
-        self.repo = self.make_repo({"calc.py": BUGGY, "README.md": "# Calc\n"})
+        self.user_home = self.tmp / "fakeuserhome"  # HOME of LowRAMTestCase
+        self.repo = self.user_home / "code" / "calc"
+        for rel, text in {"calc.py": BUGGY, "README.md": "# Calc\n"}.items():
+            (self.repo / rel).parent.mkdir(parents=True, exist_ok=True)
+            (self.repo / rel).write_text(text)
 
     def _shutdown(self):
         self.server.shutdown()
@@ -71,9 +75,17 @@ class ProjectTests(CodingApiTestCase):
 
     def test_create_validation(self):
         a_file = self.repo / "calc.py"
-        home = self.tmp / "fakeuserhome"
-        home.mkdir(exist_ok=True)
+        home = self.user_home
+        for folder in (".config/proj", "Library/proj", "code/.hidden/proj"):
+            (home / folder).mkdir(parents=True)
+        (home / "code" / "link").symlink_to(home / ".config" / "proj")
+        outside = self.make_repo({"x.py": "x = 1\n"})
         cases = [
+            {"goal": "g", "repo_path": str(outside)},  # not inside the home directory
+            {"goal": "g", "repo_path": str(home / ".config" / "proj")},
+            {"goal": "g", "repo_path": str(home / "code" / ".hidden" / "proj")},
+            {"goal": "g", "repo_path": str(home / "code" / "link")},  # symlink into a hidden folder
+            {"goal": "g", "repo_path": str(home / "Library" / "proj")},
             {"goal": "g", "repo_path": "relative/path"},
             {"goal": "g", "repo_path": str(self.tmp / "missing")},
             {"goal": "g", "repo_path": str(a_file)},
@@ -93,6 +105,20 @@ class ProjectTests(CodingApiTestCase):
                 status, data = self.api("POST", "/api/coding/projects", body)
                 self.assertEqual(status, 400, data)
                 self.assertIn("error", data)
+        messages = {
+            "home directory": outside, "hidden folder": home / ".config" / "proj",
+            "Library": home / "Library" / "proj",
+        }
+        for expected, path in messages.items():
+            body = {"goal": "g", "repo_path": str(path)}
+            self.assertIn(expected, self.api("POST", "/api/coding/projects", body)[1]["error"])
+        data_home = home / "code" / "lowram-data"  # LOWRAM_HOME inside the user's home
+        data_home.mkdir()
+        with mock.patch.dict(os.environ, {"LOWRAM_HOME": str(data_home)}):
+            for path in (data_home, home / "code"):
+                status, data = self.api("POST", "/api/coding/projects", {"goal": "g", "repo_path": str(path)})
+                self.assertEqual(status, 400)
+                self.assertIn("data folder", data["error"])
         self.assertEqual(self.api("POST", "/api/coding/projects", {"goal": "g", "repo_path": str(self.repo)}, token="x")[0], 403)
         self.assertEqual(db.list_projects(), [])
 
@@ -192,6 +218,23 @@ class WorkflowTests(CodingApiTestCase):
         status, data = self.api("POST", f"/api/coding/projects/{pid}/plan")
         self.assertEqual(status, 409)
         self.assertIn("Paused", data["error"])
+        self.assertIsNone(db.busy_reason())
+
+    def test_engine_paused_during_call_is_409_not_502(self):
+        from backend import api_coding
+
+        pid = self.new_project()
+        with mock.patch.object(chat, "engine_interrupted", return_value=True):
+            self.llm.push(HttpError(500, "connection lost"))
+            status, data = self.api("POST", f"/api/coding/projects/{pid}/plan")
+            self.assertEqual((status, data["error"]), (409, api_coding.PAUSED_MESSAGE))
+            tid = self.api("POST", f"/api/coding/projects/{pid}/steps", {"title": "Fix", "files": ["calc.py"]})[1]["task_id"]
+            self.llm.push(HttpError(500, "connection lost"))
+            status, data = self.api("POST", f"/api/coding/projects/{pid}/step")
+            self.assertEqual((status, data["error"]), (409, api_coding.PAUSED_MESSAGE))
+        self.assertEqual(db.get_task(tid)["status"], "pending")  # requeued: just try again
+        self.llm.push(proposal_reply())
+        self.assertEqual(self.api("POST", f"/api/coding/projects/{pid}/step")[1]["status"], "proposed")
         self.assertIsNone(db.busy_reason())
 
     def test_managed_engine_is_started_or_409(self):
