@@ -14,3 +14,8 @@ htmlcov/
 .DS_Store
 *.gguf
 *.db
+# local agent worktrees / tool state
+.claude/
+# desktop build output
+build/
+dist/

@@ -24,6 +24,7 @@ DEFAULTS: dict[str, Any] = {
         "code_model_id": None,  # optional separate model for the Code mode
         "port": None,  # None = pick a free port
         "ctx_size": None,  # None = derive from the RAM budget
+        "models_dir": None,  # None = <home>/models; or an absolute folder, e.g. on an external SSD
     },
     "media": {
         "image_model_id": None,
@@ -34,11 +35,12 @@ DEFAULTS: dict[str, Any] = {
         "enabled": False,  # accept helper devices on the local network
         "port": 8766,
         "device_name": None,
+        "discoverable": True,  # announce this host on the LAN so helpers can find it without a code
     },
     "ui": {"theme": "system"},
 }
 
-_lock = threading.Lock()
+_lock = threading.RLock()  # re-entrant: update() holds it across load() + write
 
 
 def _path():
@@ -87,16 +89,16 @@ def update(section: str, values: dict) -> Any:
     """Change keys of one section (or the scalar ``budget_percent``) and persist."""
     if section not in DEFAULTS:
         raise ValueError(f"Unknown settings section {section!r}")
-    current = load()
-    if isinstance(DEFAULTS[section], dict):
-        if not isinstance(values, dict):
-            raise ValueError("Settings values must be an object")
-        unknown = set(values) - set(DEFAULTS[section])
-        if unknown:
-            raise ValueError(f"Unknown setting(s) in {section}: {', '.join(sorted(unknown))}")
-        current[section].update(values)
-    else:
-        current[section] = values
-    with _lock:
+    with _lock:  # read-modify-write as one step, so concurrent updates never lose changes
+        current = load()
+        if isinstance(DEFAULTS[section], dict):
+            if not isinstance(values, dict):
+                raise ValueError("Settings values must be an object")
+            unknown = set(values) - set(DEFAULTS[section])
+            if unknown:
+                raise ValueError(f"Unknown setting(s) in {section}: {', '.join(sorted(unknown))}")
+            current[section].update(values)
+        else:
+            current[section] = values
         artifacts.write_json_atomic(_path(), current)
-    return current[section]
+        return current[section]

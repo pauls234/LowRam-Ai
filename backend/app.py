@@ -224,14 +224,16 @@ class Handler(BaseHTTPRequestHandler):
         self._send(HTTPStatus.OK, resp.path.read_bytes(), resp.content_type, extra)
 
     def _send_stream(self, resp: StreamResponse) -> None:
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-        self.send_header("Connection", "close")
-        self._security_headers()
-        self.end_headers()
-        self.close_connection = True
         events = resp.events
         try:
+            # Headers inside the try: if the client is already gone, close() still runs
+            # and the producer releases its inference slot.
+            self.close_connection = True
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Connection", "close")
+            self._security_headers()
+            self.end_headers()
             for event in events:
                 self.wfile.write(b"data: " + json.dumps(event).encode("utf-8") + b"\n\n")
                 self.wfile.flush()
@@ -345,7 +347,7 @@ def start_background(port: int | None = None) -> LowRAMServer:
 def shutdown(server: LowRAMServer) -> None:
     """Stop the loop, run shutdown hooks (e.g. stop llama-server) and close the socket."""
     server.loop.stop()
-    web.run_hooks(web.SHUTDOWN_HOOKS, server)
+    web.run_hooks(list(reversed(web.SHUTDOWN_HOOKS)), server)
     server.shutdown()
     server.server_close()
 
@@ -372,7 +374,7 @@ def main(argv: list[str] | None = None) -> int:
         print("\nStopping…")
     finally:
         server.loop.stop()
-        web.run_hooks(web.SHUTDOWN_HOOKS, server)
+        web.run_hooks(list(reversed(web.SHUTDOWN_HOOKS)), server)
         server.server_close()
     return 0
 

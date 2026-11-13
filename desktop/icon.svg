@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <title>LowRAM AI</title>
+  <!-- App icon: calm indigo tile, a memory chip and a spark ("small model, local AI").
+       At <= 48 px the media query below switches to a bolder, simpler variant. -->
+  <defs>
+    <linearGradient id="tile" x1="0.12" y1="0.04" x2="0.88" y2="0.98">
+      <stop offset="0" stop-color="#6a86f7"/>
+      <stop offset="0.52" stop-color="#4560d8"/>
+      <stop offset="1" stop-color="#2c3c9c"/>
+    </linearGradient>
+    <linearGradient id="sheen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.20"/>
+      <stop offset="0.45" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#b9f3d6" stop-opacity="0.50"/>
+      <stop offset="0.6" stop-color="#b9f3d6" stop-opacity="0.10"/>
+      <stop offset="1" stop-color="#b9f3d6" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="spark" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#d4f7e6"/>
+    </linearGradient>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="125%">
+      <feDropShadow dx="0" dy="14" stdDeviation="16" flood-color="#0d1745" flood-opacity="0.30"/>
+    </filter>
+  </defs>
+  <style>
+    .small { display: none; }
+    @media (max-width: 48px) {
+      .art { transform: scale(1.18); transform-origin: 512px 512px; }
+      .tile { filter: none; }
+      .detail, .glow { display: none; }
+      .small { display: inline; }
+      .chip, .pins { stroke-width: 78px; }
+      .spark { transform: scale(1.25); transform-origin: 512px 512px; }
+    }
+  </style>
+  <g class="art">
+    <rect class="tile" x="100" y="100" width="824" height="824" rx="186" fill="url(#tile)" filter="url(#shadow)"/>
+    <rect class="detail" x="100" y="100" width="824" height="824" rx="186" fill="url(#sheen)"/>
+    <circle class="glow" cx="512" cy="512" r="250" fill="url(#glow)"/>
+    <g fill="none" stroke="#ffffff" stroke-linecap="round" stroke-linejoin="round">
+      <rect class="chip" x="327" y="327" width="370" height="370" rx="92" stroke-width="46" fill="#ffffff" fill-opacity="0.12"/>
+      <path class="pins detail" stroke-width="46"
+            d="M327 417H251M327 512H251M327 607H251M697 417H773M697 512H773M697 607H773"/>
+      <path class="pins small" stroke-width="78" d="M327 440H226M327 584H226M697 440H798M697 584H798"/>
+    </g>
+    <path class="spark" fill="url(#spark)"
+          d="M512 402C521 470 554 503 622 512C554 521 521 554 512 622C503 554 470 521 402 512C470 503 503 470 512 402Z"/>
+    <path class="detail" fill="#b9f3d6"
+          d="M612 382C615 403 625 413 646 416C625 419 615 429 612 450C609 429 599 419 578 416C599 413 609 403 612 382Z"/>
+  </g>
+</svg>

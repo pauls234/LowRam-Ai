@@ -78,8 +78,29 @@ def llm_url() -> str:
     return os.environ.get("LOWRAM_LLM_URL", "").strip() or _runtime_llm_url or DEFAULT_LLM_URL
 
 
-def models_dir() -> Path:
+def default_models_dir() -> Path:
     return _ensure_dir(home_dir() / "models")
+
+
+def models_dir() -> Path:
+    """Where models live: ``LOWRAM_MODELS_DIR`` > ``settings.engine.models_dir`` > ``<home>/models``.
+
+    A custom folder (e.g. on an external SSD) is NOT created automatically: if
+    the drive is unplugged the path simply does not exist and callers must
+    report "drive not connected" instead of silently writing to the boot disk.
+    """
+    env = os.environ.get("LOWRAM_MODELS_DIR", "").strip()
+    if env:
+        return Path(env).expanduser()
+    try:
+        from . import settings  # lazy: settings imports this module
+
+        custom = settings.get("engine", "models_dir")
+    except Exception:  # settings unreadable → fall back to the default folder
+        custom = None
+    if isinstance(custom, str) and custom.strip():
+        return Path(custom).expanduser()
+    return default_models_dir()
 
 
 def bin_dir() -> Path:
@@ -90,9 +111,27 @@ def llm_model() -> str:
     return os.environ.get("LOWRAM_LLM_MODEL", "").strip() or DEFAULT_MODEL
 
 
+_runtime_llm_api_key: str | None = None
+
+
+def set_runtime_llm_api_key(key: str | None) -> None:
+    """Called by the engine manager: the random key its own llama-server requires."""
+    global _runtime_llm_api_key
+    _runtime_llm_api_key = key
+
+
 def llm_api_key() -> str | None:
-    """Optional bearer token for endpoints that require one (never logged)."""
-    return os.environ.get("LOWRAM_LLM_API_KEY") or None
+    """Bearer token for the model endpoint (never logged).
+
+    ``LOWRAM_LLM_API_KEY`` wins. The managed engine's random key is only sent
+    to the managed engine, never to an external ``LOWRAM_LLM_URL``.
+    """
+    env_key = os.environ.get("LOWRAM_LLM_API_KEY")
+    if env_key:
+        return env_key
+    if not os.environ.get("LOWRAM_LLM_URL", "").strip() and _runtime_llm_url:
+        return _runtime_llm_api_key
+    return None
 
 
 def llm_timeout() -> float:

@@ -104,6 +104,29 @@ EngineServer = {state: "stopped"|"starting"|"ready"|"error", model_id: str|null,
 * `POST /api/engine/start {model_id?}` → 202 `{server}`; `POST /api/engine/stop {}` → `{server}`
 * `GET /api/downloads` → `{downloads: [Download]}`; `POST /api/downloads/<id>/cancel {}` → `{download}` (download ids are strings)
 
+**Own models (v0.3.1).** `CatalogModel` gains `source: "catalog"|"custom"|"local"`,
+`path: str|null`, `available: bool` (file present – false when the external
+drive is unplugged), `fits_ram: bool`.
+
+* `POST /api/engine/custom/resolve {source}` – `source` is `owner/repo`, a
+  Hugging Face repo URL or a direct `…/resolve/<rev>/<file>.gguf` URL →
+  `{repo, revision, files: [{filename, size_bytes, quant, fits_ram, recommended}]}`
+  (GGUF files only, split `-00001-of-0000N` files grouped as one entry).
+* `POST /api/engine/custom/install {repo, filename, name?, purpose?}` → 202 `{download, model_id}`
+  (size + SHA-256 from the Hugging Face API; unverified downloads refused).
+* `POST /api/engine/custom/import {path, name?, purpose?}` → 201 `{model}` – registers an
+  existing local `.gguf` (e.g. on an external drive) without copying it.
+  Deleting an imported model only unregisters it; the file is never removed.
+* `GET /api/engine/storage` → `{models_dir, default_dir, custom: bool, available: bool,
+  writable: bool, free_bytes, total_bytes, moving: {state, bytes_done, bytes_total, error}|null}`
+* `POST /api/engine/storage {models_dir: str|null, move_existing: bool}` → 202 `{storage}` –
+  `null` resets to the default folder. The folder must be absolute, exist, be
+  writable and not be a system location. Moving runs in the background (copy,
+  verify size, then delete the source); the engine must be stopped meanwhile.
+* `config.models_dir()` resolves `LOWRAM_MODELS_DIR` > `settings.engine.models_dir` >
+  `<home>/models` and never creates a custom folder. Downloads may write below
+  `LOWRAM_HOME` **or** below `config.models_dir()`.
+
 Python API for other modules:
 `engine.status()`, `engine.ensure_running(timeout=...) -> str` (LLM url, raises `engine.EngineError`),
 `engine.stop()`, `engine.pause_for_heavy_job()` (context manager: stop the managed
@@ -172,6 +195,26 @@ Device = {id, name, status: "online"|"offline"|"busy", platform, ram_total_bytes
 * `POST /api/cluster/devices/<id>/revoke {}` → `{revoked: true}`
 * `POST /api/cluster/projects/<id>/distribute {percent?, merge: bool}` → 202 `{project_id, distributed: true}` – helper devices may claim this project's pending tasks while this machine works on it too; with `merge` a final "combine the results" step runs locally when all tasks are done.
 * `GET /api/cluster/projects/<id>/final` → `{content, path}` (404 until merged)
+* `POST /api/cluster/join {code, name?, percent?}` → 202 `{worker}`; `POST /api/cluster/leave {}` → `{worker}`
+* `GET /api/cluster` additionally returns `worker: {state: "idle"|"pairing"|"working"|"error"|"stopped", host, device_id, tasks_done, current_task: {id, title, project_id}|null, error, message}|null`, `projects: [{project_id, name, percent, merge, merge_state: "off"|"waiting"|"running"|"done"|"failed", merge_error, final_available, counts, total}]`, `pairing_error`, `host_name`
+**Easy pairing (v0.3.1) – like Bluetooth.** While Devices is enabled and
+`cluster.discoverable` is true, the host announces itself on the LAN (UDP
+beacon, see `cluster.py`). Any LowRAM AI (even with Devices off) listens and
+lists nearby hosts. Joining sends a pairing *request*; both screens show the
+same 6-digit verification number derived from the host certificate
+fingerprint and both nonces; the host user clicks Allow. A man-in-the-middle
+would have a different certificate and therefore a different number.
+
+* `GET /api/cluster/nearby` → `{hosts: [{id, name, addresses: [str], port, fingerprint_short, last_seen}]}`
+* `POST /api/cluster/join {host_id, name?, percent?}` (discovered host) or `{code, name?, percent?}`
+  (manual code, unchanged) → 202 `{worker}`; `worker.state` may be `"awaiting_approval"` with
+  `worker.verification_code` ("123 456") to show on the helper.
+* Host: `GET /api/cluster` adds `requests: [{id, name, platform, ram_total_bytes, address,
+  verification_code, expires_at}]`; `POST /api/cluster/requests/<id>/approve {}` / `…/deny {}`.
+  Requests expire after 2 minutes, at most 3 pending, rate-limited per address.
+* Desktop window: `window.pywebview.api.pick_folder(title)` → absolute path or `null`
+  (only inside the app window; the browser UI falls back to a text field).
+* LAN API (`/cluster/v1/pair|heartbeat|claim|leave`, `/cluster/v1/tasks/<id>/result|fail`): see the `backend/cluster.py` docstring. Device leases are requeued after 90 s without a heartbeat (max 3 attempts) – the only automatic retry in LowRAM AI.
 * LAN API (`scope="cluster"`, served only by the TLS device server): designed by the devices owner, all requests HMAC-signed except the one-time pairing call.
 
 ### Desktop (`desktop/launcher.py`)

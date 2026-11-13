@@ -21,7 +21,9 @@ MAX_NAME_CHARS = 120
 MAX_LOOP_TASKS = 100
 DEFAULT_LOOP_TASKS = 5
 
-STOP_REASONS = ("queue_empty", "max_tasks", "failure", "paused_low_ram", "stop_requested", "busy", "error")
+STOP_REASONS = (
+    "queue_empty", "max_tasks", "failure", "paused_low_ram", "no_model", "stop_requested", "busy", "error",
+)
 
 SYSTEM_PROMPT = (
     "You are LowRAM AI, a careful assistant running on a local model. You work through a "
@@ -141,6 +143,23 @@ def _messages(task: dict, context: str) -> list[dict]:
     ]
 
 
+def model_problem() -> str | None:
+    """``None`` when a model endpoint is usable, else why not.
+
+    Starts the managed engine when needed (same rules as chat). Without the
+    chat/engine modules, or with an external ``LOWRAM_LLM_URL``, nothing is checked.
+    """
+    try:
+        from . import chat  # lazy: chat imports this module
+    except ImportError:
+        return None
+    try:
+        chat.ensure_model()
+    except Exception as exc:  # HTTPError(409) with a user-facing reason
+        return getattr(exc, "message", None) or describe_error(exc)
+    return None
+
+
 def describe_error(exc: BaseException) -> str:
     if isinstance(exc, (llm.LLMError, artifacts.ArtifactError)):
         return str(exc)
@@ -172,6 +191,11 @@ def run_next(project_id: int, percent: object = memory.DEFAULT_PERCENT) -> dict:
     outcome: dict = {"task": None, "result": None, "error": None, "reason": None, "memory": mem.to_dict()}
     if not mem.can_run:
         return {**outcome, "status": "paused", "reason": mem.reason}
+    if not db.tasks_with_status(project_id, ["pending"]):
+        return {**outcome, "status": "empty", "reason": "No pending tasks in this project."}
+    problem = model_problem()
+    if problem:  # nothing is claimed, so the task is not marked failed
+        return {**outcome, "status": "no_model", "reason": problem}
     task = db.claim_next_task(project_id)
     if task is None:
         return {**outcome, "status": "empty", "reason": "No pending tasks in this project."}
@@ -265,6 +289,9 @@ def run_loop(
                 break
         elif status == "paused":
             summary.update(stopped_because="paused_low_ram", message=outcome["reason"])
+            break
+        elif status == "no_model":
+            summary.update(stopped_because="no_model", message=outcome["reason"])
             break
         elif status == "empty":
             summary.update(stopped_because="queue_empty", message="All tasks processed.")
