@@ -23,6 +23,7 @@ import http.client
 import json
 import logging
 import platform
+import secrets
 import socket
 import ssl
 import sys
@@ -49,6 +50,9 @@ MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 MAX_CONTENT_BYTES = 900_000  # stays below the host's 1 MiB body limit
 RESULT_RETRIES = 4
 SKEW_RETRY_S = 30
+POLL_S = 2.0  # pairing-request status polls
+MODEL_START_TIMEOUT_S = 120.0
+MODEL_RETRY_MAX_S = 60.0
 
 
 class WorkerError(RuntimeError):
@@ -75,6 +79,18 @@ class HostRejected(WorkerError):
 
 class ModelUnavailable(WorkerError):
     """The local model server cannot be reached (temporary)."""
+
+
+class _Stopped(Exception):
+    """stop() was called while pairing."""
+
+
+def effective_max_tokens(task: dict, plan: memory.MemoryPlan) -> int:
+    """The host's value, but never more than this machine's own RAM plan allows."""
+    asked = task.get("max_tokens")
+    if isinstance(asked, bool) or not isinstance(asked, (int, float)):
+        return plan.max_tokens
+    return max(1, min(int(asked), plan.max_tokens))
 
 
 # --------------------------------------------------------------------------- transport
@@ -163,11 +179,7 @@ class HostClient:
                 conn.close()
         if mismatch is not None:
             raise mismatch
-        shown = ", ".join(self.addresses)
-        raise HostUnreachable(
-            f"Could not reach the host at {shown} (port {self.port}): {last}. Is LowRAM AI running there with "
-            "Devices turned on, and are both computers on the same network?"
-        )
+        raise HostUnreachable(describe_unreachable(self.addresses, self.port, last))
 
     def _learn_clock(self, date_header: str | None) -> float:
         if not date_header:
@@ -210,6 +222,20 @@ class HostClient:
                 )
             return status, data
         raise AssertionError("unreachable")
+
+
+def describe_unreachable(addresses: list[str], port: int, exc: Exception | None) -> str:
+    """Human explanation for the common "cannot connect" causes."""
+    shown = f"{', '.join(addresses)} (port {port})"
+    if isinstance(exc, ConnectionRefusedError):
+        return (f"The host at {shown} refused the connection: Devices is turned off there, or LowRAM AI is not "
+                "running. Turn Devices on at the host.")
+    if isinstance(exc, (TimeoutError, socket.timeout)):
+        return (f"No answer from the host at {shown}. Make sure both computers are on the same network (some "
+                "Wi-Fi routers isolate clients – then use a cable or another network). If the host is a Mac, allow "
+                "incoming connections for LowRAM AI (System Settings → Network → Firewall).")
+    return (f"Could not reach the host at {shown}: {exc}. Is LowRAM AI running there with Devices turned on, and "
+            f"are both computers on the same network? A firewall on the host may block port {port}.")
 
 
 # --------------------------------------------------------------------------- credentials
@@ -340,16 +366,26 @@ def _local_model_name() -> str:
 class Worker:
     """Claim → run → report loop. ``run()`` blocks; ``stop()`` may be called from any thread."""
 
-    def __init__(self, code: object, name: object = None, percent: object = memory.DEFAULT_PERCENT, *,
+    def __init__(self, code: object = None, name: object = None, percent: object = memory.DEFAULT_PERCENT, *,
+                 host: cluster.NearbyHost | None = None,
                  state_path: Path | None = None,
                  slot: Callable[[str], AbstractContextManager[Any]] = db.inference_slot,
+                 busy_check: Callable[[], str | None] = db.busy_reason,
                  heartbeat_s: float = HEARTBEAT_S, idle_min_s: float = IDLE_MIN_S, idle_max_s: float = IDLE_MAX_S,
-                 say: Callable[[str], None] | None = None):
-        self.code = cluster.parse_pairing_code(code)
+                 poll_s: float = POLL_S, say: Callable[[str], None] | None = None):
+        if host is None:
+            self.code: cluster.PairingCode | None = cluster.parse_pairing_code(code)
+        elif code is not None:
+            raise ValueError("Join either with a pairing code or with a nearby device, not both")
+        else:
+            self.code = None
+        self.host = host
         self.name = cluster.clean_device_name(name, default_device_name())
         self.percent = memory.validate_percent(percent)
         self.state_path = state_path or default_state_path()
         self.slot = slot
+        self.busy_check = busy_check
+        self.poll_s = poll_s
         self.heartbeat_s = heartbeat_s
         self.idle_min_s = idle_min_s
         self.idle_max_s = idle_max_s
@@ -362,7 +398,7 @@ class Worker:
         self._model = config.llm_model()
         self._status: dict = {
             "state": "idle", "host": None, "device_id": None, "tasks_done": 0, "current_task": None,
-            "error": None, "message": "",
+            "error": None, "message": "", "verification_code": None,
         }
 
     # ---------------------------------------------------------------- status
@@ -401,22 +437,106 @@ class Worker:
     def _connect(self) -> None:
         self._set(state="pairing", message="Connecting to the host…")
         creds = load_credentials(self.state_path)
-        if creds is not None and _matches(creds, self.code):
-            self.client = client_from_credentials(creds, self.code.addresses)
+        if creds is not None and self._creds_match(creds):
+            self.client = client_from_credentials(creds, self._addresses())
             try:
                 self._heartbeat()
             except AuthRejected:
                 self.say("The host no longer knows this device; pairing again with the code…")
                 creds = None
             else:
-                creds["addresses"] = list(dict.fromkeys(list(self.code.addresses) + list(creds.get("addresses") or [])))
+                creds["addresses"] = list(dict.fromkeys(list(self._addresses()) + list(creds.get("addresses") or [])))
                 save_credentials(self.state_path, creds)
-        if creds is None or not _matches(creds, self.code):
-            creds = pair(self.code, self.name)
+        if creds is None or not self._creds_match(creds):
+            creds = pair(self.code, self.name) if self.code is not None else self._request_pairing()
+            if creds is None:  # stopped while waiting for approval
+                raise _Stopped()
             save_credentials(self.state_path, creds)
             self.client = client_from_credentials(creds)
             self.say(f"Paired with {creds['host_name']} as device #{creds['device_id']}.")
         self._set(host=creds.get("host_name"), device_id=int(creds["device_id"]))
+
+    def _addresses(self) -> tuple[str, ...]:
+        return self.code.addresses if self.code is not None else self.host.addresses  # type: ignore[union-attr]
+
+    def _creds_match(self, creds: dict) -> bool:
+        if self.code is not None:
+            return _matches(creds, self.code)
+        assert self.host is not None
+        return int(creds["port"]) == self.host.port and bytes.fromhex(creds["fingerprint"]).startswith(self.host.fp_prefix)
+
+    def _request_pairing(self) -> dict | None:
+        """Ask the discovered host for pairing; the user compares the number and clicks Allow there."""
+        host = self.host
+        assert host is not None
+        client = HostClient(host.addresses, host.port, host.fp_prefix)
+        client_nonce = secrets.token_bytes(16)
+        status, data = client.call("POST", "/cluster/v1/pair-request", {
+            "name": self.name, "platform": device_platform(), "ram_total_bytes": int(psutil.virtual_memory().total),
+            "client_commit": cluster._b64url(hashlib.sha256(client_nonce).digest()),
+        }, signed=False)
+        if status != 200:
+            raise WorkerError(data.get("error") or f"The host refused the pairing request (HTTP {status})")
+        host_nonce = cluster._from_b64url(data.get("host_nonce"), 16)
+        rid = data.get("request_id")
+        if host_nonce is None or isinstance(rid, bool) or not isinstance(rid, int) or client.peer_fingerprint is None:
+            raise WorkerError("The host sent an invalid answer to the pairing request")
+        fingerprint = client.peer_fingerprint  # the full certificate digest, pinned from now on
+        code = cluster.verification_code(fingerprint, client_nonce, host_nonce)
+        self._set(state="awaiting_approval", verification_code=code,
+                  message=f"Check that {host.name} shows {code}, then click Allow there.")
+        poll = HostClient([client.address or host.addresses[0], *host.addresses], host.port, fingerprint)
+        deadline = time.monotonic() + cluster.REQUEST_TTL_S + 60
+        while not self._stop.is_set():
+            try:
+                status, data = poll.call("POST", "/cluster/v1/pair-status",
+                                         {"request_id": rid, "client_nonce": cluster._b64url(client_nonce)}, signed=False)
+            except HostUnreachable:
+                if time.monotonic() > deadline:
+                    raise
+                self._wait(self.poll_s)
+                continue
+            state = data.get("state")
+            if status == 404 or state == "expired":
+                raise WorkerError("Nobody allowed the pairing request on the host in time (2 minutes). Try again "
+                                  "and click Allow on the host.")
+            if status != 200:
+                raise WorkerError(data.get("error") or f"Pairing failed (HTTP {status})")
+            if state == "denied":
+                raise WorkerError(f"{host.name} declined the pairing request.")
+            if state == "approved":
+                try:
+                    device_id = int(data["device_id"])
+                    key = base64.b64decode(data["device_key"], validate=True)
+                except (KeyError, TypeError, ValueError, binascii.Error) as exc:
+                    raise WorkerError("The approval was already used; start pairing again.") from exc
+                if len(key) != 32:
+                    raise WorkerError("The host sent an invalid pairing answer")
+                self._set(verification_code=None)
+                return {
+                    "version": 1,
+                    "host_name": cluster.clean_text(data.get("host_name") or host.name, 64),
+                    "addresses": list(dict.fromkeys([poll.address or host.addresses[0], *host.addresses])),
+                    "port": host.port,
+                    "fingerprint": fingerprint.hex(),
+                    "device_id": device_id,
+                    "device_key": base64.b64encode(key).decode("ascii"),
+                    "name": self.name,
+                    "paired_at": db.utcnow(),
+                }
+            self._wait(self.poll_s)
+        return None
+
+    def _refresh_addresses(self) -> None:
+        """After a network change the host may have a new address: take it from its beacons."""
+        if self.client is None:
+            return
+        prefix = self.client.pin.hex()[:16]
+        for host in cluster.nearby_hosts():
+            if host["fingerprint_short"] == prefix and host["port"] == self.client.port:
+                for address in host["addresses"]:
+                    if address not in self.client.addresses:
+                        self.client.addresses.insert(0, address)
 
     def _heartbeat(self) -> dict:
         assert self.client is not None
@@ -453,6 +573,8 @@ class Worker:
         status, data = self.client.call("POST", "/cluster/v1/claim", {
             "context_chars": plan.context_chars, "max_tokens": plan.max_tokens, "model": self._model,
         })
+        if status == 429:
+            return None  # the host asks us to slow down; the idle back-off handles it
         if status != 200:
             raise HostRejected(status, data.get("error") or f"Claim failed (HTTP {status})")
         task = data.get("task")
@@ -497,25 +619,25 @@ class Worker:
             self._current = None
             self._status["current_task"] = None
 
-    def _process(self, task: dict, url: str) -> None:
+    def _process(self, task: dict, url: str, plan: memory.MemoryPlan) -> None:
         with self._lock:
             self._current = task
         try:
-            self._process_inner(task, url)
+            self._process_inner(task, url, plan)
         except Exception:
             self._clear_current()
             raise
         # KeyboardInterrupt/SystemExit keep _current so stop() can hand the task back.
         self._clear_current()
 
-    def _process_inner(self, task: dict, url: str) -> None:
+    def _process_inner(self, task: dict, url: str, plan: memory.MemoryPlan) -> None:
         tid = task["task_id"]
         self._set(state="working", error=None, current_task={"id": tid, "title": task.get("title"),
                                                              "project_id": task.get("project_id")},
                   message=f"Working on task #{tid}: {cluster.clean_text(task.get('title', ''), 80)}")
         started = time.monotonic()
         try:
-            answer = llm.chat(self._messages(task), max_tokens=int(task.get("max_tokens") or 512),
+            answer = llm.chat(self._messages(task), max_tokens=effective_max_tokens(task, plan),
                               temperature=float(task.get("temperature", 0.2)), url=url)
         except llm.LLMError as exc:
             if self._is_abandoned(tid):
@@ -541,56 +663,73 @@ class Worker:
         with self._lock:
             return task_id in self._abandoned or self._stop.is_set()
 
+    def _waiting_for_model(self, reason: str, delay: float) -> float:
+        self._set(state="idle", error=reason, message="Waiting for a local model…")
+        self._wait(delay)
+        return min(delay * 2, MODEL_RETRY_MAX_S)
+
+    def _hand_back(self, task: dict, reason: str) -> None:
+        try:
+            self._report(f"/cluster/v1/tasks/{task['task_id']}/fail", {"error": reason, "release": True})
+        except WorkerError as exc:
+            log.warning("Could not hand task #%s back: %s", task["task_id"], exc)
+        self._clear_current()
+
     def _work_loop(self) -> None:
-        url = cluster.local_llm_url()
-        delay = self.idle_min_s
+        url: str | None = None  # looked up lazily: the local engine may need a while (or a model install)
+        delay = model_delay = self.idle_min_s
         while not self._stop.is_set():
             plan = memory.plan(self.percent)
             if not plan.can_run:
                 self._set(state="idle", message=plan.reason)
                 self._wait(self.idle_max_s)
                 continue
+            if url is None:
+                try:
+                    url = cluster.local_llm_url(MODEL_START_TIMEOUT_S)
+                except Exception as exc:  # engine.EngineError: no model installed, paused for a media job, …
+                    model_delay = self._waiting_for_model(f"No local model is ready yet: {exc}", model_delay)
+                    continue
             if not _model_reachable(url):
-                self._set(state="error", error=f"The local model at {llm.redact_url(url)} is not reachable; "
-                                               "start it (Models & Settings) – retrying.")
+                model_delay = self._waiting_for_model(
+                    f"The local model at {llm.redact_url(url)} is not reachable yet.", model_delay)
+                url = None
+                continue
+            model_delay = self.idle_min_s
+            busy = self.busy_check()  # do not even claim while this computer is busy
+            if busy:
+                self._set(state="idle", message=f"Waiting: {busy}")
                 self._wait(delay)
                 delay = min(delay * 2, self.idle_max_s)
-                try:
-                    url = cluster.local_llm_url()
-                except Exception as start_exc:  # engine errors are reported, then retried
-                    self._set(error=f"Could not start the local model: {start_exc}")
                 continue
-            task = None
             try:
-                with self.slot(f"helping {self._status.get('host') or 'another device'} (worker)"):
-                    if self._stop.is_set():
-                        break
-                    task = self._claim(plan)
-                    if task is not None:
-                        self._process(task, url)
-            except db.Busy as exc:
-                self._set(state="idle", message=f"Waiting: {exc}")
-            except ModelUnavailable as exc:
-                self._set(state="error", error=f"Local model not reachable: {exc}")
-                self._wait(delay)
-                delay = min(delay * 2, self.idle_max_s)
-                try:
-                    url = cluster.local_llm_url()
-                except Exception as start_exc:  # engine errors are reported, then retried
-                    self._set(error=f"Could not start the local model: {start_exc}")
-                continue
+                task = self._claim(plan)
             except (HostUnreachable, HostRejected) as exc:
                 self._set(state="error", error=str(exc))
-            if task is None:
-                if self._status.get("state") != "error":
-                    self._set(state="idle", current_task=None)
+                self._refresh_addresses()
                 self._wait(delay)
                 delay = min(delay * 2, self.idle_max_s)
-            else:
-                delay = self.idle_min_s
-                with self._lock:
-                    if self._status["state"] == "error":
-                        self._status["state"] = "idle"
+                continue
+            if task is None:
+                self._set(state="idle", error=None, current_task=None)
+                self._wait(delay)
+                delay = min(delay * 2, self.idle_max_s)
+                continue
+            delay = self.idle_min_s
+            with self._lock:
+                self._current = task  # from now on stop() hands it back
+            try:
+                with self.slot(f"helping {self._status.get('host') or 'another device'} (worker)"):
+                    self._process(task, url, plan)
+            except db.Busy as exc:  # the slot was taken between the check and the claim
+                self._hand_back(task, f"The helper became busy: {exc}")
+                self._set(state="idle", message=f"Handed task #{task['task_id']} back: {exc}")
+            except ModelUnavailable as exc:
+                url = None
+                self._set(state="idle", error=f"Local model not reachable: {exc}", message="Waiting for a local model…")
+            except (HostUnreachable, HostRejected) as exc:
+                self._set(state="error", error=str(exc))
+                self._refresh_addresses()
 
     def run(self) -> int:
         """Blocks until stopped. 0 = stopped cleanly, 1 = fatal error (see status()['error'])."""
@@ -605,6 +744,8 @@ class Worker:
             return 0
         except KeyboardInterrupt:
             self.stop("Worker stopped (Ctrl+C) before finishing this task")
+            return 0
+        except _Stopped:
             return 0
         except (WorkerError, ValueError) as exc:
             if self._stop.is_set():
@@ -648,7 +789,11 @@ def run_cli(args: Any) -> int:
         print(f"Error: {exc}", file=sys.stderr)
         return 2
     say(f"Joining as '{worker.name}' (RAM budget {worker.percent}%). Press Ctrl+C to stop.")
-    return worker.run()
+    cluster.start_discovery_listener()  # finds the host again if its address changes
+    try:
+        return worker.run()
+    finally:
+        cluster.stop_discovery_listener()
 
 
 _APP_LOCK = threading.Lock()
@@ -656,13 +801,14 @@ _APP_WORKER: Worker | None = None
 _APP_THREAD: threading.Thread | None = None
 
 
-def start_app_worker(code: object, name: object = None, percent: object = memory.DEFAULT_PERCENT) -> dict:
+def start_app_worker(code: object, name: object = None, percent: object = memory.DEFAULT_PERCENT,
+                     host: cluster.NearbyHost | None = None) -> dict:
     """Run a worker in a background thread of the app (``POST /api/cluster/join``)."""
     global _APP_WORKER, _APP_THREAD
     with _APP_LOCK:
         if _APP_THREAD is not None and _APP_THREAD.is_alive() and _APP_WORKER and not _APP_WORKER.stopped:
             raise db.Busy("This computer is already helping another device. Leave first.")
-        worker = Worker(code, name, percent)
+        worker = Worker(code, name, percent, host=host)
         thread = threading.Thread(target=worker.run, name="lowram-app-worker", daemon=True)
         _APP_WORKER, _APP_THREAD = worker, thread
         thread.start()

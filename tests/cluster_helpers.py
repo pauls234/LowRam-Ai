@@ -28,6 +28,17 @@ def free_port() -> int:
         return s.getsockname()[1]
 
 
+def free_udp_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def result_meta(task: dict) -> dict:
+    """The JSON sidecar next to a task's stored result."""
+    return json.loads(Path(task["result_path"]).with_suffix(".json").read_text())
+
+
 def null_slot(label: str):
     """Workers in the same process as the host must not share its inference slot."""
     return contextlib.nullcontext()
@@ -54,13 +65,20 @@ class ClusterTestCase(AppTestCase):
         super().setUp()
         if not HAS_OPENSSL:
             self.skipTest("the openssl CLI is not installed")
-        for target, value in (("LAN_BIND_HOST", "127.0.0.1"), ("COORDINATOR_INTERVAL_S", 0.05)):
+        self.discovery_port = free_udp_port()
+        for target, value in (
+            ("LAN_BIND_HOST", "127.0.0.1"), ("COORDINATOR_INTERVAL_S", 0.05), ("CLAIM_MIN_INTERVAL_S", 0.0),
+            ("MAX_CONNECTIONS_PER_IP", 16), ("DISCOVERY_PORT", self.discovery_port), ("DISCOVERY_BIND", "127.0.0.1"),
+            ("BEACON_INTERVAL_S", 0.05), ("BEACON_MIN_GAP_S", 0.0),
+            ("lan_addresses", lambda: ["127.0.0.1"]),
+            # Broadcast does not work in every sandbox: beacons go straight to the local listener,
+            # which (unlike in real life) also lists this very host so it can join itself.
+            ("_beacon_targets", lambda: [("127.0.0.1", self.discovery_port)]),
+            ("_listener_own_id", lambda: "not-this-host"),
+        ):
             patcher = mock.patch.object(cluster, target, value)
             patcher.start()
             self.addCleanup(patcher.stop)
-        patcher = mock.patch.object(cluster, "lan_addresses", lambda: ["127.0.0.1"])
-        patcher.start()
-        self.addCleanup(patcher.stop)
         self.addCleanup(cluster.reset)
         settings.update("cluster", {"port": free_port()})
         install_certificate()
@@ -99,8 +117,8 @@ class ClusterTestCase(AppTestCase):
             conn.close()
 
     def make_worker(self, code: str, name: str, **kw) -> worker.Worker:
-        options = dict(state_path=self.tmp / f"worker-{name}.json", slot=null_slot,
-                       heartbeat_s=0.2, idle_min_s=0.02, idle_max_s=0.1)
+        options = dict(state_path=self.tmp / f"worker-{name}.json", slot=null_slot, busy_check=lambda: None,
+                       heartbeat_s=0.2, idle_min_s=0.02, idle_max_s=0.1, poll_s=0.05)
         options.update(kw)
         return worker.Worker(code, name, 40, **options)
 
