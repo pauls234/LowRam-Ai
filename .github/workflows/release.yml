@@ -121,6 +121,7 @@ jobs:
         with:
           files: release/*.zip
           generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
           body: |
             **macOS (Apple Silicon):** download `LowRAM-AI-…-macOS-arm64.zip`, double-click it and drag
             **LowRAM AI** into *Applications*. The app is not signed by Apple yet, so the first start needs
