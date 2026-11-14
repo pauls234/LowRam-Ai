@@ -25,6 +25,7 @@ DEFAULTS: dict[str, Any] = {
         "port": None,  # None = pick a free port
         "ctx_size": None,  # None = derive from the RAM budget
         "models_dir": None,  # None = <home>/models; or an absolute folder, e.g. on an external SSD
+        "profile": "auto",  # "auto" | "saver" | "fast" – llama-server tuning (KV cache, flash attention, context)
     },
     "media": {
         "image_model_id": None,

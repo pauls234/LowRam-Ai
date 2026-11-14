@@ -259,6 +259,26 @@ would have a different certificate and therefore a different number.
 
 **Models**: catalog gets `default_for: ["chat"|"code"|"general"]` hints; on first run with purpose "coding" the wizard recommends a Coder model that fits; catalog install failure "file not found" triggers self-healing: look up the repo tree via the HF API and offer the best matching Q4_K_M GGUF file (`POST /api/engine/models/<id>/install` returns 409 `{suggestion: {filename, size_bytes}}`, UI offers one-click retry with `{filename}`).
 
+### Low-RAM power round v0.4 (binding)
+
+**Engine turbo (`engine.py`)**
+* Detect the flags the installed llama-server supports (parse `llama-server --help` once per binary, cached like the version) and only pass supported ones.
+* Profiles `settings.engine.profile`: `"auto"` (default) | `"saver"` | `"fast"`. auto/saver: flash attention on (`-fa on` or `--flash-attn` depending on the help text), KV cache `q8_0` for K and V (`--cache-type-k/--cache-type-v`, only with flash attention), `--cache-reuse 256` (prompt prefix reuse across chat turns); context size derived from free RAM after the model file size (KV q8_0 ≈ half of f16), clamped 4096..32768 (saver: ≤8192); fast: f16 KV, larger `-b/-ub` batch if supported. Never pass a flag the binary lacks.
+* `GET /api/engine/status` → `server.tuning: {profile, flash_attn, kv_cache, ctx_size, cache_reuse}` and `server.restarts`.
+* Supervisor: if the managed llama-server crashes after being ready, restart it automatically with back-off (max 3 restarts per 10 minutes, then state error); never during shutdown or while paused.
+* Interrupted model downloads (a `.part` file plus a known pending install recorded in `<home>/pending_installs.json`) resume automatically at startup.
+* `GET /api/engine/search?q=text&limit=20` → `{models: [{repo, downloads, likes, updated, license|null}]}` via `https://huggingface.co/api/models?search=…&filter=gguf&sort=downloads&limit=…` (https, allow-list, 8 s timeout, cache 10 min); then `custom/resolve` lists the files with fits_ram.
+
+**Long-chat memory (`chat.py`)**
+* When a conversation no longer fits the context budget, older turns are summarised by the model (≤ 1200 chars, German if the chat is German) instead of being dropped; stored as `conversations.summary` + `summarized_until` (message id) and put into the system prompt as "Zusammenfassung des bisherigen Gesprächs". The summarisation runs inside the same stream before the answer and emits `{"type":"status","text":"Fasse ältere Nachrichten zusammen…"}`. `GET /api/chats/<id>` includes `summary`. Failure to summarise falls back to dropping (never blocks the answer).
+
+**Big jobs on small RAM (`autosplit.py`)**
+* `POST /api/autosplit {goal (≤4000 chars), percent?, max_tasks? (2..12, default 8), distribute?: bool}` → 202 `{project, tasks}`: the model plans independent subtasks (JSON), a general project is created with them plus merge enabled (`cluster` distribute with `merge: true`; works without other devices – the host's own loop processes the tasks), and the loop starts. Each subtask gets the goal as context. `GET /api/cluster/projects/<id>/final` delivers the combined result as before.
+
+**Coding like Claude Code (`agent.py`, `api_coding.py`)**
+* Exploration: during a step the model may answer `{"need_files": ["rel/path", …]}` (max 2 extra rounds, max 6 files, same path validation, within the context budget) before it must return the proposal.
+* Test & fix loop: `POST /api/coding/projects/<pid>/test-command {command}` → `{command}` (≤300 chars, `shlex.split`, first token must resolve via PATH or be a relative path inside the repo; stored per project). `POST /api/coding/projects/<pid>/run-tests {}` → 202 `{run}`; `GET /api/coding/projects/<pid>/test-runs/<rid>` → `{run: {id, state: running|passed|failed|error|timeout, exit_code, output_tail (≤20 000 chars), started_at, finished_at}}`; `POST /api/coding/projects/<pid>/fix-tests {run_id}` → 201 `{task_id}` adds a step "Fehlschlagende Tests beheben" with the output tail as detail. Commands run ONLY after an explicit user request, never from model output: argument list, no shell, cwd = repo, timeout 10 min, environment without secrets, process group killed on timeout, one run at a time per project.
+
 ### Desktop (`desktop/launcher.py`)
 
 `main(argv) -> int`: pick a port (prefer 8765), `app.start_background(port)`,
