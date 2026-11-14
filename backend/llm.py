@@ -40,6 +40,9 @@ DEFAULT_FIRST_TOKEN_TIMEOUT_S = 1800.0
 DEFAULT_IDLE_TOKEN_TIMEOUT_S = 300.0
 MAX_TIMEOUT_S = 24 * 3600.0
 MIN_TIMEOUT_S = 0.1
+MAX_FIRST_TOKEN_TIMEOUT_S = 3600.0  # larger settings values are clamped (a stuck request must end)
+MAX_REQUEST_S = 3 * 3600.0  # wall-clock cap per request, whatever the server sends
+REQUEST_LIMIT_MESSAGE = "Die Anfrage hat das Zeitlimit von 3 Stunden überschritten"
 ENGINE_TOUCH_INTERVAL_S = 10.0
 TRANSIENT_HTTP_STATUS = frozenset({502, 503})  # engine restarting / still loading the model
 _STREAM_REJECT_STATUS = frozenset({400, 404, 405, 415, 422, 501})
@@ -164,10 +167,41 @@ def token_timeouts() -> tuple[float, float]:
         values = {}
     if not isinstance(values, dict):
         values = {}
-    return (
-        _positive_seconds(values.get("first_token_timeout_s"), DEFAULT_FIRST_TOKEN_TIMEOUT_S),
-        _positive_seconds(values.get("idle_token_timeout_s"), DEFAULT_IDLE_TOKEN_TIMEOUT_S),
-    )
+    global _first_token_clamp_logged
+    first = _positive_seconds(values.get("first_token_timeout_s"), DEFAULT_FIRST_TOKEN_TIMEOUT_S)
+    if first > MAX_FIRST_TOKEN_TIMEOUT_S:
+        if not _first_token_clamp_logged:
+            _first_token_clamp_logged = True
+            log.warning("first_token_timeout_s=%g is above the maximum; using %g s", first, MAX_FIRST_TOKEN_TIMEOUT_S)
+        first = MAX_FIRST_TOKEN_TIMEOUT_S
+    return first, _positive_seconds(values.get("idle_token_timeout_s"), DEFAULT_IDLE_TOKEN_TIMEOUT_S)
+
+
+_first_token_clamp_logged = False
+
+
+def _limit_error() -> LLMError:
+    return LLMError(REQUEST_LIMIT_MESSAGE, transient=False)
+
+
+def _start_watchdog(response, deadline: float, state: dict, lock: threading.Lock | None = None,
+                    finished: threading.Event | None = None) -> threading.Timer:
+    """Close ``response`` at ``deadline`` (``MAX_REQUEST_S`` after the request started) and mark ``state``."""
+
+    def fire() -> None:
+        if lock is None:
+            state["over_limit"] = True
+            _interrupt(response)
+            return
+        with lock:
+            if not (finished is not None and finished.is_set()):
+                state["over_limit"] = True
+                _interrupt(response)
+
+    timer = threading.Timer(max(0.0, deadline - time.monotonic()), fire)
+    timer.daemon = True
+    timer.start()
+    return timer
 
 
 _touch_lock = threading.Lock()
@@ -363,13 +397,22 @@ def _chat_plain(messages: list[dict], *, max_tokens: int, temperature: float, ur
         url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST"
     )
     _touch_engine(force=True)
+    started, state = time.monotonic(), {}
     try:
-        with _opener(parsed.hostname).open(request, timeout=timeout) as response:
-            raw = response.read(MAX_RESPONSE_BYTES + 1)
+        with _opener(parsed.hostname).open(request, timeout=min(timeout, MAX_REQUEST_S)) as response:
+            watchdog = _start_watchdog(response, started + MAX_REQUEST_S, state)
+            try:
+                raw = response.read(MAX_RESPONSE_BYTES + 1)
+            finally:
+                watchdog.cancel()
     except (OSError, http.client.HTTPException, ValueError) as exc:
+        if state.get("over_limit") or time.monotonic() - started >= MAX_REQUEST_S:
+            raise _limit_error() from exc
         raise _request_error(exc, shown_url, timeout, api_key) from exc
     finally:
         _touch_engine(force=True)
+    if state.get("over_limit"):
+        raise _limit_error()
     _, choice = _parse_completion(raw)
     content = choice["message"]["content"]
     if not isinstance(content, str):
@@ -497,6 +540,8 @@ def _sse_fields(response, stop_event: threading.Event | None, outcome: dict) -> 
         try:
             line = response.readline(MAX_STREAM_LINE_BYTES + 1)
         except (OSError, http.client.HTTPException, ValueError) as exc:
+            if outcome.get("over_limit"):
+                raise _limit_error() from exc
             if stop_event is not None and stop_event.is_set():
                 return
             if isinstance(exc, (TimeoutError, socket.timeout)):
@@ -505,6 +550,8 @@ def _sse_fields(response, stop_event: threading.Event | None, outcome: dict) -> 
                 raise LLMError(f"The model endpoint sent nothing for {waited:g} s{hint}; giving up",
                                transient=True) from exc
             raise LLMError(f"The connection to the model endpoint was interrupted ({exc})", transient=True) from exc
+        if outcome.get("over_limit"):
+            raise _limit_error()
         if not line:
             return
         total += len(line)
@@ -535,6 +582,8 @@ def _read_json_answer(response, outcome: dict) -> str:
     try:
         raw = response.read(MAX_RESPONSE_BYTES + 1)
     except (OSError, http.client.HTTPException, ValueError) as exc:
+        if outcome.get("over_limit"):
+            raise _limit_error() from exc
         if isinstance(exc, (TimeoutError, socket.timeout)):
             raise LLMError(f"The model endpoint did not answer within {outcome['timeout']:g} s",
                            transient=True) from exc
@@ -635,7 +684,9 @@ def stream_chat(
     error).
 
     ``timeout`` (default ``LOWRAM_LLM_TIMEOUT``) applies until the first
-    token; ``idle_timeout`` (default: the same) between later tokens.
+    token; ``idle_timeout`` (default: the same) between later tokens. No
+    request runs longer than ``MAX_REQUEST_S`` (3 h) in total: then the
+    connection is closed and a non-transient ``LLMError`` is raised.
 
     ``stats`` (optional dict) is filled when the generator ends, also on
     stop or error: ``tokens`` (server-reported ``usage.completion_tokens`` if
@@ -661,13 +712,20 @@ def stream_chat(
     )
     timeout = config.llm_timeout() if timeout is None else timeout
     _touch_engine(force=True)
-    response = _open_stream(request, parsed.hostname, shown_url, timeout, api_key)
+    started = time.monotonic()
+    try:
+        response = _open_stream(request, parsed.hostname, shown_url, min(timeout, MAX_REQUEST_S), api_key)
+    except LLMError as exc:
+        if time.monotonic() - started >= MAX_REQUEST_S:
+            raise _limit_error() from exc
+        raise
     finished, lock = threading.Event(), threading.Lock()
     if stop_event is not None:
         threading.Thread(
             target=_watch_stop, args=(stop_event, finished, lock, response), name="lowram-llm-stop", daemon=True
         ).start()
     outcome: dict = {"complete": False, "timeout": timeout, "idle_timeout": idle_timeout}
+    watchdog = _start_watchdog(response, started + MAX_REQUEST_S, outcome, lock, finished)
     try:
         content_type = (response.headers.get("Content-Type") or "").split(";")[0].strip().lower()
         visible: list[str] = []
@@ -683,6 +741,8 @@ def stream_chat(
             for piece in _stream_deltas(response, stop_event, api_key, outcome):
                 visible.append(piece)
                 yield piece
+        if not outcome["complete"] and outcome.get("over_limit"):
+            raise _limit_error()
         if stop_event is not None and stop_event.is_set():
             return
         if not outcome["complete"]:
@@ -690,6 +750,7 @@ def stream_chat(
         if not _without_reasoning("".join(visible)):
             raise LLMError("The model returned an empty answer")
     finally:
+        watchdog.cancel()
         with lock:
             finished.set()
             try:

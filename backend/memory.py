@@ -161,8 +161,8 @@ def guard_wait(
 
 # --------------------------------------------------------------------------- memory pressure
 
-PRESSURE_INTERVAL_S = 3.0
-MAC_PRESSURE_CACHE_S = 3.0
+PRESSURE_INTERVAL_S = 3.0  # while something runs (db.busy_reason(): inference, loop task, media job)
+PRESSURE_IDLE_INTERVAL_S = 20.0  # otherwise: spare the battery
 SYSCTL_TIMEOUT_S = 2.0
 SWAP_WINDOW_S = 60.0
 SWAP_WARN_MB_PER_MIN = 64.0
@@ -175,6 +175,18 @@ _swap_history: deque[tuple[float, int]] = deque()
 _latest: tuple[float, dict] | None = None
 _mac_cache: tuple[float, str | None] | None = None
 _mac_unsupported = False
+_cadence = PRESSURE_INTERVAL_S  # current sampling interval; the macOS sysctl cache follows it
+
+
+def _something_active() -> bool:
+    """Is an inference, loop task or media job running? (``db.busy_reason()``; unknown counts as busy)"""
+    try:
+        from . import db  # lazy: plain RAM planning does not need the database
+
+        return db.busy_reason() is not None
+    except Exception:  # noqa: BLE001 - cannot tell: keep watching closely
+        log.debug("Could not read the busy state", exc_info=True)
+        return True
 
 
 def _is_macos() -> bool:
@@ -186,13 +198,16 @@ def _sysctl() -> str:
 
 
 def mac_pressure_level() -> str | None:
-    """macOS ``kern.memorystatus_vm_pressure_level`` as ok/warn/critical (cached 3 s); None elsewhere."""
+    """macOS ``kern.memorystatus_vm_pressure_level`` as ok/warn/critical; None elsewhere.
+
+    Cached for the sampler's current interval (3 s while busy, 20 s idle).
+    """
     global _mac_cache, _mac_unsupported
     if _mac_unsupported or not _is_macos():
         return None
     with _pressure_lock:
         cached = _mac_cache
-    if cached is not None and time.monotonic() - cached[0] < MAC_PRESSURE_CACHE_S:
+    if cached is not None and time.monotonic() - cached[0] < _cadence:
         return cached[1]
     level = None
     try:
@@ -269,11 +284,11 @@ def pressure() -> dict:
     """Current memory pressure for the UI (``GET /api/memory``).
 
     While the background sampler runs, its latest sample is returned (at most
-    two intervals old); otherwise the pressure is measured now.
+    two of its current intervals old); otherwise the pressure is measured now.
     """
     with _pressure_lock:
         latest = _latest
-    if sampler_running() and latest is not None and time.monotonic() - latest[0] <= 2 * PRESSURE_INTERVAL_S:
+    if sampler_running() and latest is not None and time.monotonic() - latest[0] <= 2 * _cadence:
         return dict(latest[1])
     return sample_pressure()
 
@@ -282,13 +297,16 @@ _sampler_lock = threading.Lock()
 _sampler: tuple[threading.Thread, threading.Event] | None = None
 
 
-def _sample_forever(stop: threading.Event, interval: float) -> None:
+def _sample_forever(stop: threading.Event, interval: float, idle_interval: float) -> None:
+    """Sample every ``interval`` while something runs, else every ``idle_interval`` (battery)."""
+    global _cadence
     while not stop.is_set():
+        _cadence = interval if _something_active() else idle_interval
         try:
             sample_pressure()
         except Exception:  # noqa: BLE001 - keep sampling; the UI falls back to a direct measurement
             log.debug("Memory pressure sample failed", exc_info=True)
-        stop.wait(interval)
+        stop.wait(_cadence)
 
 
 def sampler_running() -> bool:
@@ -296,15 +314,16 @@ def sampler_running() -> bool:
         return _sampler is not None and _sampler[0].is_alive()
 
 
-def start_pressure_sampler(interval: float = PRESSURE_INTERVAL_S) -> threading.Thread:
+def start_pressure_sampler(interval: float = PRESSURE_INTERVAL_S,
+                           idle_interval: float = PRESSURE_IDLE_INTERVAL_S) -> threading.Thread:
     """Start the background sampler (idempotent: a running sampler is reused)."""
     global _sampler
     with _sampler_lock:
         if _sampler is not None and _sampler[0].is_alive():
             return _sampler[0]
         stop = threading.Event()
-        thread = threading.Thread(target=_sample_forever, args=(stop, interval), name="lowram-memory-pressure",
-                                  daemon=True)
+        thread = threading.Thread(target=_sample_forever, args=(stop, interval, idle_interval),
+                                  name="lowram-memory-pressure", daemon=True)
         _sampler = (thread, stop)
         thread.start()
         return thread
@@ -312,7 +331,7 @@ def start_pressure_sampler(interval: float = PRESSURE_INTERVAL_S) -> threading.T
 
 def stop_pressure_sampler(timeout: float = 5.0) -> None:
     """Stop the background sampler (no-op when it is not running)."""
-    global _sampler
+    global _sampler, _cadence
     with _sampler_lock:
         current, _sampler = _sampler, None
     if current is None:
@@ -321,6 +340,7 @@ def stop_pressure_sampler(timeout: float = 5.0) -> None:
     stop.set()
     if thread is not threading.current_thread():
         thread.join(timeout)
+    _cadence = PRESSURE_INTERVAL_S
 
 
 @web.on_startup
