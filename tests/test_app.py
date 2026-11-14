@@ -145,7 +145,8 @@ class SecurityTests(AppTestCase):
         self.assertEqual(self.api("GET", "/nope")[0], 404)
         self.assertEqual(self.api("POST", "/nope")[0], 404)
         self.assertEqual(self.api("GET", "/api/projects/abc")[0], 404)
-        self.assertEqual(self.api("GET", "/api/recover")[0], 404)  # POST-only
+        self.assertEqual(self.api("GET", "/api/recover")[0], 405)  # POST-only route
+        self.assertEqual(self.api("DELETE", "/api/projects")[0], 405)
 
 
 class ProjectApiTests(AppTestCase):

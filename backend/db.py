@@ -19,7 +19,7 @@ import os
 import socket
 import sqlite3
 import time
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
@@ -72,6 +72,22 @@ CREATE TABLE IF NOT EXISTS locks (
 """
 
 
+_EXTRA_SCHEMAS: list[str] = []
+_OWNER_CHECKS: dict[str, Callable[[str], bool]] = {}
+REMOTE_OWNER_PREFIX = "device:"
+
+
+def register_schema(sql: str) -> None:
+    """Feature modules add their own ``CREATE TABLE IF NOT EXISTS`` statements."""
+    if sql not in _EXTRA_SCHEMAS:
+        _EXTRA_SCHEMAS.append(sql)
+
+
+def register_owner_check(prefix: str, check: Callable[[str], bool]) -> None:
+    """Liveness check for non-process lease owners, e.g. ``device:<id>`` leases."""
+    _OWNER_CHECKS[prefix] = check
+
+
 class NotFound(LookupError):
     """A project or task id does not exist."""
 
@@ -111,6 +127,11 @@ def _owner_alive(owner: str | None) -> bool:
     """
     if not owner:
         return False
+    for prefix, check in _OWNER_CHECKS.items():
+        if owner.startswith(prefix):
+            return check(owner)
+    if owner.startswith(REMOTE_OWNER_PREFIX):
+        return True  # no checker registered yet: never steal a remote lease
     parts = owner.rsplit(":", 2)
     try:
         pid = int(parts[1])
@@ -141,7 +162,9 @@ def connect() -> Iterator[sqlite3.Connection]:
         conn.execute("PRAGMA busy_timeout = 15000")
         conn.execute("PRAGMA journal_mode = WAL")
         conn.executescript(SCHEMA)
-        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        for extra in _EXTRA_SCHEMAS:
+            conn.executescript(extra)
+        version =conn.execute("PRAGMA user_version").fetchone()[0]
         if version == 0:
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         elif version > SCHEMA_VERSION:
@@ -164,10 +187,16 @@ def _transaction(conn: sqlite3.Connection) -> Iterator[None]:
     conn.execute("COMMIT")
 
 
+transaction = _transaction  # public alias for feature modules (BEGIN IMMEDIATE … COMMIT)
+
+
 def _task_dict(row: sqlite3.Row) -> dict:
     data = dict(row)
     data["has_result"] = bool(data.get("result_path"))
     return data
+
+
+task_dict = _task_dict  # public alias
 
 
 def _empty_counts() -> dict[str, int]:
@@ -286,7 +315,12 @@ def tasks_with_status(project_id: int, statuses: Iterable[str]) -> list[dict]:
 
 
 def _busy_reason(conn: sqlite3.Connection) -> str | None:
-    row = conn.execute("SELECT id FROM tasks WHERE status = 'running' ORDER BY id LIMIT 1").fetchone()
+    """Is THIS machine's inference slot taken? Tasks leased to other devices don't count."""
+    row = conn.execute(
+        "SELECT id FROM tasks WHERE status = 'running' AND (lease_owner IS NULL OR lease_owner NOT LIKE ?) "
+        "ORDER BY id LIMIT 1",
+        (REMOTE_OWNER_PREFIX + "%",),
+    ).fetchone()
     if row is not None:
         return f"Task #{row['id']} is already running. LowRAM AI runs one inference at a time."
     lock = conn.execute("SELECT owner, label FROM locks WHERE name = ?", (INFERENCE_LOCK,)).fetchone()

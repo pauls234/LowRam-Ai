@@ -1,0 +1,141 @@
+name: Release desktop app
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    name: macOS app (arm64)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt -r requirements-desktop.txt
+      - name: Run tests
+        run: python -m unittest discover -s tests -v
+      - name: Build LowRAM AI.app
+        run: bash desktop/build_macos.sh
+      - name: Smoke test (headless)
+        env:
+          LOWRAM_HOME: ${{ runner.temp }}/lowram-home
+        run: |
+          "dist/LowRAM AI.app/Contents/MacOS/LowRAM AI" --headless --port 8799 &
+          pid=$!
+          for _ in $(seq 1 60); do
+            curl -fsS http://127.0.0.1:8799/api/status && break
+            sleep 1
+          done
+          # every feature module must be in the bundle (they are imported by name)
+          curl -fsS http://127.0.0.1:8799/api/status | python -c "import json, sys; from backend import app; s = json.load(sys.stdin); missing = set(app.FEATURE_MODULES) - set(s['features']); sys.exit(f'missing in the bundle: {sorted(missing)}' if missing else 0)"
+          curl -fsS -o /dev/null http://127.0.0.1:8799/api/power
+          curl -fsS http://127.0.0.1:8799/ | grep -q '<title>LowRAM AI'
+          curl -fsS -o /dev/null http://127.0.0.1:8799/static/app.js
+          kill -TERM "$pid"
+          wait "$pid"
+          grep -q "LowRAM AI stopped" "$LOWRAM_HOME/logs/app.log"
+      - name: Show app log
+        if: always()
+        env:
+          LOWRAM_HOME: ${{ runner.temp }}/lowram-home
+        run: cat "$LOWRAM_HOME/logs/app.log" || true
+      - uses: actions/upload-artifact@v7
+        with:
+          name: LowRAM-AI-macOS-arm64
+          path: dist/LowRAM-AI-*-macOS-*.zip
+          if-no-files-found: error
+
+  windows:
+    name: Windows app (x64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt -r requirements-desktop.txt
+      # The full suite is run on Ubuntu/macOS by ci.yml and in the macOS job
+      # above (several tests use POSIX file modes and symlinks); here the
+      # portable launcher tests guard the Windows build.
+      - name: Run desktop tests
+        run: python -m unittest tests.test_desktop -v
+      - name: Build LowRAM AI.exe
+        run: python -m PyInstaller --noconfirm --clean desktop/LowRAM-AI.spec
+      - name: Smoke test (headless)
+        shell: pwsh
+        env:
+          LOWRAM_HOME: ${{ runner.temp }}\lowram-home
+        run: |
+          $exe = Join-Path $PWD "dist\LowRAM AI\LowRAM AI.exe"
+          $proc = Start-Process -FilePath $exe -ArgumentList "--headless", "--port", "8799" -PassThru
+          $status = $null
+          for ($i = 0; $i -lt 60 -and -not $status; $i++) {
+            try { $status = Invoke-RestMethod -Uri http://127.0.0.1:8799/api/status -TimeoutSec 2 } catch { Start-Sleep -Seconds 1 }
+          }
+          if (-not $status.version) { Stop-Process -Id $proc.Id -Force; throw "LowRAM AI did not answer /api/status" }
+          $expected = (python -c "from backend import app; print(' '.join(app.FEATURE_MODULES))").Split(' ')
+          $missing = $expected | Where-Object { $status.features -notcontains $_ }
+          if ($missing) { Stop-Process -Id $proc.Id -Force; throw "Missing in the bundle: $missing" }
+          Invoke-WebRequest -Uri http://127.0.0.1:8799/api/power -UseBasicParsing | Out-Null
+          $index = Invoke-WebRequest -Uri http://127.0.0.1:8799/ -UseBasicParsing
+          if ($index.Content -notmatch "<title>LowRAM AI") { throw "Unexpected index page" }
+          Invoke-WebRequest -Uri http://127.0.0.1:8799/static/app.js -UseBasicParsing | Out-Null
+          Stop-Process -Id $proc.Id -Force
+          "Smoke test passed: version $($status.version)"
+      - name: Show app log
+        if: always()
+        shell: pwsh
+        env:
+          LOWRAM_HOME: ${{ runner.temp }}\lowram-home
+        run: Get-Content "$env:LOWRAM_HOME\logs\app.log" -ErrorAction SilentlyContinue
+      - name: Zip
+        shell: pwsh
+        run: |
+          $version = python -c "import backend; print(backend.__version__)"
+          Compress-Archive -Path "dist\LowRAM AI" -DestinationPath "dist\LowRAM-AI-$version-Windows-x64.zip"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: LowRAM-AI-Windows-x64
+          path: dist/LowRAM-AI-*-Windows-x64.zip
+          if-no-files-found: error
+
+  release:
+    name: GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [macos, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: LowRAM-AI-*
+          path: release
+          merge-multiple: true
+      - run: ls -l release
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: release/*.zip
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          body: |
+            **macOS (Apple Silicon):** download `LowRAM-AI-…-macOS-arm64.zip`, double-click it and drag
+            **LowRAM AI** into *Applications*. The app is not signed by Apple yet, so the first start needs
+            one extra step: right-click the app → **Open** → **Open** (macOS 15+: try to open it once, then
+            *System Settings → Privacy & Security → Open Anyway*). Alternative in Terminal:
+            `xattr -dr com.apple.quarantine "/Applications/LowRAM AI.app"`.
+
+            **Windows:** unzip `LowRAM-AI-…-Windows-x64.zip` and start `LowRAM AI.exe`
+            (SmartScreen: *More info → Run anyway*).
+
+            Details: [docs/DESKTOP.md](https://github.com/${{ github.repository }}/blob/${{ github.ref_name }}/docs/DESKTOP.md)

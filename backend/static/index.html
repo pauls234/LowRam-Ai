@@ -2,228 +2,152 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="lowram-token" content="__LOWRAM_TOKEN__">
   <meta name="color-scheme" content="light dark">
   <meta name="referrer" content="no-referrer">
+  <meta name="theme-color" content="#faf9f5" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#262624" media="(prefers-color-scheme: dark)">
   <title>LowRAM AI</title>
   <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/theme.js"></script>
+  <script src="/static/core.js" defer></script>
+  <script src="/static/markdown.js" defer></script>
+  <script src="/static/downloads.js" defer></script>
+  <script src="/static/chat.js" defer></script>
+  <script src="/static/code.js" defer></script>
+  <script src="/static/media.js" defer></script>
+  <script src="/static/tasks.js" defer></script>
+  <script src="/static/devices.js" defer></script>
+  <script src="/static/settings.js" defer></script>
+  <script src="/static/setup.js" defer></script>
   <script src="/static/app.js" defer></script>
 </head>
 <body>
-  <a class="skip-link" href="#project-detail">Skip to project</a>
+  <svg class="sprite" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" focusable="false">
+    <symbol id="i-logo" viewBox="0 0 24 24"><path d="M9 2.8v2.6M15 2.8v2.6M9 18.6v2.6M15 18.6v2.6M2.8 9h2.6M2.8 15h2.6M18.6 9h2.6M18.6 15h2.6"/><rect x="5.6" y="5.6" width="12.8" height="12.8" rx="3.4"/><rect x="9" y="12.6" width="6" height="2.2" rx="1.1" fill="currentColor" stroke="none"/></symbol>
+    <symbol id="i-sparkle" viewBox="0 0 24 24"><path d="M12 3Q13 11 21 12Q13 13 12 21Q11 13 3 12Q11 11 12 3Z"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+    <symbol id="i-new" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 8v8M8 12h8"/></symbol>
+    <symbol id="i-chat" viewBox="0 0 24 24"><path d="M20.5 12a8.5 8.5 0 0 1-12.3 7.6L3.5 20.5l1-4.4A8.5 8.5 0 1 1 20.5 12Z"/></symbol>
+    <symbol id="i-code" viewBox="0 0 24 24"><path d="M8.5 7 3.5 12l5 5M15.5 7l5 5-5 5M13.5 4.5l-3 15"/></symbol>
+    <symbol id="i-image" viewBox="0 0 24 24"><rect x="3" y="3.5" width="18" height="17" rx="3"/><circle cx="8.5" cy="9" r="1.6"/><path d="m20.5 15.5-5-5L4 20.3"/></symbol>
+    <symbol id="i-video" viewBox="0 0 24 24"><rect x="2.5" y="6" width="13.5" height="12" rx="2.5"/><path d="m16 10.2 5.5-3.2v10l-5.5-3.2"/></symbol>
+    <symbol id="i-tasks" viewBox="0 0 24 24"><path d="m3 6 1.6 1.6L7.5 4.8M3 12l1.6 1.6 2.9-2.8M3 18l1.6 1.6 2.9-2.8M11 6.2h10M11 12.2h10M11 18.2h10"/></symbol>
+    <symbol id="i-devices" viewBox="0 0 24 24"><rect x="2.5" y="4" width="14" height="10.5" rx="2"/><path d="M6.5 18.5h6M9.5 14.5v4"/><rect x="17.5" y="9" width="4.5" height="10.5" rx="1.4"/></symbol>
+    <symbol id="i-sliders" viewBox="0 0 24 24"><path d="M4 6.5h9M17 6.5h3M4 12h3M11 12h9M4 17.5h11M19 17.5h1"/><circle cx="15" cy="6.5" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="17" cy="17.5" r="2"/></symbol>
+    <symbol id="i-menu" viewBox="0 0 24 24"><path d="M4 6.5h16M4 12h16M4 17.5h16"/></symbol>
+    <symbol id="i-sidebar" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M9.5 4v16"/></symbol>
+    <symbol id="i-more" viewBox="0 0 24 24"><circle cx="5.5" cy="12" r="1.5" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1.5" fill="currentColor" stroke="none"/><circle cx="18.5" cy="12" r="1.5" fill="currentColor" stroke="none"/></symbol>
+    <symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="11.5" height="11.5" rx="2.5"/><path d="M15 9V5.8A2.3 2.3 0 0 0 12.7 3.5H5.8A2.3 2.3 0 0 0 3.5 5.8v6.9A2.3 2.3 0 0 0 5.8 15H9"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12.5 4.5 4.5L19 7.5"/></symbol>
+    <symbol id="i-stop" viewBox="0 0 24 24"><rect x="7" y="7" width="10" height="10" rx="2" fill="currentColor"/></symbol>
+    <symbol id="i-arrow-up" viewBox="0 0 24 24"><path d="M12 19V5.5M6 11.5l6-6 6 6"/></symbol>
+    <symbol id="i-arrow-down" viewBox="0 0 24 24"><path d="M12 5v13.5M6 12.5l6 6 6-6"/></symbol>
+    <symbol id="i-chevron-down" viewBox="0 0 24 24"><path d="m6.5 9.5 5.5 5.5 5.5-5.5"/></symbol>
+    <symbol id="i-chevron-right" viewBox="0 0 24 24"><path d="m9.5 6.5 5.5 5.5-5.5 5.5"/></symbol>
+    <symbol id="i-chevron-left" viewBox="0 0 24 24"><path d="M14.5 6.5 9 12l5.5 5.5"/></symbol>
+    <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16M10 11v6M14 11v6M6 7l.9 11.4A2.4 2.4 0 0 0 9.3 20.6h5.4a2.4 2.4 0 0 0 2.4-2.2L18 7M9 7V4.5h6V7"/></symbol>
+    <symbol id="i-pencil" viewBox="0 0 24 24"><path d="M4 20h4L19 9a2.8 2.8 0 0 0-4-4L4 16v4ZM13.5 6.5l4 4"/></symbol>
+    <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 4v11M7 10.5l5 5 5-5M5 20h14"/></symbol>
+    <symbol id="i-x" viewBox="0 0 24 24"><path d="M6.5 6.5l11 11M17.5 6.5l-11 11"/></symbol>
+    <symbol id="i-retry" viewBox="0 0 24 24"><path d="M4.5 12a7.5 7.5 0 0 1 13-5.1L19.5 9M19.5 4.5V9H15M19.5 12a7.5 7.5 0 0 1-13 5.1L4.5 15M4.5 19.5V15H9"/></symbol>
+    <symbol id="i-play" viewBox="0 0 24 24"><path d="M7.5 5.5v13l10.5-6.5Z" fill="currentColor"/></symbol>
+    <symbol id="i-zap" viewBox="0 0 24 24"><path d="M13 3 4.5 13.5h6.5l-1 7.5 8.5-10.5H12Z"/></symbol>
+    <symbol id="i-alert" viewBox="0 0 24 24"><path d="M10.3 4.3 2.8 17.5A2 2 0 0 0 4.5 20.5h15a2 2 0 0 0 1.7-3L13.7 4.3a2 2 0 0 0-3.4 0ZM12 9.5v4M12 17h.01"/></symbol>
+    <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v5.5M12 7.8h.01"/></symbol>
+    <symbol id="i-wifi" viewBox="0 0 24 24"><path d="M2.5 9a14 14 0 0 1 19 0M5.5 12.5a9.5 9.5 0 0 1 13 0M8.7 16a5 5 0 0 1 6.6 0M12 19.5h.01"/></symbol>
+    <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1"/></symbol>
+    <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2.5v2M12 19.5v2M4.6 4.6 6 6M18 18l1.4 1.4M2.5 12h2M19.5 12h2M4.6 19.4 6 18M18 6l1.4-1.4"/></symbol>
+    <symbol id="i-moon" viewBox="0 0 24 24"><path d="M20 14.5A8.5 8.5 0 1 1 9.5 4a6.6 6.6 0 0 0 10.5 10.5Z"/></symbol>
+    <symbol id="i-monitor" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="12" rx="2.5"/><path d="M8 20h8M12 16v4"/></symbol>
+    <symbol id="i-laptop" viewBox="0 0 24 24"><rect x="4.5" y="5" width="15" height="10.5" rx="2"/><path d="M2.5 19h19"/></symbol>
+    <symbol id="i-dice" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="3.5"/><circle cx="9" cy="9" r="1.3" fill="currentColor" stroke="none"/><circle cx="15" cy="15" r="1.3" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1.3" fill="currentColor" stroke="none"/></symbol>
+    <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3 7.5A2.5 2.5 0 0 1 5.5 5h3.6l2.2 2.2h7.2A2.5 2.5 0 0 1 21 9.7v7.8a2.5 2.5 0 0 1-2.5 2.5h-13A2.5 2.5 0 0 1 3 17.5Z"/></symbol>
+    <symbol id="i-file" viewBox="0 0 24 24"><path d="M14 3H7.5A2.5 2.5 0 0 0 5 5.5v13A2.5 2.5 0 0 0 7.5 21h9a2.5 2.5 0 0 0 2.5-2.5V8ZM14 3v5h5"/></symbol>
+    <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 3 19 6v5.7c0 4.4-3 7.7-7 9.3-4-1.6-7-4.9-7-9.3V6Z"/><path d="m9 12 2.2 2.2L15.5 10"/></symbol>
+    <symbol id="i-power" viewBox="0 0 24 24"><path d="M12 3.5v8M6.6 6.6a7.6 7.6 0 1 0 10.8 0"/></symbol>
+    <symbol id="i-external" viewBox="0 0 24 24"><path d="M14 4h6v6M20 4l-8.5 8.5M18 14v4a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4"/></symbol>
+    <symbol id="i-list" viewBox="0 0 24 24"><path d="M9 6.5h11M9 12h11M9 17.5h11M4.5 6.5h.01M4.5 12h.01M4.5 17.5h.01"/></symbol>
+    <symbol id="i-branch" viewBox="0 0 24 24"><circle cx="6.5" cy="5.5" r="2"/><circle cx="6.5" cy="18.5" r="2"/><circle cx="17.5" cy="7.5" r="2"/><path d="M6.5 7.5v9M17.5 9.5a6 6 0 0 1-6 6h-3"/></symbol>
+    <symbol id="i-key" viewBox="0 0 24 24"><circle cx="8" cy="15.5" r="4"/><path d="m11 12.5 8.5-8.5M16.5 7l2.5 2.5M14.5 9l2 2"/></symbol>
+    <symbol id="i-cpu" viewBox="0 0 24 24"><path d="M9 2.8v2.6M15 2.8v2.6M9 18.6v2.6M15 18.6v2.6M2.8 9h2.6M2.8 15h2.6M18.6 9h2.6M18.6 15h2.6"/><rect x="5.6" y="5.6" width="12.8" height="12.8" rx="3.4"/></symbol>
+    <symbol id="i-merge" viewBox="0 0 24 24"><circle cx="6.5" cy="5.5" r="2"/><circle cx="6.5" cy="18.5" r="2"/><circle cx="17.5" cy="12" r="2"/><path d="M6.5 7.5v9M6.5 7.5c0 3 3 4.5 9 4.5"/></symbol>
+    <symbol id="i-eye" viewBox="0 0 24 24"><path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12Z"/><circle cx="12" cy="12" r="2.8"/></symbol>
+    <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5"/><path d="m16 16 4.5 4.5"/></symbol>
+    <symbol id="i-paperclip" viewBox="0 0 24 24"><path d="m20 11.5-7.8 7.8a5 5 0 0 1-7.1-7.1l8.5-8.5a3.3 3.3 0 0 1 4.7 4.7l-8.5 8.5a1.7 1.7 0 0 1-2.4-2.4l7.8-7.8"/></symbol>
+    <symbol id="i-battery" viewBox="0 0 24 24"><rect x="2.5" y="7" width="17" height="10" rx="2.5"/><path d="M22 10.5v3"/></symbol>
+    <symbol id="i-bolt" viewBox="0 0 24 24"><path d="M13 3 6 13.5h5l-1 7.5 7-10.5h-5Z"/></symbol>
+    <symbol id="i-export" viewBox="0 0 24 24"><path d="M12 15V4M7.5 8.5 12 4l4.5 4.5M5 14v4.5A1.5 1.5 0 0 0 6.5 20h11a1.5 1.5 0 0 0 1.5-1.5V14"/></symbol>
+    <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/></symbol>
+  </svg>
 
-  <header class="site-header">
-    <div class="wrap header-grid">
-      <div class="brand">
-        <img class="brand-logo" src="/static/favicon.svg" alt="" width="40" height="40">
-        <div class="brand-text">
-          <div class="brand-title-row">
-            <h1 class="brand-title">LowRAM AI</h1>
-            <span class="badge badge-mvp">MVP · local only</span>
-          </div>
-          <p class="brand-tagline">A task queue for your local model that waits for free memory.</p>
-        </div>
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <div class="app" id="app">
+    <aside class="sidebar" id="sidebar" aria-label="Sidebar">
+      <div class="sidebar-head">
+        <a class="brand" href="#/chat" aria-label="LowRAM AI home">
+          <span class="brand-mark" aria-hidden="true"><svg class="icon"><use href="#i-logo"></use></svg></span>
+          <span class="brand-name">LowRAM AI</span>
+        </a>
+        <button class="btn btn-ghost btn-icon sidebar-close" id="sidebar-close" type="button" aria-label="Close sidebar">
+          <svg class="icon" aria-hidden="true"><use href="#i-x"></use></svg>
+        </button>
       </div>
 
-      <section class="card ram-card" aria-labelledby="ram-title">
-        <div class="card-head">
-          <h2 id="ram-title" class="card-title">Memory</h2>
-          <span id="ram-pill" class="pill pill-unknown">
-            <span class="pill-dot" aria-hidden="true"></span>
-            <span id="ram-pill-text">Checking…</span>
-          </span>
-        </div>
-        <dl class="stats">
-          <div class="stat"><dt>Total</dt><dd id="ram-total">—</dd></div>
-          <div class="stat"><dt>Available</dt><dd id="ram-available">—</dd></div>
-          <div class="stat"><dt>Used</dt><dd id="ram-used">—</dd></div>
-        </dl>
-        <div id="ram-gauge" class="gauge" role="meter" aria-label="Available memory compared with the planning budget" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
-          <span class="gauge-fill"></span>
-          <span class="gauge-reserve"></span>
-          <span class="gauge-marker"></span>
-        </div>
-        <p class="gauge-legend">
-          <span class="legend-item"><span class="legend-swatch legend-avail" aria-hidden="true"></span>Available <strong id="ram-legend-available">—</strong></span>
-          <span class="legend-item"><span class="legend-swatch legend-budget" aria-hidden="true"></span>Budget <strong id="ram-legend-budget">—</strong></span>
-          <span class="legend-item"><span class="legend-swatch legend-reserve" aria-hidden="true"></span>Reserve <strong id="ram-min-free">—</strong></span>
-        </p>
-        <p id="ram-reason" class="ram-reason" hidden></p>
-        <p class="help gauge-help">A task starts only while available RAM stays above the reserve.</p>
+      <a class="new-chat" id="new-chat" href="#/chat/new">
+        <span class="new-chat-icon" aria-hidden="true"><svg class="icon"><use href="#i-plus"></use></svg></span>
+        <span>New chat</span>
+      </a>
+
+      <nav class="nav" aria-label="Main">
+        <ul class="nav-list">
+          <li><a class="nav-link" href="#/chat" data-route="chat"><svg class="icon" aria-hidden="true"><use href="#i-chat"></use></svg><span>Chat</span></a></li>
+          <li><a class="nav-link" href="#/code" data-route="code"><svg class="icon" aria-hidden="true"><use href="#i-code"></use></svg><span>Code</span></a></li>
+          <li><a class="nav-link" href="#/media" data-route="media"><svg class="icon" aria-hidden="true"><use href="#i-image"></use></svg><span>Images &amp; Video</span></a></li>
+          <li><a class="nav-link" href="#/tasks" data-route="tasks"><svg class="icon" aria-hidden="true"><use href="#i-tasks"></use></svg><span>Task queue</span></a></li>
+          <li><a class="nav-link" href="#/devices" data-route="devices"><svg class="icon" aria-hidden="true"><use href="#i-devices"></use></svg><span>Devices</span></a></li>
+          <li><a class="nav-link" href="#/settings" data-route="settings"><svg class="icon" aria-hidden="true"><use href="#i-sliders"></use></svg><span>Models &amp; Settings</span></a></li>
+        </ul>
+      </nav>
+
+      <section class="history" id="history" aria-labelledby="history-title">
+        <h2 class="history-title" id="history-title">Recents</h2>
+        <div class="history-body" id="history-body"></div>
       </section>
 
-      <section class="card budget-card" aria-labelledby="budget-title">
-        <div class="card-head">
-          <h2 id="budget-title" class="card-title"><label for="budget-range">Planning budget</label></h2>
-          <output id="budget-output" class="budget-output" for="budget-range">40%</output>
-        </div>
-        <input id="budget-range" class="range" type="range" min="20" max="80" step="5" value="40" aria-describedby="budget-help">
-        <div class="range-scale" aria-hidden="true"><span>20%</span><span>50%</span><span>80%</span></div>
-        <dl class="stats stats-compact">
-          <div class="stat"><dt>Budget</dt><dd id="budget-bytes">—</dd></div>
-          <div class="stat"><dt>Context</dt><dd id="budget-context">—</dd></div>
-          <div class="stat"><dt>Max tokens</dt><dd id="budget-tokens">—</dd></div>
-        </dl>
-        <p id="budget-help" class="help">Share of total RAM the scheduler plans for. It sizes the prompt context and the output length (max tokens). This is a scheduling hint, not a hard memory cap.</p>
-      </section>
-    </div>
-  </header>
+      <div class="sidebar-foot">
+        <svg class="icon" aria-hidden="true"><use href="#i-shield"></use></svg>
+        <span>Private · runs on this computer</span>
+        <span class="sidebar-version" id="app-version"></span>
+      </div>
+    </aside>
 
-  <div id="banner" class="banner" role="alert" hidden>
-    <div class="wrap banner-inner">
-      <p class="banner-text"><strong id="banner-title"></strong> <span id="banner-message"></span></p>
-      <button id="banner-action" class="btn btn-sm btn-secondary" type="button"></button>
+    <div class="scrim" id="scrim" hidden></div>
+
+    <div class="main-col">
+      <header class="topbar">
+        <button class="btn btn-ghost btn-icon menu-btn" id="menu-btn" type="button" aria-label="Open sidebar" aria-controls="sidebar" aria-expanded="false">
+          <svg class="icon" aria-hidden="true"><use href="#i-menu"></use></svg>
+        </button>
+        <p class="topbar-title" id="topbar-title">LowRAM AI</p>
+        <button class="status-pill" id="status-pill" type="button" aria-describedby="status-pill-desc">
+          <span class="dot dot-idle" id="status-dot" aria-hidden="true"></span>
+          <span class="status-text" id="status-text">Connecting…</span>
+          <span class="status-ram" id="status-ram"></span>
+        </button>
+        <span class="visually-hidden" id="status-pill-desc">Opens Models and Settings</span>
+      </header>
+
+      <div class="banners" id="banners" role="region" aria-label="Notifications"></div>
+
+      <main class="views" id="main" tabindex="-1"></main>
     </div>
   </div>
 
-  <main class="wrap layout">
-    <section class="card panel-projects" aria-labelledby="projects-title">
-      <div class="card-head">
-        <h2 id="projects-title" class="card-title">Projects</h2>
-        <button id="projects-refresh" class="btn btn-ghost btn-sm" type="button">Refresh</button>
-      </div>
-      <p id="projects-empty" class="empty-text">Loading projects…</p>
-      <ul id="project-list" class="project-list"></ul>
-    </section>
-
-    <div class="panel-detail">
-      <section id="loop-banner" class="loop-banner" aria-labelledby="loop-title" hidden>
-        <div class="loop-head">
-          <span id="loop-spinner" class="spinner" aria-hidden="true"></span>
-          <div class="loop-heading">
-            <h2 id="loop-title" class="loop-title">Loop running</h2>
-            <p id="loop-project" class="loop-project"></p>
-          </div>
-          <div class="loop-actions">
-            <button id="loop-view" class="btn btn-ghost btn-sm" type="button" hidden>View project</button>
-            <button id="loop-stop" class="btn btn-danger btn-sm" type="button">Stop loop</button>
-            <button id="loop-dismiss" class="btn btn-ghost btn-sm" type="button" hidden>Dismiss</button>
-          </div>
-        </div>
-        <div id="loop-progress" class="progress" role="progressbar" aria-labelledby="loop-title" aria-valuemin="0" aria-valuemax="1" aria-valuenow="0">
-          <span class="progress-fill"></span>
-        </div>
-        <p id="loop-stats" class="loop-stats"></p>
-        <p id="loop-message" class="loop-message" hidden></p>
-      </section>
-
-      <section id="project-detail" class="card detail-card" aria-labelledby="detail-title" tabindex="-1">
-        <div class="detail-head">
-          <div class="detail-heading">
-            <h2 id="detail-title" class="detail-title">No project selected</h2>
-            <p id="detail-sub" class="detail-sub" hidden>
-              <span id="detail-kind" class="badge"></span>
-              <span id="detail-created" class="muted"></span>
-            </p>
-          </div>
-          <ul id="detail-counts" class="count-chips" aria-label="Task counts"></ul>
-        </div>
-
-        <div id="detail-empty" class="empty-state">
-          <p>Select a project from the list, or create a new one with one task per line.</p>
-        </div>
-
-        <div id="detail-body" hidden>
-          <dl id="detail-meta" class="detail-meta" hidden></dl>
-
-          <p id="coding-note" class="callout callout-info" hidden>
-            Use the CLI to plan/step/approve coding projects. This dashboard shows them read-only.
-          </p>
-
-          <div id="run-controls" class="run-controls" hidden>
-            <div class="run-row">
-              <button id="run-next" class="btn btn-primary" type="button">Run next task</button>
-              <div class="loop-group">
-                <label for="max-tasks" class="inline-label">Max tasks</label>
-                <input id="max-tasks" class="input input-number" type="number" min="1" max="100" step="1" value="5" inputmode="numeric" aria-describedby="max-tasks-error">
-                <button id="run-loop" class="btn btn-secondary" type="button">Run loop</button>
-              </div>
-            </div>
-            <p id="max-tasks-error" class="field-error" hidden></p>
-            <p id="run-busy" class="run-busy" hidden>
-              <span class="spinner" aria-hidden="true"></span>
-              <span id="run-busy-text">Running… this can take a while.</span>
-              <span id="run-elapsed" class="run-elapsed"></span>
-            </p>
-            <p id="run-hint" class="help"></p>
-          </div>
-
-          <div id="outcome" class="outcome-region" aria-live="polite" aria-atomic="true"></div>
-
-          <div class="table-wrap">
-            <table class="task-table">
-              <caption class="visually-hidden">Tasks in this project</caption>
-              <thead>
-                <tr>
-                  <th scope="col" class="col-pos">#</th>
-                  <th scope="col" class="col-title">Task</th>
-                  <th scope="col" class="col-status">Status</th>
-                  <th scope="col" class="col-attempts">Attempts</th>
-                  <th scope="col" class="col-finished">Finished</th>
-                  <th scope="col" class="col-actions"><span class="visually-hidden">Actions</span></th>
-                </tr>
-              </thead>
-              <tbody id="task-rows"></tbody>
-            </table>
-            <p id="tasks-empty" class="empty-text" hidden>This project has no tasks.</p>
-          </div>
-        </div>
-      </section>
-    </div>
-
-    <section class="card panel-new" aria-labelledby="new-title">
-      <div class="card-head">
-        <h2 id="new-title" class="card-title">New project</h2>
-      </div>
-      <form id="new-project-form" class="form" novalidate>
-        <div class="field">
-          <label for="project-name">Name</label>
-          <input id="project-name" class="input" name="name" type="text" maxlength="200" autocomplete="off" spellcheck="false" placeholder="e.g. Release notes">
-        </div>
-        <div class="field">
-          <label for="project-tasks">Tasks <span class="label-hint">one task per line</span></label>
-          <textarea id="project-tasks" class="input textarea" name="tasks" rows="6" aria-describedby="task-count" placeholder="Summarize the changelog&#10;Draft the announcement&#10;List open questions"></textarea>
-          <p id="task-count" class="help">0 tasks</p>
-        </div>
-        <p id="form-error" class="form-error" role="alert" hidden></p>
-        <div class="form-actions">
-          <button id="create-btn" class="btn btn-primary" type="submit">Create</button>
-          <p id="form-status" class="form-status" aria-live="polite"></p>
-        </div>
-      </form>
-    </section>
-  </main>
-
-  <footer class="site-footer">
-    <div class="wrap footer-inner">
-      <p class="footer-note">Runs one inference at a time against your local model endpoint. Do not expose port 8765 to the network.</p>
-      <div class="footer-actions">
-        <p id="recover-status" class="recover-status" aria-live="polite"></p>
-        <button id="recover-btn" class="btn btn-ghost btn-sm" type="button">Recover stuck tasks</button>
-      </div>
-    </div>
-  </footer>
-
-  <dialog id="result-dialog" class="dialog" aria-labelledby="dialog-title">
-    <div class="dialog-head">
-      <div class="dialog-heading">
-        <h2 id="dialog-title" class="dialog-title">Result</h2>
-        <p id="dialog-sub" class="dialog-sub"></p>
-      </div>
-      <button id="dialog-x" class="btn btn-ghost btn-icon" type="button" aria-label="Close">
-        <span aria-hidden="true">×</span>
-      </button>
-    </div>
-    <pre id="dialog-content" class="result-pre" tabindex="0"></pre>
-    <div class="dialog-foot">
-      <span id="dialog-meta" class="muted"></span>
-      <div class="dialog-buttons">
-        <button id="dialog-copy" class="btn btn-secondary btn-sm" type="button">Copy</button>
-        <button id="dialog-close" class="btn btn-primary btn-sm" type="button">Close</button>
-      </div>
-    </div>
-  </dialog>
+  <div class="toast-region" id="toasts" role="status" aria-live="polite"></div>
+  <div class="visually-hidden" id="live" aria-live="polite" aria-atomic="true"></div>
 </body>
 </html>

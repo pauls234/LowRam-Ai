@@ -11,7 +11,7 @@ import threading
 import time
 from collections.abc import Callable
 
-from . import artifacts, config, db, llm, memory
+from . import artifacts, config, db, llm, memory, power
 
 log = logging.getLogger("lowram.runner")
 
@@ -21,7 +21,10 @@ MAX_NAME_CHARS = 120
 MAX_LOOP_TASKS = 100
 DEFAULT_LOOP_TASKS = 5
 
-STOP_REASONS = ("queue_empty", "max_tasks", "failure", "paused_low_ram", "stop_requested", "busy", "error")
+STOP_REASONS = (
+    "queue_empty", "max_tasks", "failure", "paused_low_ram", "no_model", "stop_requested", "busy", "error",
+    "on_battery",
+)
 
 SYSTEM_PROMPT = (
     "You are LowRAM AI, a careful assistant running on a local model. You work through a "
@@ -141,6 +144,23 @@ def _messages(task: dict, context: str) -> list[dict]:
     ]
 
 
+def model_problem() -> str | None:
+    """``None`` when a model endpoint is usable, else why not.
+
+    Starts the managed engine when needed (same rules as chat). Without the
+    chat/engine modules, or with an external ``LOWRAM_LLM_URL``, nothing is checked.
+    """
+    try:
+        from . import chat  # lazy: chat imports this module
+    except ImportError:
+        return None
+    try:
+        chat.ensure_model()
+    except Exception as exc:  # HTTPError(409) with a user-facing reason
+        return getattr(exc, "message", None) or describe_error(exc)
+    return None
+
+
 def describe_error(exc: BaseException) -> str:
     if isinstance(exc, (llm.LLMError, artifacts.ArtifactError)):
         return str(exc)
@@ -172,6 +192,11 @@ def run_next(project_id: int, percent: object = memory.DEFAULT_PERCENT) -> dict:
     outcome: dict = {"task": None, "result": None, "error": None, "reason": None, "memory": mem.to_dict()}
     if not mem.can_run:
         return {**outcome, "status": "paused", "reason": mem.reason}
+    if not db.tasks_with_status(project_id, ["pending"]):
+        return {**outcome, "status": "empty", "reason": "No pending tasks in this project."}
+    problem = model_problem()
+    if problem:  # nothing is claimed, so the task is not marked failed
+        return {**outcome, "status": "no_model", "reason": problem}
     task = db.claim_next_task(project_id)
     if task is None:
         return {**outcome, "status": "empty", "reason": "No pending tasks in this project."}
@@ -220,7 +245,8 @@ def run_loop(
     """Run pending tasks one after another until a stop condition is met.
 
     Stop conditions: queue empty, ``max_tasks`` executed, a task failed
-    (``stop_on_failure``), RAM too low, another inference busy, or
+    (``stop_on_failure``), RAM too low, on battery below the minimum
+    (``power.battery_block_reason``), another inference busy, or
     ``stop_event`` set (checked between tasks; a running inference is never
     killed mid-way).
     """
@@ -237,36 +263,44 @@ def run_loop(
         "stopped_because": None,
         "message": "",
     }
-    while True:
-        if stop_event is not None and stop_event.is_set():
-            summary.update(stopped_because="stop_requested", message="Stopped on request.")
-            break
-        if len(summary["steps"]) >= limit:
-            summary.update(stopped_because="max_tasks", message=f"Reached the limit of {limit} task(s).")
-            break
-        try:
-            outcome = run_next(project_id, pct)
-        except db.Busy as exc:
-            summary.update(stopped_because="busy", message=str(exc))
-            break
-        if on_step is not None:
-            on_step(outcome)
-        status = outcome["status"]
-        if status in ("done", "failed"):
-            summary["steps"].append(
-                {"task_id": outcome["task"]["id"], "status": status, "error": outcome["error"]}
-            )
-        if status == "done":
-            summary["completed"] += 1
-        elif status == "failed":
-            summary["failed"] += 1
-            if stop_on_failure:
-                summary.update(stopped_because="failure", message=outcome["error"] or "Task failed.")
+    with power.keep_awake("task loop"):
+        while True:
+            if stop_event is not None and stop_event.is_set():
+                summary.update(stopped_because="stop_requested", message="Stopped on request.")
                 break
-        elif status == "paused":
-            summary.update(stopped_because="paused_low_ram", message=outcome["reason"])
-            break
-        elif status == "empty":
-            summary.update(stopped_because="queue_empty", message="All tasks processed.")
-            break
+            if len(summary["steps"]) >= limit:
+                summary.update(stopped_because="max_tasks", message=f"Reached the limit of {limit} task(s).")
+                break
+            battery = power.battery_block_reason()  # MacBook on battery: stop between tasks
+            if battery:
+                summary.update(stopped_because="on_battery", message=battery)
+                break
+            try:
+                outcome = run_next(project_id, pct)
+            except db.Busy as exc:
+                summary.update(stopped_because="busy", message=str(exc))
+                break
+            if on_step is not None:
+                on_step(outcome)
+            status = outcome["status"]
+            if status in ("done", "failed"):
+                summary["steps"].append(
+                    {"task_id": outcome["task"]["id"], "status": status, "error": outcome["error"]}
+                )
+            if status == "done":
+                summary["completed"] += 1
+            elif status == "failed":
+                summary["failed"] += 1
+                if stop_on_failure:
+                    summary.update(stopped_because="failure", message=outcome["error"] or "Task failed.")
+                    break
+            elif status == "paused":
+                summary.update(stopped_because="paused_low_ram", message=outcome["reason"])
+                break
+            elif status == "no_model":
+                summary.update(stopped_because="no_model", message=outcome["reason"])
+                break
+            elif status == "empty":
+                summary.update(stopped_because="queue_empty", message="All tasks processed.")
+                break
     return summary
