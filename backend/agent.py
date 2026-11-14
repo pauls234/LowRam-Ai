@@ -38,8 +38,10 @@ import sqlite3
 import subprocess
 import tempfile
 import threading
+import sys
 import unicodedata
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -47,7 +49,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 import logging
 import time
 
-from . import artifacts, db, llm, memory
+from . import artifacts, config, db, llm, memory
 from .runner import describe_error, record_failure
 
 log = logging.getLogger("lowram.agent")
@@ -109,6 +111,18 @@ ATTENTION_NAMES = frozenset(
 )
 ATTENTION_SUFFIXES = frozenset({".sh"})
 _ALLOWED_CONTROL = frozenset({"\n", "\t"})
+# Folder/file names are compared case-insensitively: on APFS/NTFS "Node_Modules" is "node_modules".
+_SKIP_DIRS_LOWER = frozenset(name.lower() for name in SKIP_DIRS)
+_ATTENTION_NAMES_LOWER = frozenset(name.lower() for name in ATTENTION_NAMES)
+# Files that a test run executes or that configure what it executes (see runs_during_tests).
+TEST_DIR_NAMES = frozenset({"tests", "test", "__tests__"})
+TEST_RUN_NAMES = frozenset(
+    {
+        "conftest.py", "makefile", "gnumakefile", "package.json", "setup.py", "setup.cfg", "pyproject.toml",
+        "tox.ini", "noxfile.py", "pytest.ini",
+    }
+)
+_JS_TEST_NAME = re.compile(r".+\.(?:test|spec)\.[a-z0-9]+")
 
 PLAN_SYSTEM = (
     "You are a careful senior software engineer planning small, safe code changes. "
@@ -153,9 +167,29 @@ def is_text_candidate(name: str) -> bool:
     return PurePosixPath(name).suffix.lower() in TEXT_SUFFIXES or name in TEXT_NAMES
 
 
+def runs_during_tests(rel_path: str) -> bool:
+    """Files a typical test run executes: tests/**, test_*.py, *_test.py, conftest.py, Makefile, *.sh, …"""
+    parts = [part.lower() for part in PurePosixPath(rel_path).parts]
+    if not parts:
+        return False
+    name = parts[-1]
+    return (
+        any(part in TEST_DIR_NAMES for part in parts[:-1])
+        or (name.startswith("test_") and name.endswith(".py"))
+        or name.endswith("_test.py")
+        or name in TEST_RUN_NAMES
+        or name.endswith(".sh")
+        or _JS_TEST_NAME.fullmatch(name) is not None
+    )
+
+
 def needs_attention(rel_path: str) -> bool:
     name = PurePosixPath(rel_path).name
-    return name in ATTENTION_NAMES or PurePosixPath(name).suffix.lower() in ATTENTION_SUFFIXES
+    return (
+        name.lower() in _ATTENTION_NAMES_LOWER
+        or PurePosixPath(name).suffix.lower() in ATTENTION_SUFFIXES
+        or runs_during_tests(rel_path)
+    )
 
 
 def _hidden_char(text: str) -> str | None:
@@ -246,8 +280,8 @@ def index_repository(repo_path: object, max_files: int = MAX_INDEX_FILES) -> lis
         dirs[:] = sorted(
             d
             for d in dirs
-            if d not in SKIP_DIRS
-            and (not d.startswith(".") or d in ALLOWED_HIDDEN_DIRS)
+            if d.lower() not in _SKIP_DIRS_LOWER
+            and (not d.startswith(".") or d.lower() in ALLOWED_HIDDEN_DIRS)
             and not os.path.islink(os.path.join(root, d))
         )
         for name in sorted(files):
@@ -366,13 +400,14 @@ def resolve_repo_path(repo: Path, rel: object, *, write: bool = False) -> Path:
     if not parts or any(part == ".." for part in parts):
         raise ProposalError(f"{rel}: '..' is not allowed")
     for part in parts[:-1]:
-        if part in SKIP_DIRS or (part.startswith(".") and part not in ALLOWED_HIDDEN_DIRS):
+        lower = part.lower()  # case-insensitive file systems (APFS, NTFS)
+        if lower in _SKIP_DIRS_LOWER or (part.startswith(".") and lower not in ALLOWED_HIDDEN_DIRS):
             raise ProposalError(f"{rel}: writing into {part}/ is not allowed")
     if parts[-1].lower() == ".git" or is_sensitive(parts[-1]):
         raise ProposalError(f"{rel}: this file looks sensitive and cannot be read or written")
     if not is_text_candidate(parts[-1]):
         raise ProposalError(f"{rel}: only text/source files can be changed")
-    if write and (parts[0] in WRITE_BLOCKED_DIRS or parts[-1].lower() in WRITE_BLOCKED_NAMES):
+    if write and (parts[0].lower() in WRITE_BLOCKED_DIRS or parts[-1].lower() in WRITE_BLOCKED_NAMES):
         raise ProposalError(f"{rel}: CI workflows and hook configuration run automatically and cannot be written")
     current = repo
     for index, part in enumerate(parts):
@@ -989,6 +1024,8 @@ def approve(project_id: int, task_id: int) -> dict:
             errors.append("some files already contain the proposed content or changed since the proposal")
         if errors:
             raise AgentError("Cannot apply the proposal: " + "; ".join(errors))
+        # Recorded before writing: a later failure only causes an extra confirmation, never a missing one.
+        _record_ai_writes(project_id, task_id, [change["path"] for change in validated])
         backup_dir = artifacts.project_dir(project_id) / "backups" / f"task_{task_id}"
         written = _apply(repo, validated, backup_dir)
         _mark_approved_or_rollback(repo, task_id, validated, backup_dir)
@@ -1011,25 +1048,48 @@ def reject(project_id: int, task_id: int, reason: str = "") -> dict:
 # --------------------------------------------------------------------------- test & fix loop
 #
 # The user saves a test command per project and starts it explicitly
-# (run-tests). Nothing the model writes is ever executed by this module.
+# (run-tests). Nothing the model writes is ever executed by this module; a run
+# that would execute files written by approved AI proposals needs an explicit
+# confirmation, and on macOS it runs inside sandbox-exec (no writes outside
+# the repository/temp folders, no credential folders, no outbound network).
 
 MAX_TEST_COMMAND_CHARS = 300
 MAX_TEST_ARGS = 64
 TEST_TIMEOUT_S = 600.0
 TEST_OUTPUT_TAIL_CHARS = 20_000
+MAX_TEST_RUNS_KEPT = 20  # per project; older finished runs are deleted
 FIX_TESTS_TITLE = "Fehlschlagende Tests beheben"
 FIX_TESTS_OUTPUT_CHARS = 4000
 FIX_TESTS_MAX_FILES = 6
+MAX_CONFIRM_FILES = 100
 KILL_GRACE_S = 5.0
 SECRET_ENV_WORDS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "AUTH")
 INTERRUPTED_RUN = "interrupted: LowRAM AI stopped during the test run"
 CANCELLED_RUN = "cancelled by the user"
+SHUTDOWN_MESSAGE = "LowRAM AI wird beendet"
+SANDBOX_EXEC = "/usr/bin/sandbox-exec"
+SANDBOX_WRITABLE = ("/private/tmp", "/private/var/folders", "/dev")
+SANDBOX_SECRET_PATHS = (
+    ".ssh", ".aws", ".gnupg", ".config/gh", ".netrc", ".git-credentials", "Library/Keychains", ".lowram-ai",
+)
+SANDBOX_OFF_WARNING = (
+    "Sandbox für dieses Projekt ausgeschaltet: Die Tests laufen mit deinen vollen Benutzerrechten "
+    "(Zugriff auf deine Dateien und das Internet)."
+)
+SANDBOX_UNAVAILABLE_WARNING = (
+    "Keine Sandbox auf diesem System (nur unter macOS verfügbar): Die Tests laufen mit deinen vollen "
+    "Benutzerrechten (Zugriff auf deine Dateien und das Internet)."
+)
+SANDBOX_MISSING_WARNING = (
+    "sandbox-exec wurde nicht gefunden: Die Tests laufen ohne Sandbox mit deinen vollen Benutzerrechten."
+)
 
 TEST_SCHEMA = """
 CREATE TABLE IF NOT EXISTS coding_test_commands (
     project_id INTEGER PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
     command TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    sandbox INTEGER NOT NULL DEFAULT 1
 );
 CREATE TABLE IF NOT EXISTS coding_test_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1040,13 +1100,156 @@ CREATE TABLE IF NOT EXISTS coding_test_runs (
     output_tail TEXT NOT NULL DEFAULT '',
     error TEXT,
     started_at TEXT NOT NULL,
-    finished_at TEXT
+    finished_at TEXT,
+    sandboxed INTEGER NOT NULL DEFAULT 0,
+    warning TEXT,
+    ai_writes_seen INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_coding_test_runs_project ON coding_test_runs(project_id, id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_coding_test_runs_one_running
     ON coding_test_runs(project_id) WHERE state = 'running';
+CREATE TABLE IF NOT EXISTS coding_ai_writes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    task_id INTEGER NOT NULL,
+    path TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_coding_ai_writes_project ON coding_ai_writes(project_id, id);
 """
 db.register_schema(TEST_SCHEMA)
+# Columns added after the first v0.4 builds; older databases get them via ALTER TABLE.
+_ADDED_TEST_COLUMNS = {
+    "coding_test_commands": (("sandbox", "INTEGER NOT NULL DEFAULT 1"),),
+    "coding_test_runs": (
+        ("sandboxed", "INTEGER NOT NULL DEFAULT 0"),
+        ("warning", "TEXT"),
+        ("ai_writes_seen", "INTEGER NOT NULL DEFAULT 0"),
+    ),
+}
+
+
+@contextmanager
+def _test_db() -> Iterator[sqlite3.Connection]:
+    with db.connect() as conn:
+        for table, columns in _ADDED_TEST_COLUMNS.items():
+            have = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+            for name, decl in columns:
+                if name in have:
+                    continue
+                try:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+                except sqlite3.OperationalError as exc:  # added concurrently by another connection
+                    if "duplicate column" not in str(exc).lower():
+                        raise
+        yield conn
+
+
+# ---- macOS sandbox
+
+
+def _sbpl_path(path: object) -> str:
+    """A path as an SBPL string literal; paths that would need escaping are refused."""
+    text = str(path)
+    if (
+        not text.startswith("/")
+        or '"' in text
+        or "\\" in text
+        or any(ord(char) < 32 or ord(char) == 127 for char in text)
+    ):
+        raise AgentError(
+            f"The folder {text!r} cannot be used in the macOS sandbox profile (quotes, backslashes or control "
+            "characters). Rename it or turn the sandbox off for this project."
+        )
+    return f'"{text}"'
+
+
+def sandbox_profile(repo: Path, home: Path | None = None, data_dir: Path | None = None) -> str:
+    """macOS sandbox-exec profile (SBPL) for test runs.
+
+    Later rules win: everything is allowed except outbound network (localhost
+    and unix sockets stay allowed), writes outside the repository and the temp
+    folders, and any access to credential folders and the LowRAM AI data.
+    """
+    home = Path.home().resolve() if home is None else home
+    data_dir = config.home_dir().resolve() if data_dir is None else data_dir
+    writable = [repo, *SANDBOX_WRITABLE]
+    secrets = list(dict.fromkeys([*(home / rel for rel in SANDBOX_SECRET_PATHS), data_dir]))
+    lines = [
+        "(version 1)",
+        "(allow default)",
+        "(deny network-outbound)",
+        '(allow network-outbound (remote ip "localhost:*"))',
+        "(allow network-outbound (remote unix-socket))",
+        "(deny file-write*)",
+        "(allow file-write*",
+        *(f"    (subpath {_sbpl_path(path)})" for path in writable),
+        ")",
+        "(deny file-read* file-write*",
+        *(f"    (subpath {_sbpl_path(path)})" for path in secrets),
+        ")",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def _sandbox_state() -> str:
+    """``ok`` (macOS with sandbox-exec), ``unsupported`` (not macOS) or ``missing``."""
+    if sys.platform != "darwin":
+        return "unsupported"
+    return "ok" if os.access(SANDBOX_EXEC, os.X_OK) else "missing"
+
+
+def sandbox_command(
+    repo: Path, args: list[str], executable: str, enabled: bool
+) -> tuple[list[str], str, bool, str | None]:
+    """How to start a run: ``(popen_args, popen_executable, sandboxed, warning)``."""
+    if not enabled:
+        return args, executable, False, SANDBOX_OFF_WARNING
+    state = _sandbox_state()
+    if state != "ok":
+        return args, executable, False, SANDBOX_UNAVAILABLE_WARNING if state == "unsupported" else SANDBOX_MISSING_WARNING
+    profile = sandbox_profile(repo)
+    return [SANDBOX_EXEC, "-p", profile, "--", executable, *args[1:]], SANDBOX_EXEC, True, None
+
+
+# ---- files written by the AI that a test run would execute
+
+
+class ConfirmationRequired(AgentError):
+    """Approved AI proposals wrote files that the test run executes; the user must confirm."""
+
+    def __init__(self, files: list[str]):
+        self.files = files
+        listed = ", ".join(files[:10]) + (f" und {len(files) - 10} weitere" if len(files) > 10 else "")
+        super().__init__(
+            f"Die KI hat diese Dateien geschrieben, die beim Test ausgeführt werden: {listed}. Trotzdem ausführen?"
+        )
+
+
+def _record_ai_writes(project_id: int, task_id: int, paths: list[str]) -> None:
+    now = db.utcnow()
+    with _test_db() as conn, db.transaction(conn):
+        conn.executemany(
+            "INSERT INTO coding_ai_writes (project_id, task_id, path, created_at) VALUES (?, ?, ?, ?)",
+            [(project_id, task_id, path, now) for path in paths],
+        )
+
+
+def unconfirmed_ai_files(project_id: int) -> tuple[list[str], int]:
+    """Files executed by test runs that approved AI proposals wrote since the last test run.
+
+    Returns ``(paths, watermark)``; starting a run records ``watermark``, which confirms them.
+    """
+    with _test_db() as conn:
+        seen = conn.execute(
+            "SELECT COALESCE(MAX(ai_writes_seen), 0) FROM coding_test_runs WHERE project_id = ?", (project_id,)
+        ).fetchone()[0]
+        rows = conn.execute(
+            "SELECT id, path FROM coding_ai_writes WHERE project_id = ? AND id > ? ORDER BY id", (project_id, seen)
+        ).fetchall()
+    watermark = max([seen, *(row["id"] for row in rows)])
+    files = sorted({row["path"] for row in rows if runs_during_tests(row["path"])})
+    return files[:MAX_CONFIRM_FILES], watermark
 
 _ANSI_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-Z\\-_])")
 _PATH_TOKEN_RE = re.compile(r"[\w@+~./-]+")
@@ -1115,24 +1318,41 @@ def validate_test_command(repo: Path, command: object) -> tuple[list[str], str]:
     return args, os.path.abspath(found)
 
 
-def set_test_command(project_id: int, command: object) -> str:
-    """Validate and store the project's test command (it is not run here)."""
+def set_test_command(project_id: int, command: object, sandbox: object = None) -> dict:
+    """Validate and store the project's test command (it is not run here).
+
+    ``sandbox`` (macOS sandbox for runs, default on) is kept when ``None``.
+    Returns ``{command, sandbox}``.
+    """
     _, repo = require_coding(project_id)
     validate_test_command(repo, command)
+    if sandbox is not None and not isinstance(sandbox, bool):
+        raise ValueError("'sandbox' must be true or false")
     clean = str(command).strip()
-    with db.connect() as conn, db.transaction(conn):
+    enabled = get_test_settings(project_id)["sandbox"] if sandbox is None else sandbox
+    with _test_db() as conn, db.transaction(conn):
         conn.execute(
-            "INSERT INTO coding_test_commands (project_id, command, updated_at) VALUES (?, ?, ?) "
-            "ON CONFLICT(project_id) DO UPDATE SET command = excluded.command, updated_at = excluded.updated_at",
-            (project_id, clean, db.utcnow()),
+            "INSERT INTO coding_test_commands (project_id, command, updated_at, sandbox) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(project_id) DO UPDATE SET command = excluded.command, updated_at = excluded.updated_at, "
+            "sandbox = excluded.sandbox",
+            (project_id, clean, db.utcnow(), int(enabled)),
         )
-    return clean
+    return {"command": clean, "sandbox": bool(enabled)}
+
+
+def get_test_settings(project_id: int) -> dict:
+    """``{command, sandbox}``: ``command`` is ``None`` until one is saved; the sandbox defaults to on."""
+    with _test_db() as conn:
+        row = conn.execute(
+            "SELECT command, sandbox FROM coding_test_commands WHERE project_id = ?", (project_id,)
+        ).fetchone()
+    if row is None:
+        return {"command": None, "sandbox": True}
+    return {"command": row["command"], "sandbox": bool(row["sandbox"])}
 
 
 def get_test_command(project_id: int) -> str | None:
-    with db.connect() as conn:
-        row = conn.execute("SELECT command FROM coding_test_commands WHERE project_id = ?", (project_id,)).fetchone()
-    return row["command"] if row else None
+    return get_test_settings(project_id)["command"]
 
 
 def scrubbed_environment() -> dict[str, str]:
@@ -1194,6 +1414,7 @@ class _ActiveRun:
 
 _RUNS_LOCK = threading.Lock()
 _ACTIVE_RUNS: dict[int, _ActiveRun] = {}  # project id -> its (single) running test run
+_SHUTDOWN = False  # set by stop_test_runs (app shutdown), cleared by recover_test_runs (startup)
 
 
 def _kill_group(proc: subprocess.Popen) -> None:
@@ -1243,12 +1464,20 @@ def _pump_output(stream, tail: _OutputTail) -> None:
             pass
 
 
-def _finish_test_run(run_id: int, state: str, exit_code: int | None, output: str, error: str | None) -> None:
-    with db.connect() as conn, db.transaction(conn):
+def _finish_test_run(
+    project_id: int, run_id: int, state: str, exit_code: int | None, output: str, error: str | None
+) -> None:
+    """Record the end of a run and keep only the newest ``MAX_TEST_RUNS_KEPT`` runs of the project."""
+    with _test_db() as conn, db.transaction(conn):
         conn.execute(
             "UPDATE coding_test_runs SET state = ?, exit_code = ?, output_tail = ?, error = ?, finished_at = ? "
             "WHERE id = ? AND state = 'running'",
             (state, exit_code, output, error, db.utcnow(), run_id),
+        )
+        conn.execute(
+            "DELETE FROM coding_test_runs WHERE project_id = ? AND state != 'running' AND id NOT IN "
+            "(SELECT id FROM coding_test_runs WHERE project_id = ? ORDER BY id DESC LIMIT ?)",
+            (project_id, project_id, MAX_TEST_RUNS_KEPT),
         )
 
 
@@ -1313,7 +1542,7 @@ def _test_run_worker(
         error = f"The test run failed: {exc}"
     finally:
         try:
-            _finish_test_run(active.run_id, state, exit_code, active.tail.text(), error)
+            _finish_test_run(project_id, active.run_id, state, exit_code, active.tail.text(), error)
         except Exception:
             log.exception("Could not record the end of test run #%s", active.run_id)
         finally:
@@ -1323,33 +1552,45 @@ def _test_run_worker(
             active.finished.set()
 
 
-def start_test_run(project_id: int) -> dict:
+def start_test_run(project_id: int, confirm: bool = False) -> dict:
     """Start the project's saved test command in the background (explicit user request only).
 
-    Raises ``db.Busy`` while another run of this project is in progress.
+    Raises ``ConfirmationRequired`` (unless ``confirm``) when approved AI proposals wrote files
+    the run executes since the last run, and ``db.Busy`` while another run of this project is in
+    progress or LowRAM AI is shutting down.
     """
     _, repo = require_coding(project_id)
-    command = get_test_command(project_id)
+    settings = get_test_settings(project_id)
+    command = settings["command"]
     if command is None:
         raise AgentError("No test command is saved for this project yet")
     args, executable = validate_test_command(repo, command)  # again: the repository may have changed
+    popen_args, popen_executable, sandboxed, warning = sandbox_command(repo, args, executable, settings["sandbox"])
     timeout = float(TEST_TIMEOUT_S)
     with _RUNS_LOCK:
+        if _SHUTDOWN:
+            raise db.Busy(SHUTDOWN_MESSAGE)
         if project_id in _ACTIVE_RUNS:
             raise db.Busy("A test run is already in progress for this project")
+        ai_files, watermark = unconfirmed_ai_files(project_id)
+        if ai_files and not confirm:
+            raise ConfirmationRequired(ai_files)
         try:
-            with db.connect() as conn, db.transaction(conn):
+            with _test_db() as conn, db.transaction(conn):
                 cur = conn.execute(
-                    "INSERT INTO coding_test_runs (project_id, command, state, started_at) VALUES (?, ?, 'running', ?)",
-                    (project_id, command, db.utcnow()),
+                    "INSERT INTO coding_test_runs (project_id, command, state, started_at, sandboxed, warning, "
+                    "ai_writes_seen) VALUES (?, ?, 'running', ?, ?, ?, ?)",
+                    (project_id, command, db.utcnow(), int(sandboxed), warning, watermark),
                 )
+                # confirmed (or never needing confirmation) now; the run row keeps the watermark
+                conn.execute("DELETE FROM coding_ai_writes WHERE project_id = ? AND id <= ?", (project_id, watermark))
         except sqlite3.IntegrityError:
             raise db.Busy("A test run is already in progress for this project") from None
         run_id = int(cur.lastrowid)
         active = _ActiveRun(run_id, _OutputTail(TEST_OUTPUT_TAIL_CHARS))
         active.thread = threading.Thread(
             target=_test_run_worker,
-            args=(project_id, active, repo, args, executable, timeout),
+            args=(project_id, active, repo, popen_args, popen_executable, timeout),
             name=f"lowram-tests-{run_id}",
             daemon=True,
         )
@@ -1358,20 +1599,22 @@ def start_test_run(project_id: int) -> dict:
             active.thread.start()
         except BaseException:
             del _ACTIVE_RUNS[project_id]
-            _finish_test_run(run_id, "error", None, "", "The test run could not be started")
+            _finish_test_run(project_id, run_id, "error", None, "", "The test run could not be started")
             raise
     return get_test_run(project_id, run_id)
 
 
 def get_test_run(project_id: int, run_id: int) -> dict:
     """A run of this project; while it is running, ``output_tail`` is the live output."""
-    with db.connect() as conn:
+    with _test_db() as conn:
         row = conn.execute(
             "SELECT * FROM coding_test_runs WHERE id = ? AND project_id = ?", (run_id, project_id)
         ).fetchone()
     if row is None:
         raise db.NotFound(f"Test run #{run_id} not found in project #{project_id}")
     run = dict(row)
+    run["sandboxed"] = bool(run.get("sandboxed"))
+    run.pop("ai_writes_seen", None)
     if run["state"] == "running":
         with _RUNS_LOCK:
             active = _ACTIVE_RUNS.get(project_id)
@@ -1381,7 +1624,7 @@ def get_test_run(project_id: int, run_id: int) -> dict:
 
 
 def latest_test_run(project_id: int) -> dict | None:
-    with db.connect() as conn:
+    with _test_db() as conn:
         row = conn.execute(
             "SELECT id FROM coding_test_runs WHERE project_id = ? ORDER BY id DESC LIMIT 1", (project_id,)
         ).fetchone()
@@ -1407,8 +1650,10 @@ def cancel_test_run(project_id: int, run_id: int, wait: float = 15.0) -> dict:
 
 
 def stop_test_runs(reason: str = INTERRUPTED_RUN, wait: float = 15.0) -> None:
-    """Kill every running test run (shutdown) and wait until the runs are recorded."""
+    """Shutdown: refuse new runs, kill every running one and wait until the runs are recorded."""
+    global _SHUTDOWN
     with _RUNS_LOCK:
+        _SHUTDOWN = True  # start_test_run checks this under the same lock: no run can slip in
         runs = list(_ACTIVE_RUNS.values())
         for active in runs:
             active.cancel_reason = active.cancel_reason or reason
@@ -1420,12 +1665,14 @@ def stop_test_runs(reason: str = INTERRUPTED_RUN, wait: float = 15.0) -> None:
 
 
 def recover_test_runs() -> int:
-    """Mark runs left ``running`` by an earlier LowRAM AI process as ``error`` (interrupted)."""
+    """Startup: allow runs again and mark runs left ``running`` by an earlier process as interrupted."""
+    global _SHUTDOWN
     with _RUNS_LOCK:
+        _SHUTDOWN = False
         active_ids = [active.run_id for active in _ACTIVE_RUNS.values()]
     marks = ",".join("?" for _ in active_ids)
     extra = f" AND id NOT IN ({marks})" if active_ids else ""
-    with db.connect() as conn, db.transaction(conn):
+    with _test_db() as conn, db.transaction(conn):
         cur = conn.execute(
             "UPDATE coding_test_runs SET state = 'error', error = ?, finished_at = ? WHERE state = 'running'" + extra,
             (INTERRUPTED_RUN, db.utcnow(), *active_ids),

@@ -275,6 +275,7 @@ class WorkflowTests(CodingApiTestCase):
 class TestLoopApiTests(CodingApiTestCase):
     def setUp(self):
         super().setUp()
+        agent.recover_test_runs()  # like app startup: clears the shutdown flag of earlier tests
         self.addCleanup(agent.stop_test_runs)
 
     def finished_run(self, pid, rid):
@@ -297,9 +298,9 @@ class TestLoopApiTests(CodingApiTestCase):
                 self.assertEqual(status, 400, data)
         command = "python3 -c \"import sys; print('calc.py: add is wrong'); sys.exit(2)\""
         status, data = self.api("POST", f"{base}/test-command", {"command": command})
-        self.assertEqual((status, data), (200, {"command": command}))
+        self.assertEqual((status, data), (200, {"command": command, "sandbox": True}))
         status, data = self.api("GET", base)
-        self.assertEqual((data["test_command"], data["last_test_run"]), (command, None))
+        self.assertEqual((data["test_command"], data["test_sandbox"], data["last_test_run"]), (command, True, None))
 
         status, data = self.api("POST", f"{base}/run-tests", {})
         self.assertEqual((status, data["run"]["state"]), (202, "running"), data)
@@ -343,6 +344,27 @@ class TestLoopApiTests(CodingApiTestCase):
         status, data = self.api("POST", f"{base}/test-runs/{rid}/cancel")
         self.assertEqual((status, data["run"]["state"], data["run"]["error"]), (200, "error", agent.CANCELLED_RUN))
         self.assertEqual(self.api("POST", f"{base}/test-runs/{rid}/cancel")[0], 409)
+
+    def test_confirmation_for_ai_written_test_files_and_sandbox_setting(self):
+        pid = self.new_project()
+        base = f"/api/coding/projects/{pid}"
+        self.assertEqual(self.api("POST", f"{base}/test-command", {"command": "python3 -c pass", "sandbox": "no"})[0], 400)
+        status, data = self.api("POST", f"{base}/test-command", {"command": "python3 -c pass", "sandbox": False})
+        self.assertEqual((status, data), (200, {"command": "python3 -c pass", "sandbox": False}))
+        self.assertFalse(self.api("GET", base)[1]["test_sandbox"])
+        agent._record_ai_writes(pid, 1, ["tests/test_calc.py", "calc.py", "Makefile"])  # as approve() does
+        status, data = self.api("POST", f"{base}/run-tests", {})
+        self.assertEqual(status, 409, data)
+        self.assertEqual((data["needs_confirmation"], data["ai_files"]), (True, ["Makefile", "tests/test_calc.py"]))
+        self.assertIn("Trotzdem ausführen?", data["error"])
+        self.assertEqual(self.api("POST", f"{base}/run-tests", {"confirm": "yes"})[0], 400)
+        status, data = self.api("POST", f"{base}/run-tests", {"confirm": True})
+        self.assertEqual(status, 202, data)
+        run = self.finished_run(pid, data["run"]["id"])
+        self.assertEqual((run["state"], run["sandboxed"], run["warning"]), ("passed", False, agent.SANDBOX_OFF_WARNING))
+        status, data = self.api("POST", f"{base}/run-tests", {})  # already confirmed
+        self.assertEqual(status, 202, data)
+        self.finished_run(pid, data["run"]["id"])
 
 
 if __name__ == "__main__":
