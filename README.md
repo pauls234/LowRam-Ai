@@ -40,7 +40,8 @@ internet afterwards – only model/engine downloads you start yourself.
 
 | | |
 | --- | --- |
-| **Chat** | Claude-like conversations with streamed answers, Markdown and code blocks, a collapsible "thinking" section for reasoning models, stop button, chat history. |
+| **Chat** | Claude-like conversations with streamed answers, Markdown and code blocks, a collapsible "thinking" section for reasoning models, stop, regenerate and *continue* (when an answer was cut off), speed shown per answer (tokens/s), custom instructions, text/code file attachments, chat search and Markdown export. |
+| **MacBook-friendly** | Long jobs keep the Mac awake, pause on battery below a threshold you choose (default 20 %), and a notification tells you when a loop, an image or a merged result is ready – start it, do something else, come back later. |
 | **Code** | A code chat mode, plus the coding agent: point it at a project folder, it plans small steps and proposes complete file changes as a diff. **Nothing changes on disk until you click Approve.** The model can never run commands. |
 | **Images & video** | Local generation with [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) (SD-Turbo, SD 1.5, SDXL-Turbo, Wan 2.1 video). Jobs queue up, show progress and can be cancelled. Video is very slow on small machines. |
 | **Task queue** | One task per line; run one, or a bounded loop that stops by itself (queue empty, limit, failure, low RAM, no model, stop button). |
