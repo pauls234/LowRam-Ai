@@ -29,7 +29,7 @@ VERSION = re.search(r'__version__\s*=\s*"([^"]+)"', (ROOT / "backend" / "__init_
 # Feature modules are imported by name (importlib) in backend/app.py, so the
 # import scanner cannot see them. Modules that do not exist yet only produce an
 # "ERROR: Hidden import ... not found" line; the build continues.
-FEATURE_MODULES = ["api_coding", "chat", "engine", "downloads", "media", "cluster", "worker", "power", "diagnostics", "knowledge", "autosplit"]
+FEATURE_MODULES = ["api_coding", "chat", "engine", "downloads", "media", "cluster", "worker", "power", "diagnostics", "knowledge"]
 hiddenimports = sorted(
     {f"backend.{p.stem}" for p in (ROOT / "backend").glob("*.py") if p.stem != "__init__"}
     | {f"backend.{name}" for name in FEATURE_MODULES}
