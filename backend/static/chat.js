@@ -10,16 +10,16 @@
 
   const EXAMPLES = {
     chat: [
-      { title: 'Explain an idea', prompt: 'Explain how a hash map works, with a small example.' },
-      { title: 'Write a friendly email', prompt: 'Help me write a short, friendly email declining a meeting next week.' },
-      { title: 'Plan a weekend', prompt: 'Plan a relaxed weekend in Lisbon on a small budget.' },
-      { title: 'Weigh pros and cons', prompt: 'What are the pros and cons of running AI models locally?' },
+      { title: LR.t('Explain an idea'), prompt: LR.t('Explain how a hash map works, with a small example.') },
+      { title: LR.t('Write a friendly email'), prompt: LR.t('Help me write a short, friendly email declining a meeting next week.') },
+      { title: LR.t('Plan a weekend'), prompt: LR.t('Plan a relaxed weekend in Lisbon on a small budget.') },
+      { title: LR.t('Weigh pros and cons'), prompt: LR.t('What are the pros and cons of running AI models locally?') },
     ],
     code: [
-      { title: 'Write a function', prompt: 'Write a Python function that removes duplicate lines from a file but keeps the order.' },
-      { title: 'Explain a regex', prompt: 'Explain this regular expression step by step: ^(?=.*\\d)[A-Za-z\\d]{8,}$' },
-      { title: 'Find the bug', prompt: 'Why does `for i in range(len(items)): items.pop(i)` fail in Python?' },
-      { title: 'Shell one-liner', prompt: 'Give me a shell command that finds the 10 largest files in a folder.' },
+      { title: LR.t('Write a function'), prompt: LR.t('Write a Python function that removes duplicate lines from a file but keeps the order.') },
+      { title: LR.t('Explain a regex'), prompt: LR.t('Explain this regular expression step by step: ^(?=.*\\d)[A-Za-z\\d]{8,}$') },
+      { title: LR.t('Find the bug'), prompt: LR.t('Why does `for i in range(len(items)): items.pop(i)` fail in Python?') },
+      { title: LR.t('Shell one-liner'), prompt: LR.t('Give me a shell command that finds the 10 largest files in a folder.') },
     ],
   };
 
@@ -52,9 +52,9 @@
 
   function greeting() {
     const hour = new Date().getHours();
-    if (hour >= 5 && hour < 12) return 'Good morning';
-    if (hour >= 12 && hour < 18) return 'Good afternoon';
-    return 'Good evening';
+    if (hour >= 5 && hour < 12) return LR.t('Good morning');
+    if (hour >= 12 && hour < 18) return LR.t('Good afternoon');
+    return LR.t('Good evening');
   }
 
   function paneMode(pane) {
@@ -62,7 +62,7 @@
   }
 
   function makePane(id, chat) {
-    return { id, chat: chat || null, list: h('ol', { class: 'messages', 'aria-label': 'Conversation' }), loaded: id === null, loading: false, count: 0 };
+    return { id, chat: chat || null, list: h('ol', { class: 'messages', 'aria-label': LR.t('Conversation') }), loaded: id === null, loading: false, count: 0 };
   }
 
   /* ------------------------------------------------------------ view */
@@ -82,19 +82,19 @@
     ui.unavailable = h('div', { class: 'chat-unavailable', hidden: true });
     ui.column = h('div', { class: 'chat-column' }, [ui.welcome, ui.unavailable, ui.thread]);
     ui.scroll = h('div', { class: 'chat-scroll' }, ui.column);
-    ui.jump = h('button', { type: 'button', class: 'jump-latest', 'aria-label': 'Jump to the latest message', hidden: true, onclick: () => scrollToBottom(true) }, icon('arrow-down'));
+    ui.jump = h('button', { type: 'button', class: 'jump-latest', 'aria-label': LR.t('Jump to the latest message'), hidden: true, onclick: () => scrollToBottom(true) }, icon('arrow-down'));
     ui.notice = h('div', { class: 'chat-notice' });
     ui.input = h('textarea', {
       class: 'composer-input',
       id: 'composer-input',
       rows: '1',
-      'aria-label': 'Message LowRAM AI',
+      'aria-label': LR.t('Message LowRAM AI'),
       'aria-describedby': 'composer-hint',
       autocomplete: 'off',
       spellcheck: 'true',
     });
     ui.mode = LR.segmented({
-      label: 'Conversation mode',
+      label: LR.t('Conversation mode'),
       cls: 'segmented-sm',
       options: [
         { value: 'chat', label: 'Chat', icon: 'chat' },
@@ -108,8 +108,8 @@
         ui.input.focus();
       },
     });
-    ui.send = h('button', { type: 'submit', class: 'send-btn', 'aria-label': 'Send message', title: 'Send (Enter)', disabled: true }, icon('arrow-up'));
-    ui.stop = h('button', { type: 'button', class: 'stop-btn', 'aria-label': 'Stop generating', title: 'Stop (Esc)', hidden: true, onclick: stopStream }, icon('stop'));
+    ui.send = h('button', { type: 'submit', class: 'send-btn', 'aria-label': LR.t('Send message'), title: LR.t('Send (Enter)'), disabled: true }, icon('arrow-up'));
+    ui.stop = h('button', { type: 'button', class: 'stop-btn', 'aria-label': LR.t('Stop generating'), title: LR.t('Stop (Esc)'), hidden: true, onclick: stopStream }, icon('stop'));
     ui.fileInput = h('input', {
       type: 'file', multiple: true, class: 'visually-hidden', tabindex: '-1', 'aria-hidden': 'true',
       accept: '.txt,.md,.markdown,.csv,.tsv,.json,.yaml,.yml,.toml,.ini,.xml,.html,.css,.js,.mjs,.ts,.tsx,.jsx,.py,.rb,.go,.rs,.java,.kt,.swift,.c,.h,.cpp,.hpp,.cs,.php,.sh,.zsh,.sql,.log,.env.example,text/*',
@@ -118,24 +118,24 @@
       addFiles(ui.fileInput.files);
       ui.fileInput.value = '';
     });
-    ui.attach = h('button', { type: 'button', class: 'icon-btn attach-btn', 'aria-label': 'Attach text or code files', title: 'Attach files (text or code, up to 200 KB)', onclick: () => ui.fileInput.click() }, icon('paperclip'));
-    ui.atts = h('ul', { class: 'att-list composer-atts', 'aria-label': 'Files to send', hidden: true });
+    ui.attach = h('button', { type: 'button', class: 'icon-btn attach-btn', 'aria-label': LR.t('Attach text or code files'), title: LR.t('Attach files (text or code, up to 200 KB)'), onclick: () => ui.fileInput.click() }, icon('paperclip'));
+    ui.atts = h('ul', { class: 'att-list composer-atts', 'aria-label': LR.t('Files to send'), hidden: true });
     ui.attachMsg = h('p', { class: 'attach-msg', role: 'status', hidden: true });
     ui.form = h('form', { class: 'composer', novalidate: true }, [
       ui.atts,
       ui.input,
-      h('div', { class: 'composer-bar' }, [ui.attach, ui.mode.el, h('span', { class: 'composer-spacer' }), ui.stop, ui.send]),
+      h('div', { class: 'composer-bar' }, [ui.attach, ui.mode.el, buildKnowledgePicker(), h('span', { class: 'composer-spacer' }), ui.stop, ui.send]),
       ui.fileInput,
     ]);
     let dragDepth = 0;
     ui.form.addEventListener('dragenter', (ev) => {
-      if (!ev.dataTransfer || ![...ev.dataTransfer.types].includes('Files')) return;
+      if (!ev.dataTransfer || ![...ev.dataTransfer.types].includes(LR.t('Files'))) return;
       ev.preventDefault();
       dragDepth++;
       ui.form.classList.add('is-drop');
     });
     ui.form.addEventListener('dragover', (ev) => {
-      if (ev.dataTransfer && [...ev.dataTransfer.types].includes('Files')) ev.preventDefault();
+      if (ev.dataTransfer && [...ev.dataTransfer.types].includes(LR.t('Files'))) ev.preventDefault();
     });
     ui.form.addEventListener('dragleave', () => {
       dragDepth = Math.max(0, dragDepth - 1);
@@ -150,9 +150,9 @@
     });
     ui.hint = h('p', { class: 'composer-hint', id: 'composer-hint' }, [
       icon('shield'),
-      h('span', { text: 'Runs locally – answers can take a little longer. Nothing leaves this computer.' }),
+      h('span', { text: LR.t('Runs locally – answers can take a little longer. Nothing leaves this computer.') }),
     ]);
-    ui.examples = h('div', { class: 'examples', role: 'list', 'aria-label': 'Example prompts' });
+    ui.examples = h('div', { class: 'examples', role: 'list', 'aria-label': LR.t('Example prompts') });
     ui.dock = h('div', { class: 'composer-dock' }, [ui.notice, ui.form, ui.attachMsg, ui.hint, ui.examples]);
     ui.status = h('div', { class: 'visually-hidden', 'aria-live': 'polite', 'aria-atomic': 'true' });
     ui.root.append(ui.heading, ui.scroll, ui.jump, ui.dock, ui.status);
@@ -178,6 +178,56 @@
     });
     ui.scroll.addEventListener('scroll', onScroll, { passive: true });
     return ui.root;
+  }
+
+  /* ------------------------------------------------------------ knowledge picker (v0.3.1) */
+
+  function buildKnowledgePicker() {
+    const ui = S.ui;
+    const id = 'composer-kb';
+    ui.kbSelect = h('select', { class: 'kb-select', id });
+    ui.kbSelect.addEventListener('change', () => {
+      S.collectionId = ui.kbSelect.value || null;
+      if (S.collectionId) LR.store.set('lowram.chatCollection', S.collectionId);
+      else LR.store.remove('lowram.chatCollection');
+      ui.kbWrap.classList.toggle('is-on', Boolean(S.collectionId));
+    });
+    ui.kbWrap = h('div', { class: 'kb-picker', hidden: true }, [
+      icon('book'),
+      h('label', { class: 'kb-label', for: id, text: LR.t('Answer with knowledge') + ':' }),
+      ui.kbSelect,
+    ]);
+    S.collectionId = LR.store.get('lowram.chatCollection') || null;
+    LR.on('knowledge', renderKnowledgePicker);
+    window.setTimeout(renderKnowledgePicker, 0);
+    return ui.kbWrap;
+  }
+
+  function renderKnowledgePicker() {
+    const ui = S.ui;
+    const kb = LR.knowledge;
+    const cols = kb && kb.available && Array.isArray(kb.collections) ? kb.collections : [];
+    if (!ui.kbWrap) return;
+    ui.kbWrap.hidden = !cols.length;
+    if (S.collectionId && !cols.some((c) => String(c.id) === String(S.collectionId))) S.collectionId = null;
+    ui.kbSelect.replaceChildren(
+      h('option', { value: '', text: LR.t('No knowledge') }),
+      ...cols.map((c) => h('option', { value: String(c.id), text: LR.str(c.name, LR.t('Untitled')) })),
+    );
+    ui.kbSelect.value = S.collectionId ? String(S.collectionId) : '';
+    ui.kbWrap.classList.toggle('is-on', Boolean(S.collectionId));
+  }
+
+  function sourcesBlock(sources) {
+    if (!Array.isArray(sources) || !sources.length) return null;
+    const id = LR.uid('src');
+    return h('section', { class: 'msg-sources', 'aria-labelledby': id }, [
+      h('h3', { class: 'msg-sources-title', id }, [icon('book'), h('span', { text: LR.t('Sources') + ' (' + sources.length + ')' })]),
+      h('ol', { class: 'msg-sources-list' }, sources.map((src) => h('li', { class: 'msg-source' }, [
+        h('p', { class: 'msg-source-doc', text: LR.str(src && src.document, LR.t('(unnamed file)')) }),
+        src && src.snippet ? h('p', { class: 'msg-source-snippet', text: LR.str(src.snippet).slice(0, 400) }) : null,
+      ]))),
+    ]);
   }
 
   function autosize() {
@@ -226,14 +276,14 @@
     ui.welcome.hidden = hasMessages || !available;
     ui.unavailable.hidden = available;
     ui.dock.hidden = !available;
-    ui.greet.textContent = mode === 'code' ? "Let's write some code" : greeting();
+    ui.greet.textContent = mode === 'code' ? LR.t("Let's write some code") : greeting();
     ui.greetSub.textContent = mode === 'code'
-      ? 'Ask about code, paste an error or describe what you want to build.'
-      : 'What can I help you with today?';
-    ui.input.placeholder = mode === 'code' ? 'Ask a coding question…' : hasMessages ? 'Reply to LowRAM AI…' : 'How can I help you today?';
+      ? LR.t('Ask about code, paste an error or describe what you want to build.')
+      : LR.t('What can I help you with today?');
+    ui.input.placeholder = mode === 'code' ? LR.t('Ask a coding question…') : hasMessages ? LR.t('Reply to LowRAM AI…') : LR.t('How can I help you today?');
     ui.mode.set(mode);
     const fixed = Boolean(pane && pane.id !== null);
-    ui.mode.setDisabled(fixed, fixed ? 'The mode is fixed per conversation – start a new chat to switch.' : null);
+    ui.mode.setDisabled(fixed, fixed ? LR.t('The mode is fixed per conversation – start a new chat to switch.') : null);
     ui.examples.hidden = hasMessages;
     if (!hasMessages) {
       ui.examples.replaceChildren(...EXAMPLES[mode].map((ex) => h('button', {
@@ -249,7 +299,7 @@
       }, [h('span', { class: 'example-title', text: ex.title }), h('span', { class: 'example-text', text: ex.prompt })])));
     }
     const chat = pane && pane.chat;
-    const title = chat ? chat.title || 'Untitled chat' : mode === 'code' ? 'New code chat' : 'New chat';
+    const title = chat ? chat.title || LR.t('Untitled chat') : mode === 'code' ? LR.t('New code chat') : LR.t('New chat');
     if (LR.currentRoute && LR.currentRoute() === 'chat') LR.setTitle(title);
     updateSend();
     renderHistoryState();
@@ -260,9 +310,9 @@
     if (ui.unavailable.childElementCount) return;
     ui.unavailable.append(LR.empty({
       icon: 'chat',
-      title: 'Chat is not available in this build',
-      text: 'This version of LowRAM AI was built without the chat module. You can still use the task queue and the other tools.',
-      actions: [LR.button({ text: 'Open the task queue', variant: 'primary', icon: 'tasks', onclick: () => LR.go('#/tasks') })],
+      title: LR.t('Chat is not available in this build'),
+      text: LR.t('This version of LowRAM AI was built without the chat module. You can still use the task queue and the other tools.'),
+      actions: [LR.button({ text: LR.t('Open the task queue'), variant: 'primary', icon: 'tasks', onclick: () => LR.go('#/tasks') })],
       cls: 'empty-page',
     }));
   }
@@ -353,15 +403,15 @@
       pane.list.replaceChildren();
       if (err.status === 404) {
         S.panes.delete(pane.id);
-        LR.toast('That chat no longer exists.', 'info');
+        LR.toast(LR.t('That chat no longer exists.'), 'info');
         LR.go('#/chat/new');
         return;
       }
       pane.list.append(h('li', { class: 'msg' }, LR.callout({
         tone: 'error',
-        title: 'Could not load this chat',
+        title: LR.t('Could not load this chat'),
         text: err.message,
-        actions: [LR.button({ text: 'Try again', icon: 'retry', size: 'sm', onclick: () => loadPane(pane) })],
+        actions: [LR.button({ text: LR.t('Try again'), icon: 'retry', size: 'sm', onclick: () => loadPane(pane) })],
       })));
     } finally {
       pane.loading = false;
@@ -376,21 +426,21 @@
 
   function attachmentChips(list) {
     if (!Array.isArray(list) || !list.length) return null;
-    return h('ul', { class: 'att-list', 'aria-label': 'Attached files' }, list.map((a) => h('li', { class: 'att-chip' }, [
+    return h('ul', { class: 'att-list', 'aria-label': LR.t('Attached files') }, list.map((a) => h('li', { class: 'att-chip' }, [
       icon('file'),
       h('span', { class: 'att-name', text: LR.str(a.name, 'file') }),
       LR.isNum(a.size) ? h('span', { class: 'att-size', text: fmt.bytes(a.size) })
-        : LR.isNum(a.chars) ? h('span', { class: 'att-size', text: fmt.int(a.chars) + ' chars' }) : null,
+        : LR.isNum(a.chars) ? h('span', { class: 'att-size', text: fmt.int(a.chars) + LR.t(' chars') }) : null,
     ])));
   }
 
   function userMessage(content, attachments) {
     return h('li', { class: 'msg msg-user' }, [
-      h('h2', { class: 'visually-hidden', text: 'You said:' }),
+      h('h2', { class: 'visually-hidden', text: LR.t('You said:') }),
       content ? h('div', { class: 'bubble', text: content }) : null,
       attachmentChips(attachments),
       h('div', { class: 'msg-actions' }, [
-        LR.copyButton({ getText: () => content, iconOnly: true, cls: 'icon-btn', ariaLabel: 'Copy your message' }),
+        LR.copyButton({ getText: () => content, iconOnly: true, cls: 'icon-btn', ariaLabel: LR.t('Copy your message') }),
       ]),
     ]);
   }
@@ -400,7 +450,7 @@
 
   function assistantMessage() {
     const thinkId = LR.uid('think');
-    const thinkLabel = h('span', { class: 'thinking-label', text: 'Thinking…' });
+    const thinkLabel = h('span', { class: 'thinking-label', text: LR.t('Thinking…') });
     const thinkBody = h('div', { class: 'thinking-body md', id: thinkId, hidden: true });
     const thinkToggle = h('button', { type: 'button', class: 'thinking-toggle', 'aria-expanded': 'false', 'aria-controls': thinkId }, [
       h('span', { class: 'thinking-icon' }, icon('sparkle')),
@@ -409,19 +459,19 @@
     ]);
     const think = h('div', { class: 'thinking', hidden: true }, [thinkToggle, thinkBody]);
     const body = h('div', { class: 'msg-body md' });
-    const waitText = h('span', { class: 'wait-text', text: 'Working on it…' });
+    const waitText = h('span', { class: 'wait-text', text: LR.t('Working on it…') });
     const wait = h('div', { class: 'msg-wait' }, [h('span', { class: 'typing', 'aria-hidden': 'true' }, [h('i'), h('i'), h('i')]), waitText]);
     const extra = h('div', { class: 'msg-extra' });
     const cont = h('div', { class: 'msg-continue', hidden: true });
     const meta = h('span', { class: 'msg-meta' });
     let answerText = '';
     let reasoningText = '';
-    const copyBtn = LR.copyButton({ getText: () => answerText, iconOnly: true, cls: 'icon-btn', ariaLabel: 'Copy answer' });
-    const retryBtn = h('button', { type: 'button', class: 'icon-btn', 'aria-label': 'Retry', title: 'Retry', hidden: true }, icon('retry'));
-    const regenBtn = h('button', { type: 'button', class: 'icon-btn', 'aria-label': 'Regenerate answer', title: 'Regenerate', hidden: true }, icon('retry'));
+    const copyBtn = LR.copyButton({ getText: () => answerText, iconOnly: true, cls: 'icon-btn', ariaLabel: LR.t('Copy answer') });
+    const retryBtn = h('button', { type: 'button', class: 'icon-btn', 'aria-label': LR.t('Retry'), title: LR.t('Retry'), hidden: true }, icon('retry'));
+    const regenBtn = h('button', { type: 'button', class: 'icon-btn', 'aria-label': LR.t('Regenerate answer'), title: LR.t('Regenerate'), hidden: true }, icon('retry'));
     const actions = h('div', { class: 'msg-actions', hidden: true }, [copyBtn, retryBtn, regenBtn, meta]);
     const li = h('li', { class: 'msg msg-assistant' }, [
-      h('h2', { class: 'visually-hidden', text: 'LowRAM AI said:' }),
+      h('h2', { class: 'visually-hidden', text: LR.t('LowRAM AI said:') }),
       think,
       body,
       wait,
@@ -449,10 +499,10 @@
     function startWait() {
       started = Date.now();
       statusText = '';
-      waitText.textContent = 'Working on it…';
+      waitText.textContent = LR.t('Working on it…');
       window.clearInterval(waitTimer);
       waitTimer = window.setInterval(() => {
-        if ((Date.now() - started) / 1000 > 6) waitText.textContent = (statusText || 'Still working – local models can take a moment') + ' · ' + fmt.clock(Date.now() - started);
+        if ((Date.now() - started) / 1000 > 6) waitText.textContent = (statusText || LR.t('Still working – local models can take a moment')) + ' · ' + fmt.clock(Date.now() - started);
       }, 1000);
     }
     function stopTimers() {
@@ -483,11 +533,11 @@
         const thinking = streaming && !answer;
         think.classList.toggle('is-active', thinking);
         if (thinking) {
-          thinkLabel.textContent = 'Thinking…';
+          thinkLabel.textContent = LR.t('Thinking…');
           if (!userToggled) setExpanded(true);
         } else {
           if (thinkSecs === null && streaming) thinkSecs = (Date.now() - thinkStart) / 1000;
-          thinkLabel.textContent = thinkSecs !== null && thinkSecs >= 1 ? 'Thought for ' + fmt.duration(thinkSecs) : 'Thoughts';
+          thinkLabel.textContent = thinkSecs !== null && thinkSecs >= 1 ? LR.t('Thought for ') + fmt.duration(thinkSecs) : LR.t('Thoughts');
           if (!userToggled) setExpanded(false);
         }
       }
@@ -590,29 +640,31 @@
         actions.hidden = false;
         // Quiet stats line: "14 tok/s · 38 s · Qwen3 4B"
         const parts = [];
-        if (LR.isNum(m.tokens_per_s) && m.tokens_per_s > 0) parts.push((m.tokens_per_s < 10 ? m.tokens_per_s.toFixed(1) : Math.round(m.tokens_per_s)) + ' tok/s');
+        if (LR.isNum(m.tokens_per_s) && m.tokens_per_s > 0) parts.push((m.tokens_per_s < 10 ? m.tokens_per_s.toFixed(1) : Math.round(m.tokens_per_s)) + LR.t(' tok/s'));
         if (LR.isNum(m.duration_s)) parts.push(fmt.duration(m.duration_s));
         if (m.model) parts.push(LR.modelName(m.model));
         meta.textContent = parts.join(' · ');
-        meta.title = LR.isNum(m.tokens) ? fmt.int(m.tokens) + ' tokens' : '';
+        meta.title = LR.isNum(m.tokens) ? fmt.int(m.tokens) + LR.t(' tokens') : '';
         extra.replaceChildren();
         li.classList.remove('is-error', 'is-stopped');
         retryBtn.hidden = true;
         if (m.status === 'stopped') {
           li.classList.add('is-stopped');
-          extra.append(h('p', { class: 'msg-note' }, [icon('stop'), h('span', { text: split.answer ? 'Stopped – the partial answer was kept.' : 'Stopped before an answer arrived.' })]));
+          extra.append(h('p', { class: 'msg-note' }, [icon('stop'), h('span', { text: split.answer ? LR.t('Stopped – the partial answer was kept.') : LR.t('Stopped before an answer arrived.') })]));
           retryBtn.hidden = !retryFn || isSmart(m);
         } else if (m.status === 'error') {
-          api.fail(m.error || 'The answer could not be completed.');
+          api.fail(m.error || LR.t('The answer could not be completed.'));
         } else if (m.status === 'streaming') {
-          extra.append(h('p', { class: 'msg-note' }, [LR.spinner(), h('span', { text: 'Still generating… this view refreshes by itself.' })]));
+          extra.append(h('p', { class: 'msg-note' }, [LR.spinner(), h('span', { text: LR.t('Still generating… this view refreshes by itself.') })]));
           actions.hidden = true;
         } else if (!split.answer) {
-          extra.append(h('p', { class: 'msg-note', text: 'The model returned an empty answer.' }));
+          extra.append(h('p', { class: 'msg-note', text: LR.t('The model returned an empty answer.') }));
         }
+        const srcEl = sourcesBlock(m.sources);
+        if (srcEl) extra.append(srcEl);
         cont.replaceChildren(
-          h('p', { class: 'msg-note' }, [icon('info'), h('span', { text: 'The answer reached the length limit.' })]),
-          LR.button({ text: 'Continue', icon: 'arrow-down', size: 'sm', variant: 'secondary', onclick: () => { if (handlers.cont) handlers.cont(); } }),
+          h('p', { class: 'msg-note' }, [icon('info'), h('span', { text: LR.t('The answer reached the length limit.') })]),
+          LR.button({ text: LR.t('Continue'), icon: 'arrow-down', size: 'sm', variant: 'secondary', onclick: () => { if (handlers.cont) handlers.cont(); } }),
         );
         syncLast();
         scrollToBottom(false);
@@ -625,10 +677,10 @@
         li.classList.add('is-error');
         const modelIssue = /model|engine|llama|server|start/i.test(LR.str(error));
         const btns = [];
-        if (handlers.regenerate && isSmart(message)) btns.push(LR.button({ text: 'Regenerate', icon: 'retry', size: 'sm', variant: 'secondary', onclick: () => handlers.regenerate() }));
-        else if (retryFn) btns.push(LR.button({ text: 'Retry', icon: 'retry', size: 'sm', variant: 'secondary', onclick: () => retryFn() }));
-        if (modelIssue && LR.has('engine')) btns.push(LR.button({ text: 'Open Models', icon: 'sliders', size: 'sm', variant: 'ghost', onclick: () => LR.go('#/settings') }));
-        extra.replaceChildren(LR.callout({ tone: 'error', title: 'The answer could not be completed', text: LR.str(error, 'Unknown error.'), actions: btns, role: 'alert' }));
+        if (handlers.regenerate && isSmart(message)) btns.push(LR.button({ text: LR.t('Regenerate'), icon: 'retry', size: 'sm', variant: 'secondary', onclick: () => handlers.regenerate() }));
+        else if (retryFn) btns.push(LR.button({ text: LR.t('Retry'), icon: 'retry', size: 'sm', variant: 'secondary', onclick: () => retryFn() }));
+        if (modelIssue && LR.has('engine')) btns.push(LR.button({ text: LR.t('Open Models'), icon: 'sliders', size: 'sm', variant: 'ghost', onclick: () => LR.go('#/settings') }));
+        extra.replaceChildren(LR.callout({ tone: 'error', title: LR.t('The answer could not be completed'), text: LR.str(error, LR.t('Unknown error.')), actions: btns, role: 'alert' }));
         actions.hidden = !answerText;
         retryBtn.hidden = true;
         cont.hidden = true;
@@ -655,15 +707,15 @@
   function showNotice(err, retry) {
     const busy = err.status === 409;
     const noModel = err.status === 400 || /model|engine|llama|not running|start/i.test(err.message);
-    let title = 'Could not send your message';
-    if (err.network) title = 'LowRAM AI is not reachable';
-    else if (busy && !noModel) title = 'LowRAM AI is busy right now';
-    else if (noModel) title = 'No model is ready yet';
-    const text = err.message + (busy && !retry ? ' Your message is still in the box – send it again in a moment.' : '');
+    let title = LR.t('Could not send your message');
+    if (err.network) title = LR.t('LowRAM AI is not reachable');
+    else if (busy && !noModel) title = LR.t('LowRAM AI is busy right now');
+    else if (noModel) title = LR.t('No model is ready yet');
+    const text = err.message + (busy && !retry ? LR.t(' Your message is still in the box – send it again in a moment.') : '');
     const actions = [];
-    if (LR.has('engine') && (noModel || busy)) actions.push(LR.button({ text: 'Open Models', icon: 'sliders', size: 'sm', variant: 'primary', onclick: () => LR.go('#/settings') }));
-    actions.push(LR.button({ text: 'Try again', icon: 'retry', size: 'sm', onclick: () => { clearNotice(); if (retry) retry(); else send(); } }));
-    actions.push(LR.button({ text: 'Dismiss', size: 'sm', variant: 'ghost', onclick: clearNotice }));
+    if (LR.has('engine') && (noModel || busy)) actions.push(LR.button({ text: LR.t('Open Models'), icon: 'sliders', size: 'sm', variant: 'primary', onclick: () => LR.go('#/settings') }));
+    actions.push(LR.button({ text: LR.t('Try again'), icon: 'retry', size: 'sm', onclick: () => { clearNotice(); if (retry) retry(); else send(); } }));
+    actions.push(LR.button({ text: LR.t('Dismiss'), size: 'sm', variant: 'ghost', onclick: clearNotice }));
     S.ui.notice.replaceChildren(LR.callout({ tone: busy ? 'warn' : 'error', title, text, actions, role: 'alert', cls: 'notice-pop' }));
   }
 
@@ -686,21 +738,21 @@
     const problems = [];
     for (const file of files) {
       if (S.attachments.length >= MAX_FILES && !S.attachments.some((a) => a.name === file.name)) {
-        problems.push('You can attach up to ' + MAX_FILES + ' files.');
+        problems.push(LR.t('You can attach up to ') + MAX_FILES + LR.t(' files.'));
         break;
       }
-      if (file.size > MAX_FILE_BYTES) { problems.push(file.name + ' is larger than 200 KB.'); continue; }
+      if (file.size > MAX_FILE_BYTES) { problems.push(file.name + LR.t(' is larger than 200 KB.')); continue; }
       if (BINARY_EXT.test(file.name) || /^(image|audio|video)\//.test(file.type) || /pdf|zip|octet-stream/.test(file.type)) {
-        problems.push(file.name + ' is not a text file.');
+        problems.push(file.name + LR.t(' is not a text file.'));
         continue;
       }
       let text;
-      try { text = await file.text(); } catch (_) { problems.push(file.name + ' could not be read.'); continue; }
+      try { text = await file.text(); } catch (_) { problems.push(file.name + LR.t(' could not be read.')); continue; }
       const bad = (text.match(/�/g) || []).length;
-      if (text.includes('\u0000') || bad > Math.max(4, text.length / 100)) { problems.push(file.name + ' looks like a binary file.'); continue; }
+      if (text.includes('\u0000') || bad > Math.max(4, text.length / 100)) { problems.push(file.name + LR.t(' looks like a binary file.')); continue; }
       S.attachments = S.attachments.filter((a) => a.name !== file.name).concat({ name: file.name, size: file.size, content: text });
     }
-    attachNote(problems.length ? problems.join(' ') + ' Only text and code files up to 200 KB work.' : '');
+    attachNote(problems.length ? problems.join(' ') + LR.t(' Only text and code files up to 200 KB work.') : '');
     renderAttachments();
   }
 
@@ -710,7 +762,7 @@
       icon('file'),
       h('span', { class: 'att-name', text: a.name }),
       h('span', { class: 'att-size', text: fmt.bytes(a.size) }),
-      h('button', { type: 'button', class: 'att-remove', 'aria-label': 'Remove ' + a.name, onclick: () => {
+      h('button', { type: 'button', class: 'att-remove', 'aria-label': LR.t('Remove ') + a.name, onclick: () => {
         S.attachments = S.attachments.filter((x) => x !== a);
         renderAttachments();
         ui.input.focus();
@@ -734,7 +786,7 @@
     updateSend();
     renderHistoryState();
     renderLastActions(pane);
-    ui.status.textContent = 'LowRAM AI is answering…';
+    ui.status.textContent = LR.t('LowRAM AI is answering…');
     const base = o.base || { reasoning: '', answer: '' };
     const extraBefore = o.extra || '';
     const view = () => {
@@ -773,13 +825,13 @@
             ctx.done = true;
             const msg = ev.message;
             const split = LR.md.splitThinking(msg && typeof msg.content === 'string' ? msg.content : base.answer + ctx.tokens);
-            a.fail(ev.error || 'The answer could not be completed.', [extraBefore + ctx.reasoning + split.reasoning, split.answer]);
+            a.fail(ev.error || LR.t('The answer could not be completed.'), [extraBefore + ctx.reasoning + split.reasoning, split.answer]);
           }
         },
       });
       if (!ctx.done) {
         if (ctx.stopRequested) a.finish({ content: base.answer + ctx.tokens, status: 'stopped' }, extraBefore + ctx.reasoning);
-        else a.fail('The answer ended unexpectedly. The model server may have stopped.', view());
+        else a.fail(LR.t('The answer ended unexpectedly. The model server may have stopped.'), view());
       }
     } catch (err) {
       if (err && err.name === 'AbortError') {
@@ -791,7 +843,7 @@
       }
     } finally {
       S.stream = null;
-      ui.status.textContent = 'Answer finished.';
+      ui.status.textContent = LR.t('Answer finished.');
       if (S.currentId === ctx.chatId) renderChrome();
       updateSend();
       renderLastActions(pane);
@@ -853,7 +905,7 @@
     const attachments = fromComposer ? S.attachments.slice() : [];
     let content = (fromComposer ? ui.input.value : retryText).trim();
     if (!content && !attachments.length) return;
-    if (!content) content = attachments.length === 1 ? 'Please take a look at the attached file.' : 'Please take a look at the attached files.';
+    if (!content) content = attachments.length === 1 ? LR.t('Please take a look at the attached file.') : LR.t('Please take a look at the attached files.');
     clearNotice();
     let pane = currentPane();
     const restore = fromComposer ? ui.input.value : null;
@@ -902,6 +954,7 @@
     scrollToBottom(true);
 
     const body = { content, percent: budget() };
+    if (S.collectionId && LR.knowledge && LR.knowledge.available) body.collection_id = isNaN(Number(S.collectionId)) ? S.collectionId : Number(S.collectionId);
     if (attachments.length) body.attachments = attachments.map((x) => ({ name: x.name, content: x.content }));
     await runStream({
       pane, a, chatId: pane.id, body,
@@ -955,13 +1008,13 @@
 
   function groupOf(chat) {
     const d = fmt.parseTime(chat.updated_at || chat.created_at);
-    if (!d) return 'Earlier';
+    if (!d) return LR.t('Earlier');
     const today = new Date();
     today.setHours(0, 0, 0, 0);
     const t = d.getTime();
-    if (t >= today.getTime()) return 'Today';
-    if (t >= today.getTime() - 86400000) return 'Yesterday';
-    return 'Earlier';
+    if (t >= today.getTime()) return LR.t('Today');
+    if (t >= today.getTime() - 86400000) return LR.t('Yesterday');
+    return LR.t('Earlier');
   }
 
   function renderHistory() {
@@ -970,7 +1023,7 @@
     closeMenu();
     if (S.searchBox) S.searchBox.hidden = !LR.has('chat') || (S.listLoaded && !S.chats.length && S.results === null);
     if (!LR.has('chat')) {
-      el.replaceChildren(h('p', { class: 'history-empty', text: 'Chat history appears here.' }));
+      el.replaceChildren(h('p', { class: 'history-empty', text: LR.t('Chat history appears here.') }));
       return;
     }
     if (!S.listLoaded) {
@@ -979,7 +1032,7 @@
     }
     if (S.results !== null) {
       if (!S.results.length) {
-        el.replaceChildren(h('p', { class: 'history-empty', text: 'No chats match “' + S.query + '”.' }));
+        el.replaceChildren(h('p', { class: 'history-empty', text: LR.t('No chats match “') + S.query + '”.' }));
         return;
       }
       const id = LR.uid('hist');
@@ -991,10 +1044,10 @@
       return;
     }
     if (!S.chats.length) {
-      el.replaceChildren(h('p', { class: 'history-empty', text: 'Your conversations will appear here.' }));
+      el.replaceChildren(h('p', { class: 'history-empty', text: LR.t('Your conversations will appear here.') }));
       return;
     }
-    const groups = new Map([['Today', []], ['Yesterday', []], ['Earlier', []]]);
+    const groups = new Map([[LR.t('Today'), []], [LR.t('Yesterday'), []], [LR.t('Earlier'), []]]);
     for (const c of S.chats) groups.get(groupOf(c)).push(c);
     const out = [];
     for (const [label, chats] of groups) {
@@ -1010,7 +1063,7 @@
   }
 
   function historyItem(chat) {
-    const title = chat.title || 'Untitled chat';
+    const title = chat.title || LR.t('Untitled chat');
     const link = h('a', { class: 'hist-item', href: '#/chat/' + chat.id, dataset: { id: String(chat.id) } }, [
       chat.mode === 'code' ? icon('code', 'hist-mode') : null,
       h('span', { class: 'hist-title' }, S.results !== null ? highlight(title, S.query) : title),
@@ -1019,7 +1072,7 @@
     const more = h('button', {
       type: 'button',
       class: 'hist-more',
-      'aria-label': 'Options for “' + title + '”',
+      'aria-label': LR.t('Options for “') + title + '”',
       'aria-haspopup': 'menu',
       'aria-expanded': 'false',
     }, icon('more'));
@@ -1070,14 +1123,14 @@
         S.query = q;
         S.results = chats;
         renderHistory();
-        LR.announce(fmt.plural(chats.length, 'chat') + ' found');
+        LR.announce(fmt.plural(chats.length, 'chat') + LR.t(' found'));
       } catch (_) { /* keep the previous list */ }
     }, 250);
   }
 
   function mountSearch(el) {
-    S.searchInput = h('input', { type: 'search', class: 'history-search-input', placeholder: 'Search chats', 'aria-label': 'Search chats', autocomplete: 'off', spellcheck: 'false' });
-    S.searchClear = h('button', { type: 'button', class: 'icon-btn search-clear', 'aria-label': 'Clear search', hidden: true, onclick: () => {
+    S.searchInput = h('input', { type: 'search', class: 'history-search-input', placeholder: LR.t('Search chats'), 'aria-label': LR.t('Search chats'), autocomplete: 'off', spellcheck: 'false' });
+    S.searchClear = h('button', { type: 'button', class: 'icon-btn search-clear', 'aria-label': LR.t('Clear search'), hidden: true, onclick: () => {
       S.searchInput.value = '';
       onSearch();
       S.searchInput.focus();
@@ -1098,7 +1151,7 @@
     try {
       const res = await fetch('/api/chats/' + encodeURIComponent(chat.id) + '/export', { credentials: 'same-origin', cache: 'no-store' });
       if (res.status === 404) {
-        LR.toast('Export is not available in this version', 'info');
+        LR.toast(LR.t('Export is not available in this version'), 'info');
         return;
       }
       if (!res.ok) throw new Error('HTTP ' + res.status);
@@ -1110,9 +1163,9 @@
       a.click();
       a.remove();
       window.setTimeout(() => URL.revokeObjectURL(url), 4000);
-      LR.toast('Exported ' + name);
+      LR.toast(LR.t('Exported ') + name);
     } catch (err) {
-      LR.toast('Could not export: ' + err.message, 'error');
+      LR.toast(LR.t('Could not export: ') + err.message, 'error');
     }
   }
 
@@ -1140,11 +1193,11 @@
   function openMenu(button, chat) {
     closeMenu();
     const items = [
-      h('button', { type: 'button', role: 'menuitem', class: 'menu-item', onclick: () => { closeMenu(); startRename(chat); } }, [icon('pencil'), h('span', { text: 'Rename' })]),
-      h('button', { type: 'button', role: 'menuitem', class: 'menu-item', onclick: () => { closeMenu(); exportChat(chat); } }, [icon('export'), h('span', { text: 'Export as Markdown' })]),
-      h('button', { type: 'button', role: 'menuitem', class: 'menu-item menu-danger', onclick: () => { closeMenu(); deleteChat(chat); } }, [icon('trash'), h('span', { text: 'Delete' })]),
+      h('button', { type: 'button', role: 'menuitem', class: 'menu-item', onclick: () => { closeMenu(); startRename(chat); } }, [icon('pencil'), h('span', { text: LR.t('Rename') })]),
+      h('button', { type: 'button', role: 'menuitem', class: 'menu-item', onclick: () => { closeMenu(); exportChat(chat); } }, [icon('export'), h('span', { text: LR.t('Export as Markdown') })]),
+      h('button', { type: 'button', role: 'menuitem', class: 'menu-item menu-danger', onclick: () => { closeMenu(); deleteChat(chat); } }, [icon('trash'), h('span', { text: LR.t('Delete') })]),
     ];
-    const el = h('div', { class: 'menu', role: 'menu', 'aria-label': 'Chat options' }, items);
+    const el = h('div', { class: 'menu', role: 'menu', 'aria-label': LR.t('Chat options') }, items);
     el.addEventListener('keydown', (ev) => {
       const idx = items.indexOf(document.activeElement);
       if (ev.key === 'ArrowDown' || ev.key === 'ArrowUp') {
@@ -1171,7 +1224,7 @@
   function startRename(chat) {
     const li = S.historyEl.querySelector('.hist-li[data-id="' + CSS.escape(String(chat.id)) + '"]');
     if (!li) return;
-    const input = h('input', { class: 'input hist-rename', type: 'text', maxlength: '200', 'aria-label': 'Chat title' });
+    const input = h('input', { class: 'input hist-rename', type: 'text', maxlength: '200', 'aria-label': LR.t('Chat title') });
     input.value = chat.title || '';
     li.replaceChildren(input);
     input.focus();
@@ -1188,9 +1241,9 @@
           for (const key of ['id', 'title', 'mode', 'updated_at', 'message_count']) {
             if (key in c) chat[key] = c[key];
           }
-          LR.toast('Chat renamed');
+          LR.toast(LR.t('Chat renamed'));
         } catch (err) {
-          LR.toast('Could not rename: ' + err.message, 'error');
+          LR.toast(LR.t('Could not rename: ') + err.message, 'error');
         }
       }
       renderHistory();
@@ -1207,9 +1260,9 @@
 
   async function deleteChat(chat) {
     const ok = await LR.confirm({
-      title: 'Delete this chat?',
-      message: '“' + (chat.title || 'Untitled chat') + '” will be removed from this computer. This cannot be undone.',
-      confirmText: 'Delete',
+      title: LR.t('Delete this chat?'),
+      message: '“' + (chat.title || LR.t('Untitled chat')) + LR.t('” will be removed from this computer. This cannot be undone.'),
+      confirmText: LR.t('Delete'),
       danger: true,
     });
     if (!ok) return;
@@ -1218,11 +1271,11 @@
       S.chats = S.chats.filter((c) => c.id !== chat.id);
       S.panes.delete(chat.id);
       LR.store.remove(draftKey(chat.id));
-      LR.toast('Chat deleted');
+      LR.toast(LR.t('Chat deleted'));
       renderHistory();
       if (S.currentId === chat.id) LR.go('#/chat/new');
     } catch (err) {
-      LR.toast('Could not delete: ' + err.message, 'error');
+      LR.toast(LR.t('Could not delete: ') + err.message, 'error');
     }
   }
 

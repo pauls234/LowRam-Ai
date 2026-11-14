@@ -153,10 +153,10 @@
     },
     eta(sec) {
       if (!isNum(sec) || sec <= 0) return '';
-      if (sec < 10) return 'a few seconds left';
-      if (sec < 60) return 'about ' + Math.round(sec / 5) * 5 + ' s left';
-      if (sec < 3600) return 'about ' + Math.round(sec / 60) + ' min left';
-      return 'about ' + fmt.duration(sec) + ' left';
+      if (sec < 10) return LR.t('a few seconds left');
+      if (sec < 60) return LR.t('about {t} left', { t: Math.round(sec / 5) * 5 + ' s' });
+      if (sec < 3600) return LR.t('about {t} left', { t: Math.round(sec / 60) + ' min' });
+      return LR.t('about {t} left', { t: fmt.duration(sec) });
     },
     clock(ms) {
       const total = Math.max(0, Math.floor(ms / 1000));
@@ -179,16 +179,16 @@
       const d = parseTime(value);
       if (!d) return '';
       const sec = (Date.now() - d.getTime()) / 1000;
-      if (sec < 45) return 'just now';
-      if (sec < 3600) return Math.max(1, Math.round(sec / 60)) + ' min ago';
-      if (sec < 86400) return Math.round(sec / 3600) + ' h ago';
+      if (sec < 45) return LR.t('just now');
+      if (sec < 3600) return LR.t('{n} min ago', { n: Math.max(1, Math.round(sec / 60)) });
+      if (sec < 86400) return LR.t('{n} h ago', { n: Math.round(sec / 3600) });
       return fmt.time(value);
     },
     plural(n, word, many) {
-      return n + ' ' + (n === 1 ? word : many || word + 's');
+      return LR.plural(n, word, many);
     },
     int(n) {
-      return isNum(n) ? Math.round(n).toLocaleString('en-US') : '—';
+      return isNum(n) ? Math.round(n).toLocaleString(LR.locale || 'en-US') : '—';
     },
   };
   LR.fmt = fmt;
@@ -233,7 +233,7 @@
     } catch (err) {
       if (err && err.name === 'AbortError') throw err;
       LR.setBackendDown(true);
-      throw new ApiError('LowRAM AI is not reachable right now.', 0, null, true);
+      throw new ApiError(LR.t('LowRAM AI is not reachable right now.'), 0, null, true);
     }
     LR.setBackendDown(false);
     return res;
@@ -249,7 +249,7 @@
     }
     const message = data && typeof data.error === 'string' && data.error
       ? data.error
-      : 'Request failed (HTTP ' + res.status + ').';
+      : LR.t('Request failed (HTTP ') + res.status + ').';
     if (res.status === 403 && /token/i.test(message)) LR.emit('token-rejected');
     return new ApiError(message, res.status, data);
   }
@@ -261,9 +261,9 @@
     try {
       data = await res.json();
     } catch (_) {
-      throw new ApiError('Unexpected response from LowRAM AI.', res.status);
+      throw new ApiError(LR.t('Unexpected response from LowRAM AI.'), res.status);
     }
-    if (!data || typeof data !== 'object') throw new ApiError('Unexpected response from LowRAM AI.', res.status);
+    if (!data || typeof data !== 'object') throw new ApiError(LR.t('Unexpected response from LowRAM AI.'), res.status);
     return data;
   }
   LR.api = api;
@@ -282,7 +282,7 @@
       let data = null;
       try { data = await res.json(); } catch (_) { data = null; }
       if (data && typeof data.error === 'string') throw new ApiError(data.error, res.status, data);
-      throw new ApiError('Expected a streamed answer from LowRAM AI.', res.status, data);
+      throw new ApiError(LR.t('Expected a streamed answer from LowRAM AI.'), res.status, data);
     }
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
@@ -311,7 +311,7 @@
       }
     } catch (err) {
       if (err && err.name === 'AbortError') throw err;
-      throw new ApiError('The connection to LowRAM AI was interrupted.', 0, null, true);
+      throw new ApiError(LR.t('The connection to LowRAM AI was interrupted.'), 0, null, true);
     }
     buffer += decoder.decode();
     if (buffer.trim()) dispatch(buffer);
@@ -367,7 +367,7 @@
 
   /** A button that copies getText() and briefly confirms with a check mark. */
   LR.copyButton = function (opts) {
-    const label = opts.label || 'Copy';
+    const label = opts.label || LR.t('Copy');
     const textEl = opts.iconOnly ? null : h('span', { text: label });
     const btn = h('button', {
       type: 'button',
@@ -378,9 +378,9 @@
     let timer = 0;
     btn.addEventListener('click', async () => {
       const ok = await LR.copy(opts.getText());
-      btn.replaceChildren(...[icon(ok ? 'check' : 'alert'), opts.iconOnly ? null : h('span', { text: ok ? 'Copied' : 'Copy failed' })].filter(Boolean));
+      btn.replaceChildren(...[icon(ok ? 'check' : 'alert'), opts.iconOnly ? null : h('span', { text: ok ? LR.t('Copied') : LR.t('Copy failed') })].filter(Boolean));
       btn.classList.toggle('is-done', ok);
-      if (opts.iconOnly) LR.announce(ok ? 'Copied to clipboard' : 'Copy failed');
+      if (opts.iconOnly) LR.announce(ok ? LR.t('Copied to clipboard') : LR.t('Copy failed'));
       window.clearTimeout(timer);
       timer = window.setTimeout(() => {
         btn.replaceChildren(...[icon('copy'), textEl].filter(Boolean));
@@ -462,8 +462,8 @@
   LR.unavailable = function (name, text) {
     return LR.empty({
       icon: 'info',
-      title: name + ' is not available in this build',
-      text: text || 'This version of LowRAM AI was built without this part. Everything else keeps working.',
+      title: name + LR.t(' is not available in this build'),
+      text: text || LR.t('This version of LowRAM AI was built without this part. Everything else keeps working.'),
       cls: 'empty-page',
     });
   };
@@ -613,7 +613,7 @@
     const inner = h('div', { class: 'dialog-inner' }, [
       h('div', { class: 'dialog-head' }, [
         h('div', { class: 'dialog-heading' }, [titleEl, subEl]),
-        h('button', { type: 'button', class: 'btn btn-ghost btn-icon dialog-x', 'aria-label': 'Close', onclick: () => close() }, icon('x')),
+        h('button', { type: 'button', class: 'btn btn-ghost btn-icon dialog-x', 'aria-label': LR.t('Close'), onclick: () => close() }, icon('x')),
       ]),
       body,
       foot,
@@ -656,9 +656,9 @@
   LR.confirm = function (o) {
     return new Promise((resolve) => {
       let result = false;
-      const cancel = LR.button({ text: o.cancelText || 'Cancel', variant: 'secondary', onclick: () => m.close() });
+      const cancel = LR.button({ text: o.cancelText || LR.t('Cancel'), variant: 'secondary', onclick: () => m.close() });
       const ok = LR.button({
-        text: o.confirmText || 'Confirm',
+        text: o.confirmText || LR.t('Confirm'),
         variant: o.danger ? 'danger' : 'primary',
         onclick: () => { result = true; m.close(); },
       });
@@ -685,7 +685,7 @@
       const submit = () => {
         const value = control.value.trim();
         if (o.required && !value) {
-          field.setError(o.requiredText || 'This field is required.');
+          field.setError(o.requiredText || LR.t('This field is required.'));
           control.focus();
           return;
         }
@@ -699,8 +699,8 @@
         size: 'sm',
         body: form,
         actions: [
-          LR.button({ text: 'Cancel', variant: 'secondary', onclick: () => m.close() }),
-          LR.button({ text: o.confirmText || 'Save', variant: o.danger ? 'danger' : 'primary', onclick: submit }),
+          LR.button({ text: LR.t('Cancel'), variant: 'secondary', onclick: () => m.close() }),
+          LR.button({ text: o.confirmText || LR.t('Save'), variant: o.danger ? 'danger' : 'primary', onclick: submit }),
         ],
         onClose: () => resolve(result),
       });
@@ -790,5 +790,22 @@
     const models = LR.state.catalog && Array.isArray(LR.state.catalog.models) ? LR.state.catalog.models : [];
     const found = models.find((m) => m.id === id);
     return found && found.name ? found.name : String(id);
+  };
+
+  /**
+   * Model self-heal: an install answered 409 {suggestion: {filename, size_bytes}}
+   * when the catalog file is gone. Offers the suggested file; resolves with the
+   * retried response, or null when declined / not applicable.
+   */
+  LR.offerSuggestion = async function (err, path) {
+    const sug = err && err.status === 409 && err.data && err.data.suggestion;
+    if (!sug || typeof sug.filename !== 'string' || !sug.filename) return null;
+    const ok = await LR.confirm({
+      title: LR.t('File not found – install {file} ({size}) instead?', { file: sug.filename, size: fmt.bytes(sug.size_bytes) }),
+      message: LR.t('The model file is no longer available under its old name. LowRAM AI found a matching file in the same repository.'),
+      confirmText: LR.t('Install instead'),
+    });
+    if (!ok) return null;
+    return LR.post(path, { filename: sug.filename });
   };
 })();

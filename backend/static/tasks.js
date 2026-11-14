@@ -11,17 +11,17 @@
   const STATUS_ORDER = ['pending', 'running', 'done', 'failed', 'proposed', 'approved', 'rejected'];
   const STATUS_TONE = { pending: 'neutral', running: 'accent', done: 'ok', failed: 'error', proposed: 'warn', approved: 'ok', rejected: 'neutral' };
   const STOP_REASONS = {
-    queue_empty: ['ok', 'Queue empty: every pending task was processed.'],
-    max_tasks: ['ok', 'Reached the task limit for this loop.'],
-    failure: ['error', 'Stopped because a task failed.'],
-    paused_low_ram: ['warn', 'Paused: not enough free RAM.'],
-    stop_requested: ['info', 'Stopped on request.'],
-    busy: ['warn', 'Did not start: something else was running.'],
-    error: ['error', 'Stopped because of an unexpected error.'],
-    no_model: ['warn', 'Stopped: no model is running.'],
-    on_battery: ['warn', 'Paused: your Mac is on battery.'],
+    queue_empty: ['ok', LR.t('Queue empty: every pending task was processed.')],
+    max_tasks: ['ok', LR.t('Reached the task limit for this loop.')],
+    failure: ['error', LR.t('Stopped because a task failed.')],
+    paused_low_ram: ['warn', LR.t('Paused: not enough free RAM.')],
+    stop_requested: ['info', LR.t('Stopped on request.')],
+    busy: ['warn', LR.t('Did not start: something else was running.')],
+    error: ['error', LR.t('Stopped because of an unexpected error.')],
+    no_model: ['warn', LR.t('Stopped: no model is running.')],
+    on_battery: ['warn', LR.t('Paused: your Mac is on battery.')],
   };
-  const MERGE_TEXT = { waiting: 'Waiting for all tasks before combining the results…', running: 'Combining the results on this computer…', failed: 'Combining the results failed.' };
+  const MERGE_TEXT = { waiting: LR.t('Waiting for all tasks before combining the results…'), running: LR.t('Combining the results on this computer…'), failed: LR.t('Combining the results failed.') };
   const ERROR_PREVIEW = 240;
   const ui = {};
   const st = {
@@ -33,7 +33,7 @@
 
   const isLoopActive = () => Boolean(st.loop && st.loop.active);
   const projectById = (id) => st.projects.find((p) => p.id === id) || null;
-  const taskLabel = (t) => (t && LR.isNum(t.position) ? 'Task #' + t.position : 'Task');
+  const taskLabel = (t) => (t && LR.isNum(t.position) ? LR.t('Task #') + t.position : LR.t('Task'));
 
   /* ------------------------------------------------------------ data */
 
@@ -138,26 +138,26 @@
       return;
     }
     if (!st.projects.length) {
-      ui.list.replaceChildren(LR.empty({ icon: 'tasks', title: 'No projects yet', text: 'Create one with a task per line – LowRAM AI works through them one at a time.', actions: [LR.button({ text: 'New project', icon: 'plus', variant: 'primary', onclick: newProject })] }));
+      ui.list.replaceChildren(LR.empty({ icon: 'tasks', title: LR.t('No projects yet'), text: LR.t('Create one with a task per line – LowRAM AI works through them one at a time.'), actions: [LR.button({ text: LR.t('New project'), icon: 'plus', variant: 'primary', onclick: newProject })] }));
       return;
     }
     const loopPid = isLoopActive() ? st.loop.project_id : null;
     const sig = JSON.stringify([st.projects, st.selected, loopPid, st.run && st.run.projectId]);
     if (sig === ui.listSig) return;
     ui.listSig = sig;
-    ui.list.replaceChildren(h('ul', { class: 'proj-list', 'aria-label': 'Task projects' }, st.projects.map((p) => {
+    ui.list.replaceChildren(h('ul', { class: 'proj-list', 'aria-label': LR.t('Task projects') }, st.projects.map((p) => {
       const counts = p.counts || {};
       const total = LR.isNum(p.total) ? p.total : STATUS_ORDER.reduce((n, s) => n + (counts[s] || 0), 0);
       const finished = (counts.done || 0) + (counts.approved || 0);
       const bar = LR.progress({ size: 'xs', value: total ? finished / total : 0 });
       bar.el.setAttribute('aria-hidden', 'true');
       const parts = [fmt.plural(total, 'task')];
-      if (counts.done) parts.push(counts.done + ' done');
-      if (counts.failed) parts.push(counts.failed + ' failed');
-      if (counts.pending) parts.push(counts.pending + ' pending');
+      if (counts.done) parts.push(counts.done + LR.t(' done'));
+      if (counts.failed) parts.push(counts.failed + LR.t(' failed'));
+      if (counts.pending) parts.push(counts.pending + LR.t(' pending'));
       return h('li', null, h('a', { class: 'proj-item', href: '#/tasks/' + p.id, 'aria-current': p.id === st.selected ? 'page' : null }, [
         h('span', { class: 'proj-name' }, [
-          h('span', { text: p.name || 'Untitled' }),
+          h('span', { text: p.name || LR.t('Untitled') }),
           p.kind === 'coding' ? LR.badge('coding', 'info') : null,
           p.id === loopPid ? LR.badge('loop', 'accent') : null,
           st.run && st.run.projectId === p.id ? LR.badge('running', 'accent') : null,
@@ -174,8 +174,8 @@
     const was = isLoopActive();
     st.loop = loop;
     if (was && !isLoopActive() && loop) {
-      const reason = STOP_REASONS[loop.stopped_because] || ['info', 'Loop finished.'];
-      LR.announce('Loop finished. ' + reason[1]);
+      const reason = STOP_REASONS[loop.stopped_because] || ['info', LR.t('Loop finished.')];
+      LR.announce(LR.t('Loop finished. ') + reason[1]);
       loadDetail();
     }
     renderLoop();
@@ -205,39 +205,39 @@
     // Progress against what is actually left in the project (the limit is only a cap).
     const left = project && project.counts && LR.isNum(project.counts.pending) ? project.counts.pending + (project.counts.running || 0) : null;
     const planned = left !== null ? Math.min(max || Infinity, completed + failed + left) : max;
-    const bar = LR.progress({ label: 'Loop progress' });
-    bar.set(planned ? Math.min(1, (completed + failed) / planned) : null, completed + ' done' + (planned ? ' of ' + planned : ''));
-    const parts = [completed + ' done'];
-    if (failed) parts.push(failed + ' failed');
+    const bar = LR.progress({ label: LR.t('Loop progress') });
+    bar.set(planned ? Math.min(1, (completed + failed) / planned) : null, completed + LR.t(' done') + (planned ? LR.t(' of ') + planned : ''));
+    const parts = [completed + LR.t(' done')];
+    if (failed) parts.push(failed + LR.t(' failed'));
     if (active && left !== null) parts.push(left + ' left');
-    if (max) parts.push('limit ' + max);
+    if (max) parts.push(LR.t('limit ') + max);
     let tone = 'accent';
-    let title = loop.stop_requested ? 'Loop stopping…' : 'Loop running';
+    let title = loop.stop_requested ? LR.t('Loop stopping…') : LR.t('Loop running');
     if (!active) {
-      const reason = STOP_REASONS[loop.stopped_because] || ['info', 'Loop finished.'];
+      const reason = STOP_REASONS[loop.stopped_because] || ['info', LR.t('Loop finished.')];
       tone = reason[0];
-      title = 'Loop finished';
+      title = LR.t('Loop finished');
       parts.push(reason[1]);
-    } else if (loop.stop_requested) parts.push('ends after the current task');
+    } else if (loop.stop_requested) parts.push(LR.t('ends after the current task'));
     const actions = [];
-    if (project && project.id !== st.selected) actions.push(LR.button({ text: 'View project', size: 'sm', variant: 'ghost', onclick: () => LR.go('#/tasks/' + project.id) }));
+    if (project && project.id !== st.selected) actions.push(LR.button({ text: LR.t('View project'), size: 'sm', variant: 'ghost', onclick: () => LR.go('#/tasks/' + project.id) }));
     if (!active && loop.stopped_because === 'no_model') actions.push(...modelsButton());
-    if (!active && loop.stopped_because === 'on_battery') actions.push(LR.button({ text: 'Power settings', icon: 'battery', size: 'sm', variant: 'ghost', onclick: () => LR.go('#/settings') }));
-    if (active) actions.push(LR.button({ text: loop.stop_requested ? 'Stopping…' : 'Stop loop', icon: 'stop', size: 'sm', variant: 'secondary', disabled: loop.stop_requested, onclick: stopLoop }));
-    else actions.push(LR.button({ text: 'Dismiss', size: 'sm', variant: 'ghost', onclick: () => { st.loopDismissed = loopKey(loop); LR.store.set('lowram.loopDismissed', st.loopDismissed); renderLoop(); } }));
+    if (!active && loop.stopped_because === 'on_battery') actions.push(LR.button({ text: LR.t('Power settings'), icon: 'battery', size: 'sm', variant: 'ghost', onclick: () => LR.go('#/settings') }));
+    if (active) actions.push(LR.button({ text: loop.stop_requested ? LR.t('Stopping…') : LR.t('Stop loop'), icon: 'stop', size: 'sm', variant: 'secondary', disabled: loop.stop_requested, onclick: stopLoop }));
+    else actions.push(LR.button({ text: LR.t('Dismiss'), size: 'sm', variant: 'ghost', onclick: () => { st.loopDismissed = loopKey(loop); LR.store.set('lowram.loopDismissed', st.loopDismissed); renderLoop(); } }));
     ui.loop.className = 'loop-banner tone-' + tone + (active ? ' is-active' : '');
     ui.loop.replaceChildren(
       h('div', { class: 'loop-head' }, [
         active ? LR.spinner() : icon(tone === 'error' ? 'alert' : 'check'),
         h('div', { class: 'loop-heading' }, [
           h('p', { class: 'loop-title', text: title }),
-          h('p', { class: 'loop-sub', text: (project ? project.name : 'Project ' + loop.project_id) + ' · ' + parts.join(' · ') }),
+          h('p', { class: 'loop-sub', text: (project ? project.name : LR.t('Project ') + loop.project_id) + ' · ' + parts.join(' · ') }),
         ]),
         h('div', { class: 'loop-actions' }, actions),
       ]),
       bar.el,
       loop.last_message ? h('p', { class: 'loop-msg', text: LR.str(loop.last_message) }) : null,
-      !active && loop.stopped_because === 'on_battery' ? h('p', { class: 'loop-msg loop-hint' }, [LR.icon('bolt'), h('span', { text: 'Plug in your Mac and run the loop again – or lower the battery limit in Models & Settings.' })]) : null,
+      !active && loop.stopped_because === 'on_battery' ? h('p', { class: 'loop-msg loop-hint' }, [LR.icon('bolt'), h('span', { text: LR.t('Plug in your Mac and run the loop again – or lower the battery limit in Models & Settings.') })]) : null,
     );
   }
 
@@ -247,7 +247,7 @@
     if (!ui.detail) return;
     const p = st.detail && st.detail.project && st.detail.project.id === st.selected ? st.detail.project : projectById(st.selected);
     if (!p) {
-      ui.detail.replaceChildren(LR.empty({ icon: 'tasks', title: st.projects.length ? 'Choose a project' : 'Your task queue', text: 'Write one task per line. LowRAM AI runs them one at a time, waits for free memory, and keeps every result.' }));
+      ui.detail.replaceChildren(LR.empty({ icon: 'tasks', title: st.projects.length ? LR.t('Choose a project') : LR.t('Your task queue'), text: LR.t('Write one task per line. LowRAM AI runs them one at a time, waits for free memory, and keeps every result.') }));
       return;
     }
     const counts = p.counts || {};
@@ -259,42 +259,42 @@
 
     const head = h('div', { class: 'detail-head' }, [
       h('div', { class: 'detail-heading' }, [
-        h('h2', { class: 'detail-title', text: p.name || 'Untitled' }),
-        h('p', { class: 'muted small', text: (coding ? 'Coding project' : 'Task project') + (p.created_at ? ' · created ' + fmt.dateLong(p.created_at) : '') }),
+        h('h2', { class: 'detail-title', text: p.name || LR.t('Untitled') }),
+        h('p', { class: 'muted small', text: (coding ? LR.t('Coding project') : LR.t('Task project')) + (p.created_at ? LR.t(' · created ') + fmt.dateLong(p.created_at) : '') }),
       ]),
-      h('ul', { class: 'count-chips', 'aria-label': 'Task counts' }, STATUS_ORDER.filter((s) => counts[s]).map((s) => h('li', { class: 'badge badge-' + STATUS_TONE[s], text: counts[s] + ' ' + s }))),
+      h('ul', { class: 'count-chips', 'aria-label': LR.t('Task counts') }, STATUS_ORDER.filter((s) => counts[s]).map((s) => h('li', { class: 'badge badge-' + STATUS_TONE[s], text: counts[s] + ' ' + s }))),
     ]);
     const out = [head];
     if (coding) {
-      out.push(LR.callout({ tone: 'info', title: 'This is a coding project', text: 'Review and approve its steps in Code.', actions: LR.has('api_coding') ? [LR.button({ text: 'Open in Code', icon: 'code', size: 'sm', onclick: () => LR.go('#/code/' + p.id) })] : [] }));
+      out.push(LR.callout({ tone: 'info', title: LR.t('This is a coding project'), text: LR.t('Review and approve its steps in Code.'), actions: LR.has('api_coding') ? [LR.button({ text: LR.t('Open in Code'), icon: 'code', size: 'sm', onclick: () => LR.go('#/code/' + p.id) })] : [] }));
     } else {
       const maxId = LR.uid('max');
       ui.maxTasks = h('input', { class: 'input input-number', id: maxId, type: 'number', min: '1', max: '100', step: '1', inputmode: 'numeric', value: LR.store.get('lowram.maxTasks') || '5', disabled: busy });
       ui.maxErr = h('p', { class: 'field-error', hidden: true });
       const controls = h('div', { class: 'run-controls' }, [
-        LR.button({ text: 'Run next task', icon: 'play', variant: 'primary', disabled: busy, onclick: runNext }),
+        LR.button({ text: LR.t('Run next task'), icon: 'play', variant: 'primary', disabled: busy, onclick: runNext }),
         h('div', { class: 'loop-group' }, [
-          h('label', { class: 'inline-label', for: maxId, text: 'Up to' }),
+          h('label', { class: 'inline-label', for: maxId, text: LR.t('Up to') }),
           ui.maxTasks,
-          LR.button({ text: 'Run loop', icon: 'retry', variant: 'secondary', disabled: busy, onclick: startLoop }),
+          LR.button({ text: LR.t('Run loop'), icon: 'retry', variant: 'secondary', disabled: busy, onclick: startLoop }),
         ]),
       ]);
       out.push(controls, ui.maxErr);
       if (st.run) {
         const elapsed = h('span', { class: 'run-elapsed' });
-        out.push(h('p', { class: 'run-busy' }, [LR.spinner(), h('span', { text: st.run.projectId === p.id ? 'Running… local models take their time.' : 'Running a task in “' + st.run.name + '”…' }), elapsed]));
+        out.push(h('p', { class: 'run-busy' }, [LR.spinner(), h('span', { text: st.run.projectId === p.id ? LR.t('Running… local models take their time.') : LR.t('Running a task in “') + st.run.name + '”…' }), elapsed]));
         if (ui.stopRunTimer) ui.stopRunTimer();
         ui.stopRunTimer = LR.elapsed(elapsed, st.run.started);
       }
-      let hint = 'Runs with a ' + LR.budgetPercent() + '% memory budget. Results are saved on this computer.';
-      if (loopActive) hint = 'A loop is running – stop it above to run single tasks.';
-      else if (mem && mem.can_run === false) hint = 'Not enough free RAM right now; a run would pause. Close other apps, then try again.';
+      let hint = LR.t('Runs with a ') + LR.budgetPercent() + LR.t('% memory budget. Results are saved on this computer.');
+      if (loopActive) hint = LR.t('A loop is running – stop it above to run single tasks.');
+      else if (mem && mem.can_run === false) hint = LR.t('Not enough free RAM right now; a run would pause. Close other apps, then try again.');
       out.push(h('p', { class: 'help' + (mem && mem.can_run === false ? ' is-warn' : ''), text: hint }));
       if (LR.has('cluster')) out.push(distributeRow(p, busy));
     }
     out.push(ui.finalSlot, ui.outcome);
     if (tasks === null) out.push(LR.skeleton(4));
-    else if (!tasks.length) out.push(LR.empty({ icon: 'list', title: 'This project has no tasks' }));
+    else if (!tasks.length) out.push(LR.empty({ icon: 'list', title: LR.t('This project has no tasks') }));
     else out.push(taskTable(tasks, coding));
     ui.detail.replaceChildren(...out);
     renderFinal();
@@ -312,12 +312,12 @@
       : null;
     return h('div', { class: 'distribute' }, [
       h('div', { class: 'distribute-text' }, [
-        h('p', { class: 'strong' }, [icon('devices'), h('span', { text: on ? 'Shared with your devices' : 'Run on all devices' })]),
-        h('p', { class: 'muted small', text: on ? 'Paired computers pick up pending tasks while this one works too.' : 'Paired computers on your network help work through the pending tasks.' }),
-        h('label', { class: 'check-row', for: mergeId }, [merge, h('span', { text: 'Combine all results into one final answer at the end' })]),
+        h('p', { class: 'strong' }, [icon('devices'), h('span', { text: on ? LR.t('Shared with your devices') : LR.t('Run on all devices') })]),
+        h('p', { class: 'muted small', text: on ? LR.t('Paired computers pick up pending tasks while this one works too.') : LR.t('Paired computers on your network help work through the pending tasks.') }),
+        h('label', { class: 'check-row', for: mergeId }, [merge, h('span', { text: LR.t('Combine all results into one final answer at the end') })]),
         mergeNote,
       ]),
-      LR.button({ text: on ? 'Share again' : 'Run on all devices', icon: 'merge', variant: 'secondary', disabled: busy, onclick: (ev) => distribute(p, merge.checked, ev.currentTarget) }),
+      LR.button({ text: on ? LR.t('Share again') : LR.t('Run on all devices'), icon: 'merge', variant: 'secondary', disabled: busy, onclick: (ev) => distribute(p, merge.checked, ev.currentTarget) }),
     ]);
   }
 
@@ -332,7 +332,7 @@
     LR.md.render(body, f.content);
     ui.finalSlot.replaceChildren(h('section', { class: 'final-card', 'aria-labelledby': 'final-title' }, [
       h('div', { class: 'final-head' }, [
-        h('div', null, [h('p', { class: 'eyebrow', text: 'Merged from all devices' }), h('h3', { class: 'final-title', id: 'final-title', text: 'Final result' })]),
+        h('div', null, [h('p', { class: 'eyebrow', text: LR.t('Merged from all devices') }), h('h3', { class: 'final-title', id: 'final-title', text: LR.t('Final result') })]),
         LR.copyButton({ getText: () => f.content }),
       ]),
       body,
@@ -343,44 +343,44 @@
   function taskTable(tasks, coding) {
     const rows = tasks.map((t) => {
       const status = STATUS_ORDER.includes(t.status) ? t.status : 'pending';
-      const titleCell = h('td', { class: 'col-title' }, h('span', { class: 'task-title', text: t.title || '(untitled task)' }));
+      const titleCell = h('td', { class: 'col-title' }, h('span', { class: 'task-title', text: t.title || LR.t('(untitled task)') }));
       if (t.status === 'failed' && t.error) {
         const err = LR.str(t.error);
         const p = h('p', { class: 'task-error' });
         if (err.length > ERROR_PREVIEW) {
-          p.append(err.slice(0, ERROR_PREVIEW).trimEnd() + '… ', h('button', { type: 'button', class: 'link-btn', text: 'Show full error', onclick: () => textDialog(taskLabel(t) + ' error', t.title, err) }));
+          p.append(err.slice(0, ERROR_PREVIEW).trimEnd() + '… ', h('button', { type: 'button', class: 'link-btn', text: LR.t('Show full error'), onclick: () => textDialog(taskLabel(t) + LR.t(' error'), t.title, err) }));
         } else p.textContent = err;
         titleCell.append(p);
       }
       const actions = [];
-      if (t.has_result) actions.push(LR.button({ text: 'Result', icon: 'eye', size: 'sm', variant: 'secondary', label: 'View result of ' + taskLabel(t), onclick: () => openResult(t) }));
-      if (t.status === 'failed' && !coding) actions.push(LR.button({ text: 'Retry', icon: 'retry', size: 'sm', variant: 'ghost', label: 'Retry ' + taskLabel(t), onclick: (ev) => retryTask(t, ev.currentTarget) }));
+      if (t.has_result) actions.push(LR.button({ text: LR.t('Result'), icon: 'eye', size: 'sm', variant: 'secondary', label: LR.t('View result of ') + taskLabel(t), onclick: () => openResult(t) }));
+      if (t.status === 'failed' && !coding) actions.push(LR.button({ text: LR.t('Retry'), icon: 'retry', size: 'sm', variant: 'ghost', label: LR.t('Retry ') + taskLabel(t), onclick: (ev) => retryTask(t, ev.currentTarget) }));
       const isCurrent = status === 'running' || (isLoopActive() && st.loop.current_task_id === t.id);
       return h('tr', { class: isCurrent ? 'is-running' : null }, [
         h('td', { class: 'col-pos', text: LR.isNum(t.position) ? String(t.position) : '' }),
         titleCell,
         h('td', { class: 'col-status' }, h('span', { class: 'badge badge-' + STATUS_TONE[status] }, [isCurrent ? LR.spinner('spinner-xs') : null, h('span', { text: status })])),
-        h('td', { class: 'col-attempts' }, [h('span', { class: 'cell-label', text: 'Attempts ' }), String(LR.isNum(t.attempts) ? t.attempts : 0)]),
+        h('td', { class: 'col-attempts' }, [h('span', { class: 'cell-label', text: LR.t('Attempts ') }), String(LR.isNum(t.attempts) ? t.attempts : 0)]),
         h('td', { class: 'col-finished' }, t.finished_at ? h('time', { datetime: String(t.finished_at), title: fmt.dateLong(t.finished_at), text: fmt.time(t.finished_at) }) : h('span', { class: 'muted', text: '—' })),
         h('td', { class: 'col-actions' }, actions.length ? h('div', { class: 'row-actions' }, actions) : null),
       ]);
     });
     return h('div', { class: 'table-scroll' }, h('table', { class: 'task-table' }, [
-      h('caption', { class: 'visually-hidden', text: 'Tasks in this project' }),
+      h('caption', { class: 'visually-hidden', text: LR.t('Tasks in this project') }),
       h('thead', null, h('tr', null, [
         h('th', { scope: 'col', class: 'col-pos', text: '#' }),
-        h('th', { scope: 'col', text: 'Task' }),
+        h('th', { scope: 'col', text: LR.t('Task') }),
         h('th', { scope: 'col', text: 'Status' }),
-        h('th', { scope: 'col', class: 'col-attempts', text: 'Tries' }),
-        h('th', { scope: 'col', class: 'col-finished', text: 'Finished' }),
-        h('th', { scope: 'col' }, h('span', { class: 'visually-hidden', text: 'Actions' })),
+        h('th', { scope: 'col', class: 'col-attempts', text: LR.t('Tries') }),
+        h('th', { scope: 'col', class: 'col-finished', text: LR.t('Finished') }),
+        h('th', { scope: 'col' }, h('span', { class: 'visually-hidden', text: LR.t('Actions') })),
       ])),
       h('tbody', null, rows),
     ]));
   }
 
   function modelsButton() {
-    return LR.has('engine') ? [LR.button({ text: 'Open Models', icon: 'sliders', size: 'sm', variant: 'primary', onclick: () => LR.go('#/settings') })] : [];
+    return LR.has('engine') ? [LR.button({ text: LR.t('Open Models'), icon: 'sliders', size: 'sm', variant: 'primary', onclick: () => LR.go('#/settings') })] : [];
   }
 
   function showOutcome(tone, title, text, actions) {
@@ -392,7 +392,7 @@
   async function runNext() {
     const p = projectById(st.selected);
     if (!p || st.run || isLoopActive()) return;
-    st.run = { projectId: p.id, name: p.name || 'Untitled', started: Date.now() };
+    st.run = { projectId: p.id, name: p.name || LR.t('Untitled'), started: Date.now() };
     ui.outcome.replaceChildren();
     renderDetail();
     renderList();
@@ -401,15 +401,15 @@
       const data = await LR.post('/api/projects/' + p.id + '/run', { percent: LR.budgetPercent() });
       const task = data.task || null;
       const label = taskLabel(task);
-      if (data.status === 'done') showOutcome('ok', label + ' done', task ? task.title : '', task ? [LR.button({ text: 'View result', size: 'sm', onclick: () => openResult(task) })] : []);
-      else if (data.status === 'failed') showOutcome('error', label + ' failed', LR.str(data.error || data.reason, 'Unknown error.'), task ? [LR.button({ text: 'Retry task', size: 'sm', onclick: (ev) => retryTask(task, ev.currentTarget) })] : []);
-      else if (data.status === 'paused') showOutcome('warn', 'Paused – low RAM', LR.str(data.reason, 'Not enough free memory to start a task.'));
-      else if (data.status === 'empty') showOutcome('info', 'Nothing to run', LR.str(data.reason, 'This project has no pending tasks.'));
-      else if (data.status === 'on_battery') showOutcome('warn', 'Paused – on battery', LR.str(data.reason, 'Plug in your Mac to run long tasks.'), [LR.button({ text: 'Power settings', icon: 'battery', size: 'sm', onclick: () => LR.go('#/settings') })]);
-      else if (data.status === 'no_model') showOutcome('warn', 'No model is running', LR.str(data.reason, 'Start a model first.'), modelsButton());
-      else showOutcome('info', 'Run finished', 'Status: ' + LR.str(data.status));
+      if (data.status === 'done') showOutcome('ok', label + LR.t(' done'), task ? task.title : '', task ? [LR.button({ text: LR.t('View result'), size: 'sm', onclick: () => openResult(task) })] : []);
+      else if (data.status === 'failed') showOutcome('error', label + LR.t(' failed'), LR.str(data.error || data.reason, LR.t('Unknown error.')), task ? [LR.button({ text: LR.t('Retry task'), size: 'sm', onclick: (ev) => retryTask(task, ev.currentTarget) })] : []);
+      else if (data.status === 'paused') showOutcome('warn', LR.t('Paused – low RAM'), LR.str(data.reason, LR.t('Not enough free memory to start a task.')));
+      else if (data.status === 'empty') showOutcome('info', LR.t('Nothing to run'), LR.str(data.reason, LR.t('This project has no pending tasks.')));
+      else if (data.status === 'on_battery') showOutcome('warn', LR.t('Paused – on battery'), LR.str(data.reason, LR.t('Plug in your Mac to run long tasks.')), [LR.button({ text: LR.t('Power settings'), icon: 'battery', size: 'sm', onclick: () => LR.go('#/settings') })]);
+      else if (data.status === 'no_model') showOutcome('warn', LR.t('No model is running'), LR.str(data.reason, LR.t('Start a model first.')), modelsButton());
+      else showOutcome('info', LR.t('Run finished'), 'Status: ' + LR.str(data.status));
     } catch (err) {
-      showOutcome(err.status === 409 ? 'warn' : 'error', err.status === 409 ? 'Busy' : 'Run failed', err.network ? 'LowRAM AI could not be reached. The task may still be running.' : err.message);
+      showOutcome(err.status === 409 ? 'warn' : 'error', err.status === 409 ? LR.t('Busy') : LR.t('Run failed'), err.network ? LR.t('LowRAM AI could not be reached. The task may still be running.') : err.message);
     } finally {
       if (ui.stopRunTimer) { ui.stopRunTimer(); ui.stopRunTimer = null; }
       st.run = null;
@@ -424,7 +424,7 @@
     const n = Number(ui.maxTasks.value);
     if (!Number.isInteger(n) || n < 1 || n > 100) {
       ui.maxTasks.setAttribute('aria-invalid', 'true');
-      ui.maxErr.textContent = 'Choose a whole number from 1 to 100.';
+      ui.maxErr.textContent = LR.t('Choose a whole number from 1 to 100.');
       ui.maxErr.hidden = false;
       ui.maxTasks.focus();
       return null;
@@ -448,9 +448,9 @@
       st.loopDismissed = null;
       LR.store.remove('lowram.loopDismissed');
       if (data.loop) applyLoop(data.loop);
-      LR.announce('Loop started: up to ' + fmt.plural(max, 'task') + ', one at a time.');
+      LR.announce(LR.t('Loop started: up to ') + fmt.plural(max, 'task') + LR.t(', one at a time.'));
     } catch (err) {
-      showOutcome(err.status === 409 ? 'warn' : 'error', 'Could not start the loop', err.message);
+      showOutcome(err.status === 409 ? 'warn' : 'error', LR.t('Could not start the loop'), err.message);
     } finally {
       st.loopRequest = false;
       renderDetail();
@@ -464,7 +464,7 @@
       const data = await LR.post('/api/loop/stop', {});
       if (data.loop) applyLoop(data.loop);
     } catch (err) {
-      showOutcome('error', 'Could not stop the loop', err.message);
+      showOutcome('error', LR.t('Could not stop the loop'), err.message);
     }
   }
 
@@ -473,9 +473,9 @@
     try {
       const data = await LR.post('/api/tasks/' + task.id + '/retry', {});
       const t = data.task || task;
-      showOutcome('info', taskLabel(t) + ' queued again', LR.str(t.title) + ' is back in the queue.');
+      showOutcome('info', taskLabel(t) + LR.t(' queued again'), LR.str(t.title) + LR.t(' is back in the queue.'));
     } catch (err) {
-      showOutcome('error', 'Could not retry ' + taskLabel(task), err.message);
+      showOutcome('error', LR.t('Could not retry ') + taskLabel(task), err.message);
     } finally {
       await loadDetail();
       loadProjects().catch(() => {});
@@ -483,31 +483,31 @@
   }
 
   async function distribute(p, merge, btn) {
-    LR.setBusy(btn, true, 'Sharing…');
+    LR.setBusy(btn, true, LR.t('Sharing…'));
     try {
       await LR.post('/api/cluster/projects/' + p.id + '/distribute', { percent: LR.budgetPercent(), merge });
       st.distributed.add(p.id);
       await loadShared().catch(() => {});
       LR.store.set('lowram.distributed', [...st.distributed].slice(-50).join(','));
       if (st.finalFor === p.id) { st.final = null; st.finalFor = null; renderFinal(); }
-      showOutcome('ok', 'Shared with your devices', merge ? 'Helpers pick up pending tasks now. The combined final answer appears here when everything is done.' : 'Helpers pick up pending tasks now.');
+      showOutcome('ok', LR.t('Shared with your devices'), merge ? LR.t('Helpers pick up pending tasks now. The combined final answer appears here when everything is done.') : LR.t('Helpers pick up pending tasks now.'));
       poller.now();
     } catch (err) {
-      showOutcome(err.status === 409 ? 'warn' : 'error', 'Could not share the project', err.message, [LR.button({ text: 'Open Devices', size: 'sm', onclick: () => LR.go('#/devices') })]);
+      showOutcome(err.status === 409 ? 'warn' : 'error', LR.t('Could not share the project'), err.message, [LR.button({ text: LR.t('Open Devices'), size: 'sm', onclick: () => LR.go('#/devices') })]);
     } finally {
       renderDetail();
     }
   }
 
   async function recover() {
-    const ok = await LR.confirm({ title: 'Recover stuck tasks?', message: 'Tasks left “running” by a crash or a closed app are marked as failed so you can retry them.', confirmText: 'Recover' });
+    const ok = await LR.confirm({ title: LR.t('Recover stuck tasks?'), message: LR.t('Tasks left “running” by a crash or a closed app are marked as failed so you can retry them.'), confirmText: LR.t('Recover') });
     if (!ok) return;
     try {
       const data = await LR.post('/api/recover', {});
       const ids = Array.isArray(data.recovered) ? data.recovered : [];
-      LR.toast(ids.length ? 'Recovered ' + fmt.plural(ids.length, 'task') : 'No stuck tasks found', 'info');
+      LR.toast(ids.length ? LR.t('Recovered ') + fmt.plural(ids.length, 'task') : LR.t('No stuck tasks found'), 'info');
     } catch (err) {
-      LR.toast('Could not recover: ' + err.message, 'error');
+      LR.toast(LR.t('Could not recover: ') + err.message, 'error');
     } finally {
       poller.now();
     }
@@ -523,48 +523,48 @@
     const body = h('div', { class: 'result-body md', tabindex: '0' }, LR.skeleton(6));
     const raw = h('pre', { class: 'result-pre', tabindex: '0', hidden: true });
     let content = '';
-    const toggle = LR.button({ text: 'Show plain text', size: 'sm', variant: 'ghost', disabled: true, onclick: () => {
+    const toggle = LR.button({ text: LR.t('Show plain text'), size: 'sm', variant: 'ghost', disabled: true, onclick: () => {
       const showRaw = raw.hidden;
       raw.hidden = !showRaw;
       body.hidden = showRaw;
-      toggle.querySelector('span').textContent = showRaw ? 'Show formatted' : 'Show plain text';
+      toggle.querySelector('span').textContent = showRaw ? LR.t('Show formatted') : LR.t('Show plain text');
     } });
     const copy = LR.copyButton({ getText: () => content, cls: 'btn btn-secondary btn-sm' });
-    const m = LR.modal({ title: taskLabel(task) + (task.title ? ': ' + task.title : ''), size: 'lg', body: [body, raw], actions: [toggle, h('span', { class: 'spacer' }), copy, LR.button({ text: 'Close', variant: 'primary', size: 'sm', onclick: () => m.close() })] });
+    const m = LR.modal({ title: taskLabel(task) + (task.title ? ': ' + task.title : ''), size: 'lg', body: [body, raw], actions: [toggle, h('span', { class: 'spacer' }), copy, LR.button({ text: LR.t('Close'), variant: 'primary', size: 'sm', onclick: () => m.close() })] });
     try {
       const data = await LR.get('/api/tasks/' + task.id + '/result');
       content = LR.str(data.content);
-      m.setSub((data.path ? data.path + ' · ' : '') + fmt.int(content.length) + ' characters' + (data.truncated ? ' (truncated)' : ''));
+      m.setSub((data.path ? data.path + ' · ' : '') + fmt.int(content.length) + LR.t(' characters') + (data.truncated ? LR.t(' (truncated)') : ''));
       if (content) LR.md.render(body, content);
-      else body.replaceChildren(h('p', { class: 'muted', text: 'The result file is empty.' }));
+      else body.replaceChildren(h('p', { class: 'muted', text: LR.t('The result file is empty.') }));
       raw.textContent = content;
       toggle.disabled = false;
     } catch (err) {
-      body.replaceChildren(LR.callout({ tone: 'error', title: 'Could not load the result', text: err.status === 404 ? 'No result is stored for this task.' : err.message }));
+      body.replaceChildren(LR.callout({ tone: 'error', title: LR.t('Could not load the result'), text: err.status === 404 ? LR.t('No result is stored for this task.') : err.message }));
     }
   }
 
   function newProject() {
-    const name = h('input', { class: 'input', type: 'text', maxlength: '200', autocomplete: 'off', placeholder: 'e.g. Release notes' });
-    const tasks = h('textarea', { class: 'input textarea', rows: '7', placeholder: 'Summarize the changelog\nDraft the announcement\nList open questions' });
+    const name = h('input', { class: 'input', type: 'text', maxlength: '200', autocomplete: 'off', placeholder: LR.t('e.g. Release notes') });
+    const tasks = h('textarea', { class: 'input textarea', rows: '7', placeholder: LR.t('Summarize the changelog\nDraft the announcement\nList open questions') });
     const count = h('p', { class: 'help', 'aria-live': 'polite', text: '0 tasks' });
     const fName = LR.field({ label: 'Name', control: name });
-    const fTasks = LR.field({ label: 'Tasks – one per line', control: tasks });
+    const fTasks = LR.field({ label: LR.t('Tasks – one per line'), control: tasks });
     fTasks.el.append(count);
     const lines = () => tasks.value.split('\n').map((l) => l.trim()).filter(Boolean);
     tasks.addEventListener('input', () => { count.textContent = fmt.plural(lines().length, 'task'); });
     const form = h('form', { class: 'form', novalidate: true }, [fName.el, fTasks.el]);
-    const createBtn = LR.button({ text: 'Create project', variant: 'primary', onclick: (ev) => submit(ev.currentTarget) });
+    const createBtn = LR.button({ text: LR.t('Create project'), variant: 'primary', onclick: (ev) => submit(ev.currentTarget) });
     async function submit(btn) {
       fName.setError('');
       fTasks.setError('');
-      if (!name.value.trim()) { fName.setError('Enter a project name.'); name.focus(); return; }
-      if (!lines().length) { fTasks.setError('Add at least one task, one per line.'); tasks.focus(); return; }
-      LR.setBusy(btn, true, 'Creating…');
+      if (!name.value.trim()) { fName.setError(LR.t('Enter a project name.')); name.focus(); return; }
+      if (!lines().length) { fTasks.setError(LR.t('Add at least one task, one per line.')); tasks.focus(); return; }
+      LR.setBusy(btn, true, LR.t('Creating…'));
       try {
         const data = await LR.post('/api/projects', { name: name.value.trim(), tasks: tasks.value });
         m.close();
-        LR.toast('Project created');
+        LR.toast(LR.t('Project created'));
         await loadProjects();
         if (data.project) LR.go('#/tasks/' + data.project.id);
       } catch (err) {
@@ -573,7 +573,7 @@
       }
     }
     form.addEventListener('submit', (ev) => { ev.preventDefault(); submit(createBtn); });
-    const m = LR.modal({ title: 'New task project', sub: 'Each line becomes one task for the local model.', body: form, actions: [LR.button({ text: 'Cancel', onclick: () => m.close() }), createBtn] });
+    const m = LR.modal({ title: LR.t('New task project'), sub: LR.t('Each line becomes one task for the local model.'), body: form, actions: [LR.button({ text: LR.t('Cancel'), onclick: () => m.close() }), createBtn] });
     name.focus();
   }
 
@@ -582,25 +582,25 @@
   function create() {
     const root = h('section', { class: 'view view-page', 'aria-labelledby': 'tasks-title' });
     const head = LR.pageHead({
-      title: 'Task queue',
-      sub: 'Queue up text tasks and let the local model work through them one at a time – even overnight.',
-      actions: [LR.button({ text: 'Recover stuck tasks', variant: 'ghost', onclick: recover }), LR.button({ text: 'New project', icon: 'plus', variant: 'primary', onclick: newProject })],
+      title: LR.t('Task queue'),
+      sub: LR.t('Queue up text tasks and let the local model work through them one at a time – even overnight.'),
+      actions: [LR.button({ text: LR.t('Recover stuck tasks'), variant: 'ghost', onclick: recover }), LR.button({ text: LR.t('New project'), icon: 'plus', variant: 'primary', onclick: newProject })],
     });
     head.querySelector('h1').id = 'tasks-title';
     ui.list = h('div', { class: 'proj-list-wrap' });
-    ui.loop = h('section', { class: 'loop-banner', 'aria-live': 'polite', 'aria-label': 'Loop status', hidden: true });
+    ui.loop = h('section', { class: 'loop-banner', 'aria-live': 'polite', 'aria-label': LR.t('Loop status'), hidden: true });
     ui.detail = h('div', { class: 'card detail-card' });
     ui.outcome = h('div', { class: 'outcome', 'aria-live': 'polite' });
     ui.finalSlot = h('div', { class: 'final-slot' });
     root.append(h('div', { class: 'page page-wide' }, [head, h('div', { class: 'split' }, [
-      h('aside', { class: 'split-side', 'aria-label': 'Projects' }, ui.list),
+      h('aside', { class: 'split-side', 'aria-label': LR.t('Projects') }, ui.list),
       h('div', { class: 'split-main' }, [ui.loop, ui.detail]),
     ])]));
     return root;
   }
 
   LR.registerView('tasks', {
-    title: 'Task queue',
+    title: LR.t('Task queue'),
     create,
     show(params) {
       const id = params[0] && /^\d+$/.test(params[0]) ? Number(params[0]) : null;

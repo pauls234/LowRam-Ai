@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="de">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
@@ -12,6 +12,7 @@
   <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/static/app.css">
   <script src="/static/theme.js"></script>
+  <script src="/static/i18n.js" defer></script>
   <script src="/static/core.js" defer></script>
   <script src="/static/markdown.js" defer></script>
   <script src="/static/downloads.js" defer></script>
@@ -22,6 +23,8 @@
   <script src="/static/devices.js" defer></script>
   <script src="/static/settings.js" defer></script>
   <script src="/static/setup.js" defer></script>
+  <script src="/static/knowledge.js" defer></script>
+  <script src="/static/diagnostics.js" defer></script>
   <script src="/static/app.js" defer></script>
 </head>
 <body>
@@ -80,6 +83,8 @@
     <symbol id="i-battery" viewBox="0 0 24 24"><rect x="2.5" y="7" width="17" height="10" rx="2.5"/><path d="M22 10.5v3"/></symbol>
     <symbol id="i-bolt" viewBox="0 0 24 24"><path d="M13 3 6 13.5h5l-1 7.5 7-10.5h-5Z"/></symbol>
     <symbol id="i-export" viewBox="0 0 24 24"><path d="M12 15V4M7.5 8.5 12 4l4.5 4.5M5 14v4.5A1.5 1.5 0 0 0 6.5 20h11a1.5 1.5 0 0 0 1.5-1.5V14"/></symbol>
+    <symbol id="i-book" viewBox="0 0 24 24"><path d="M4 5.5A2.5 2.5 0 0 1 6.5 3H20v15H6.5A2.5 2.5 0 0 0 4 20.5ZM4 20.5A2.5 2.5 0 0 0 6.5 23H20v-5M8 7.5h8M8 11h6"/></symbol>
+    <symbol id="i-pulse" viewBox="0 0 24 24"><path d="M3 12h4l2.5-6 4 12 2.5-6H21"/></symbol>
     <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/></symbol>
   </svg>
 
@@ -108,8 +113,10 @@
           <li><a class="nav-link" href="#/code" data-route="code"><svg class="icon" aria-hidden="true"><use href="#i-code"></use></svg><span>Code</span></a></li>
           <li><a class="nav-link" href="#/media" data-route="media"><svg class="icon" aria-hidden="true"><use href="#i-image"></use></svg><span>Images &amp; Video</span></a></li>
           <li><a class="nav-link" href="#/tasks" data-route="tasks"><svg class="icon" aria-hidden="true"><use href="#i-tasks"></use></svg><span>Task queue</span></a></li>
+          <li><a class="nav-link" href="#/knowledge" data-route="knowledge"><svg class="icon" aria-hidden="true"><use href="#i-book"></use></svg><span>Knowledge</span></a></li>
           <li><a class="nav-link" href="#/devices" data-route="devices"><svg class="icon" aria-hidden="true"><use href="#i-devices"></use></svg><span>Devices</span></a></li>
           <li><a class="nav-link" href="#/settings" data-route="settings"><svg class="icon" aria-hidden="true"><use href="#i-sliders"></use></svg><span>Models &amp; Settings</span></a></li>
+          <li><a class="nav-link" href="#/diagnostics" data-route="diagnostics"><svg class="icon" aria-hidden="true"><use href="#i-pulse"></use></svg><span>Diagnostics</span></a></li>
         </ul>
       </nav>
 
