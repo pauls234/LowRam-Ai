@@ -320,6 +320,15 @@
   /* ------------------------------------------------------------ features */
 
   LR.has = (feature) => Boolean(LR.state.features && LR.state.features.has(feature));
+  /** False only when the backend reports its modules and `feature` is not among them. */
+  LR.mayHave = (feature) => !LR.state.features || LR.state.features.has(feature);
+  /** A 404 for a route this backend does not have (not a missing record). */
+  LR.isMissingRoute = (err) => Boolean(err && (err.status === 405 || (err.status === 404 && (!err.data || err.data.error === 'Not found'))));
+  /** 12,345 -> "12.345" / "12K" style compact counts. */
+  LR.compact = function (n) {
+    if (!isNum(n)) return '—';
+    try { return new Intl.NumberFormat(LR.locale || undefined, { notation: 'compact', maximumFractionDigits: 1 }).format(n); } catch (_) { return String(n); }
+  };
 
   /* ------------------------------------------------------------ live region & toasts */
 

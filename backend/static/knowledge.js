@@ -20,6 +20,15 @@
   const kb = (LR.knowledge = { available: null, collections: [] });
 
   kb.load = async function () {
+    if (!LR.mayHave('knowledge')) {
+      // The backend lists its modules and the knowledge base is not among them.
+      kb.available = false;
+      kb.collections = [];
+      LR.knowledgeAvailable = false;
+      if (LR.updateNav) LR.updateNav();
+      LR.emit('knowledge', kb);
+      return kb.collections;
+    }
     try {
       const data = await LR.get('/api/knowledge');
       kb.available = true;

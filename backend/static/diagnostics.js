@@ -28,6 +28,12 @@
   });
 
   async function load(render) {
+    if (!LR.mayHave('diagnostics')) {
+      LR.diagnosticsAvailable = false;
+      if (LR.updateNav) LR.updateNav();
+      if (render !== false) renderChecks();
+      return;
+    }
     st.loading = true;
     try {
       st.data = await LR.get('/api/diagnostics');
@@ -150,7 +156,7 @@
     if (updateChecked) return;
     updateChecked = true;
     const uiS = (settings && settings.ui) || {};
-    if (uiS.check_updates === false) return;
+    if (uiS.check_updates === false || !LR.mayHave('diagnostics')) return;
     checkUpdate();
   });
 
