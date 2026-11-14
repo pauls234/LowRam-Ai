@@ -30,7 +30,8 @@ if args[:1] == ["--version"]:
     print("stable-diffusion.cpp version master-999-fake, commit abc1234def")
     sys.exit(0)
 if args[:1] == ["-h"]:
-    print("usage: sd-cli [options]\n  --sampling-method {euler, euler_a}")
+    print("usage: sd-cli [options]\n  -t, --threads N    number of threads to use during computation (default: -1)\n"
+          "  --sampling-method {euler, euler_a}")
     sys.exit(0)
 
 def val(flag, default=None):

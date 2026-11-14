@@ -3,6 +3,7 @@ import http.client
 import json
 import os
 import shutil
+import signal
 import socket
 import subprocess
 import threading
@@ -47,6 +48,7 @@ class EngineTestCase(LowRAMTestCase):
             mock.patch.object(engine, "HOMEBREW_DIRS", (self.tmp / "brew",)),
             mock.patch.object(engine, "HEALTH_POLL_S", 0.05),
             mock.patch.object(engine, "STOP_GRACE_S", 3.0),
+            mock.patch.object(engine, "_perf_cores", 8),  # -> 6 threads
             mock.patch.object(downloads, "RETRY_DELAYS_S", (0.01,)),
             mock.patch.dict(os.environ, {"PATH": fake_path_env(self.fake_dir)}),
         ]
@@ -314,7 +316,7 @@ class ServerTests(EngineTestCase):
         # 8 GiB free, tiny file, 1.5B params, q8_0 KV: the RAM allows more than the 32768 cap
         self.assertEqual((server["state"], server["model_id"], server["ctx_size"]), ("starting", SMALL, 32768))
         self.assertEqual(server["tuning"], {"profile": "auto", "flash_attn": True, "kv_cache": "q8_0",
-                                            "ctx_size": 32768, "cache_reuse": 256})
+                                            "ctx_size": 32768, "cache_reuse": 256, "threads": 6, "note": None})
         self.assertEqual((server["restarts"], server["unloaded_idle"]), (0, False))
         server = self.wait_state("ready")
         url = f"http://127.0.0.1:{server['port']}/v1/chat/completions"
@@ -372,11 +374,19 @@ class ServerTests(EngineTestCase):
             server = engine._manager.snapshot()
         self.assertTrue(ok, server)
         self.assertIn("GGML_ASSERT", server["error"])
-        self.assertIn("3 automatic restarts", server["error"])
+        self.assertIn("Die KI ist mehrfach abgestürzt – bitte Modell/Einstellungen prüfen", server["error"])
         self.assertEqual(server["restarts"], 3)
         self.assertGreaterEqual(len(pids - {None}), 2)  # really new processes
         self.assertEqual(config.llm_url(), config.DEFAULT_LLM_URL)
         self.assertFalse(wait_until(lambda: engine._manager.snapshot()["state"] != "error", 0.5))
+        engine._manager._restart_times.clear()  # as if the 10-minute window had passed: still locked
+        for attempt in (lambda: engine.ensure_running(timeout=5), lambda: engine.start(SMALL, persist=False)):
+            with self.assertRaises(engine.EngineError) as ctx:
+                attempt()
+            self.assertIn("mehrfach abgestürzt", str(ctx.exception))
+        self.assertEqual(engine._manager.snapshot()["state"], "error")
+        engine.start(SMALL, manual=True)  # the user's start button lifts the lock
+        self.assertEqual((self.wait_state("ready")["restarts"], engine._manager._crash_locked), (0, False))
 
     def test_load_timeout(self):
         with mock.patch.dict(os.environ, {"FAKE_LLAMA_MODE": "never_ready"}), \
@@ -1074,6 +1084,7 @@ class SelfHealingInstallTests(EngineTestCase):
 NEW_HELP = (
     "----- common params -----\n\n"
     "-h,    --help, --usage                  print usage and exit\n"
+    "-t,    --threads N                      number of threads to use during generation (default: -1)\n"
     "-b,    --batch-size N                   logical maximum batch size (default: 2048)\n"
     "-ub,   --ubatch-size N                  physical maximum batch size (default: 512)\n"
     "-fa,   --flash-attn [on|off|auto]       set Flash Attention use ('on', 'off', or 'auto', default: 'auto')\n"
@@ -1102,7 +1113,7 @@ class FlagParsingTests(unittest.TestCase):
         self.assertEqual({f: flags.get(f) for f in engine.FLAG_SPELLINGS}, {
             "flash_attn": "--flash-attn", "cache_type_k": "--cache-type-k", "cache_type_v": "--cache-type-v",
             "cache_reuse": "--cache-reuse", "batch_size": "--batch-size", "ubatch_size": "--ubatch-size",
-            "parallel": "--parallel", "jinja": "--jinja"})
+            "parallel": "--parallel", "jinja": "--jinja", "threads": "--threads"})
         self.assertIn("--no-jinja", flags.options)
         self.assertNotIn("--override-kv", flags.options)  # only option columns count, not descriptions
 
@@ -1158,32 +1169,36 @@ class TurboServerTests(EngineTestCase):
         """The fake rejects every option its --help does not list, like a real llama-server."""
         self.set_memory(16, 1024)  # 1 GiB free: the context depends on the KV cache type
         turbo = ["--cache-type-k", "q8_0", "--cache-type-v", "q8_0", "--cache-reuse", "256", "--jinja"]
+        base = ["--parallel", "1", "--threads", "6"]
         cases = {
-            "new": (["-c", "10240", "--parallel", "1", "--flash-attn", "on", *turbo], True, "q8_0", 10240, 256),
-            "old": (["-c", "10240", "--parallel", "1", "--flash-attn", *turbo], True, "q8_0", 10240, 256),
-            "minimal": (["-c", "5120", "--parallel", "1"], False, "f16", 5120, None),  # no flash attention
-            "fail": (["-c", "5120", "--parallel", "1"], False, "f16", 5120, None),  # --help failed
+            "new": (["-c", "10240", *base, "--flash-attn", "on", *turbo], True, "q8_0", 10240, 256, 6),
+            "old": (["-c", "10240", *base, "--flash-attn", *turbo], True, "q8_0", 10240, 256, 6),
+            "minimal": (["-c", "5120", *base], False, "f16", 5120, None, 6),  # no flash attention
+            "fail": (["-c", "5120", "--parallel", "1"], False, "f16", 5120, None, None),  # --help failed
         }
-        for variant, (expected, flash, kv, ctx, reuse) in cases.items():
+        for variant, (expected, flash, kv, ctx, reuse, threads) in cases.items():
             with self.subTest(variant=variant):
                 engine._flags_cache.clear()
                 server, args = self.launch(FAKE_LLAMA_HELP=variant)
                 self.assertEqual(args, [*expected, "--api-key", "***"])
                 self.assertEqual(server["tuning"], {"profile": "auto", "flash_attn": flash, "kv_cache": kv,
-                                                    "ctx_size": ctx, "cache_reuse": reuse})
+                                                    "ctx_size": ctx, "cache_reuse": reuse, "threads": threads,
+                                                    "note": None})
                 self.assertEqual(server["ctx_size"], ctx)
 
     def test_profiles_and_ctx_setting(self):
         self.set_memory(16, 1024)
         settings.update("engine", {"profile": "fast"})
         server, args = self.launch()
-        self.assertEqual(args, ["-c", "5120", "--parallel", "1", "--flash-attn", "on", "--cache-reuse", "256",
+        self.assertEqual(args, ["-c", "5120", "--parallel", "1", "--threads", "6", "--flash-attn", "on",
+                                "--cache-reuse", "256",
                                 "--batch-size", "4096", "--ubatch-size", "1024", "--jinja", "--api-key", "***"])
         self.assertEqual((server["tuning"]["profile"], server["tuning"]["kv_cache"]), ("fast", "f16"))
         self.set_memory(16, 8192)
         settings.update("engine", {"profile": "saver"})
         server, args = self.launch()
-        self.assertEqual(args, ["-c", "8192", "--parallel", "1", "--flash-attn", "on", "--cache-type-k", "q8_0",
+        self.assertEqual(args, ["-c", "8192", "--parallel", "1", "--threads", "6", "--flash-attn", "on",
+                                "--cache-type-k", "q8_0",
                                 "--cache-type-v", "q8_0", "--cache-reuse", "256", "--jinja", "--api-key", "***"])
         settings.update("engine", {"profile": "bogus", "ctx_size": 6144})
         server, args = self.launch()
@@ -1223,6 +1238,31 @@ class SupervisorAndIdleTests(EngineTestCase):
         self.assertIn(f":{server['port']}/", url)
         self.assertEqual(llm.chat([{"role": "user", "content": "hi"}]), "fake llama reply")
         self.assertIn("GGML_ASSERT", (engine.logs_dir() / "llama-server.log.1").read_text())  # crash log kept
+
+    def test_killed_server_url_is_never_handed_out(self):
+        """kill -9 of a ready server: ensure_running must not return the dead port but the restarted server's."""
+        mgr = engine._manager
+        monitor = mgr._on_exit
+
+        def late_monitor(*args, **kwargs):  # the watch thread notices the exit late, as in the field
+            if threading.current_thread().name == "lowram-engine-watch":
+                time.sleep(1.0)
+            return monitor(*args, **kwargs)
+
+        with mock.patch.object(engine, "RESTART_BACKOFF_S", (0.1,)), mock.patch.object(mgr, "_on_exit", late_monitor):
+            engine.start(SMALL)
+            old = self.wait_state("ready")
+            self.assertEqual(llm.chat([{"role": "user", "content": "hi"}]), "fake llama reply")
+            os.kill(old["pid"], signal.SIGKILL)  # mid-use
+            self.assertTrue(wait_until(lambda: gone(old["pid"]), 5))
+            url = engine.ensure_running(timeout=15)
+            server = engine._manager.snapshot()
+            self.assertEqual((server["state"], server["restarts"]), ("ready", 1))
+            self.assertNotEqual(server["pid"], old["pid"])
+            self.assertEqual(url, f"http://127.0.0.1:{server['port']}/v1/chat/completions")
+            self.assertEqual(llm.chat([{"role": "user", "content": "hi"}]), "fake llama reply")
+            time.sleep(1.2)  # the late monitor must not restart the new server
+            self.assertEqual(engine._manager.snapshot()["pid"], server["pid"])
 
     def test_no_restart_while_shutting_down_or_paused(self):
         mgr, proc = engine._manager, mock.Mock(returncode=-9)
@@ -1438,6 +1478,85 @@ class SearchTests(EngineTestCase):
         del self.hub.status[self.KEY]
         self.hub.json[self.KEY] = ([{"id": "a/b", "downloads": 1}], None)
         self.assertEqual(self.api("GET", "/api/engine/search?q=llama")[1]["models"][0]["repo"], "a/b")
+
+
+# --------------------------------------------------------------------------- hardware safety
+
+
+class HardwareSafetyTests(EngineTestCase):
+    setUp = EngineRouteTests.setUp
+    api = EngineRouteTests.api
+
+    def test_performance_cores_and_threads(self):
+        with mock.patch.object(engine, "_perf_cores", None), mock.patch.object(engine.sys, "platform", "darwin"), \
+                mock.patch.object(engine.subprocess, "run", return_value=mock.Mock(stdout=b"6\n")) as run:
+            self.assertEqual((engine.performance_cores(), engine.inference_threads()), (6, 4))
+            engine.performance_cores()
+        self.assertEqual(run.call_count, 1)  # cached
+        self.assertEqual(run.call_args.args[0][1:], ["-n", "hw.perflevel0.physicalcpu"])
+        self.assertEqual(run.call_args.kwargs["timeout"], 2.0)
+        with mock.patch.object(engine, "_perf_cores", None), mock.patch.object(engine.sys, "platform", "darwin"), \
+                mock.patch.object(engine.subprocess, "run", side_effect=OSError("no sysctl")), \
+                mock.patch.object(engine.psutil, "cpu_count", return_value=3):
+            self.assertEqual((engine.performance_cores(), engine.inference_threads()), (3, 2))
+        with mock.patch.object(engine, "_perf_cores", None), mock.patch.object(engine.sys, "platform", "linux"), \
+                mock.patch.object(engine.psutil, "cpu_count", return_value=None):
+            self.assertEqual(engine.performance_cores(), 4)
+
+    def test_fit_ctx_to_ram(self):
+        fit = engine.fit_ctx_to_ram
+        # 7B with q8_0 KV: 224 MiB per 1k tokens; 85 % of 6 GiB minus the 4.4 GiB model leaves ~717 MiB
+        self.assertEqual(fit(32768, 7, int(4.4 * GIB), 6 * GIB, kv_q8=True), 3072)
+        self.assertEqual(fit(8192, 7, int(4.4 * GIB), 5 * GIB, kv_q8=True), 2048)  # floor, even if tight
+        self.assertEqual(fit(8192, 7, GIB, 16 * GIB, kv_q8=True), 8192)  # fits: unchanged
+        self.assertEqual(fit(1024, 7, int(4.4 * GIB), 5 * GIB, kv_q8=True), 1024)  # a smaller setting stays
+
+    def test_model_larger_than_80_percent_of_the_ram_is_refused(self):
+        self.managed()
+        self.add_model()
+        with mock.patch.object(engine, "_model_bytes", return_value=int(13.5 * GIB)):  # 16 GiB machine
+            status, body = self.api("POST", "/api/engine/start", {"model_id": SMALL})
+        self.assertEqual(status, 409)
+        self.assertIn("Dieses Modell braucht etwa 13,5 GB und ist für deinen ", body["error"])
+        self.assertIn("mit 16 GB Arbeitsspeicher zu groß – wähle ein kleineres Modell.", body["error"])
+        self.assertEqual(engine._manager.snapshot()["state"], "stopped")
+
+
+@unittest.skipUnless(POSIX, "the fake llama-server is a shebang script")
+class HardwareSafetyServerTests(TurboServerTests):
+    """Runs TurboServerTests' launch helper; the inherited tests run again here (cheap)."""
+
+    def test_ram_guard_shrinks_the_context_and_clamps_the_setting(self):
+        self.set_memory(16, 2048)  # 2 GiB free
+        with mock.patch.object(engine, "_model_bytes", return_value=int(1.6 * GIB)):
+            server, args = self.launch()
+        self.assertEqual((args[:2], server["ctx_size"]), (["-c", "2048"], 2048))  # below 4096: RAM-limited
+        self.assertIn("2048", server["tuning"]["note"])
+        settings.update("engine", {"ctx_size": 32768})
+        with mock.patch.object(engine, "_model_bytes", return_value=int(1.2 * GIB)), \
+                self.assertLogs("lowram.engine", "WARNING") as logs:
+            server, args = self.launch()
+        self.assertEqual((args[:2], server["ctx_size"]), (["-c", "10240"], 10240))
+        self.assertTrue(any("32768" in line for line in logs.output))
+
+    def test_fast_profile_needs_16_gb(self):
+        self.set_memory(8, 4096)
+        settings.update("engine", {"profile": "fast"})
+        server, args = self.launch()
+        self.assertEqual(server["tuning"]["profile"], "auto")
+        self.assertIn("16 GB", server["tuning"]["note"])
+        self.assertIn("--cache-type-k", args)
+        self.assertNotIn("--batch-size", args)
+
+    def test_lower_priority_never_blocks_a_start(self):
+        engine.start(SMALL)
+        server = self.wait_state("ready")
+        self.assertGreaterEqual(os.getpriority(os.PRIO_PROCESS, server["pid"]), engine.LLAMA_NICE)
+        engine.stop()
+        with mock.patch.object(engine.os, "setpriority", side_effect=PermissionError("not allowed")) as nice:
+            engine.start(SMALL)
+            self.wait_state("ready")
+        self.assertEqual(nice.call_args.args[2], 5)
 
 
 if __name__ == "__main__":

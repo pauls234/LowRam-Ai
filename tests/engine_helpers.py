@@ -211,11 +211,12 @@ if "--version" in args:
     print("built with fake compiler for testing", file=sys.stderr)
     sys.exit(0)
 
-OPTIONS = {"-h": 0, "--help": 0, "-m": 1, "-c": 1, "--host": 1, "--port": 1, "--api-key": 1, "-np": 1,
+OPTIONS = {"-h": 0, "--help": 0, "-m": 1, "-c": 1, "--host": 1, "--port": 1, "--api-key": 1, "-np": 1, "-t": 1, "--threads": 1,
            "--parallel": 1, "-b": 1, "--batch-size": 1, "-ctk": 1, "--cache-type-k": 1, "-ctv": 1, "--cache-type-v": 1}
 HELP = [
     "----- common params -----", "",
     "-h,    --help, --usage                  print usage and exit",
+    "-t,    --threads N                      number of threads to use during generation (default: -1)",
     "-c,    --ctx-size N                     size of the prompt context (default: 4096, 0 = loaded from model)",
     "                                        (env: LLAMA_ARG_CTX_SIZE)",
     "-b,    --batch-size N                   logical maximum batch size (default: 2048)",
@@ -232,7 +233,7 @@ HELP = [
 if variant in ("new", "old"):
     OPTIONS.update({"-ub": 1, "--ubatch-size": 1, "--cache-reuse": 1, "--jinja": 0,
                     "-fa": int(variant == "new"), "--flash-attn": int(variant == "new")})
-    HELP[6:6] = [
+    HELP[7:7] = [
         "-ub,   --ubatch-size N                  physical maximum batch size (default: 512)",
         "-fa,   --flash-attn [on|off|auto]       set Flash Attention use ('on', 'off', or 'auto', default: 'auto')"
         if variant == "new" else "-fa,   --flash-attn                     enable Flash Attention (default: disabled)",
