@@ -27,9 +27,9 @@
     if (btn) LR.setBusy(btn, true);
     try {
       await LR.post('/api/cluster/requests/' + encodeURIComponent(req.id) + '/' + (allow ? 'approve' : 'deny'), {});
-      LR.toast(allow ? LR.str(req.name, 'The device') + ' can now help' : 'Request declined', allow ? null : 'info');
+      LR.toast(allow ? LR.str(req.name, LR.t('The device')) + ' can now help' : LR.t('Request declined'), allow ? null : 'info');
     } catch (err) {
-      LR.toast('Could not answer the request: ' + err.message, 'error');
+      LR.toast(LR.t('Could not answer the request: ') + err.message, 'error');
       if (btn && btn.isConnected) LR.setBusy(btn, false);
     } finally {
       poller.now();
@@ -40,21 +40,21 @@
 
   function requestCard(r) {
     const facts = [r.platform, LR.isNum(r.ram_total_bytes) ? fmt.gb(r.ram_total_bytes) + ' RAM' : '', r.address].filter(Boolean).join(' · ');
-    return h('div', { class: 'request-card', role: 'group', 'aria-label': 'Pairing request from ' + LR.str(r.name, 'a device') }, [
+    return h('div', { class: 'request-card', role: 'group', 'aria-label': LR.t('Pairing request from ') + LR.str(r.name, LR.t('a device')) }, [
       h('div', { class: 'request-head' }, [
         h('span', { class: 'device-icon', 'aria-hidden': 'true' }, icon('laptop')),
         h('div', { class: 'device-main' }, [
-          h('p', { class: 'strong', text: LR.str(r.name, 'A computer') + ' wants to help' }),
+          h('p', { class: 'strong', text: LR.str(r.name, LR.t('A computer')) + LR.t(' wants to help') }),
           facts ? h('p', { class: 'muted small', text: facts }) : null,
         ]),
       ]),
       r.verification_code
-        ? h('p', { class: 'verify-code', 'aria-label': 'Verification number ' + LR.str(r.verification_code), text: LR.str(r.verification_code) })
-        : h('p', { class: 'verify-code is-pending' }, [LR.spinner(), h('span', { class: 'small muted', text: ' Waiting for the number…' })]),
-      h('p', { class: 'verify-help', text: 'Only allow it if the other computer shows exactly the same number.' }),
+        ? h('p', { class: 'verify-code', 'aria-label': LR.t('Verification number ') + LR.str(r.verification_code), text: LR.str(r.verification_code) })
+        : h('p', { class: 'verify-code is-pending' }, [LR.spinner(), h('span', { class: 'small muted', text: LR.t(' Waiting for the number…') })]),
+      h('p', { class: 'verify-help', text: LR.t('Only allow it if the other computer shows exactly the same number.') }),
       h('div', { class: 'row-actions request-actions' }, [
-        LR.button({ text: 'Deny', variant: 'secondary', onclick: (ev) => answerRequest(r, false, ev.currentTarget) }),
-        LR.button({ text: 'Allow', icon: 'check', variant: 'primary', disabled: !r.verification_code, title: r.verification_code ? null : 'Wait until the number is shown', onclick: (ev) => answerRequest(r, true, ev.currentTarget) }),
+        LR.button({ text: LR.t('Deny'), variant: 'secondary', onclick: (ev) => answerRequest(r, false, ev.currentTarget) }),
+        LR.button({ text: LR.t('Allow'), icon: 'check', variant: 'primary', disabled: !r.verification_code, title: r.verification_code ? null : LR.t('Wait until the number is shown'), onclick: (ev) => answerRequest(r, true, ev.currentTarget) }),
       ]),
     ]);
   }
@@ -66,34 +66,34 @@
     if (sig === st.nearbySig && ui.nearby.childElementCount) return;
     st.nearbySig = sig;
     if (hosts === null) {
-      ui.nearby.replaceChildren(h('p', { class: 'muted small' }, [LR.spinner(), ' Looking for computers nearby…']));
+      ui.nearby.replaceChildren(h('p', { class: 'muted small' }, [LR.spinner(), LR.t(' Looking for computers nearby…')]));
       return;
     }
-    const errorNote = st.nearbyError ? LR.callout({ tone: 'warn', title: 'Searching for computers is not working right now', text: st.nearbyError + ' You can still join with a code.' }) : null;
+    const errorNote = st.nearbyError ? LR.callout({ tone: 'warn', title: LR.t('Searching for computers is not working right now'), text: st.nearbyError + LR.t(' You can still join with a code.') }) : null;
     if (!hosts.length) {
       ui.nearby.replaceChildren(errorNote || '', h('div', { class: 'nearby-empty' }, [
         h('span', { class: 'scan', 'aria-hidden': 'true' }, icon('wifi')),
-        h('p', { class: 'strong', text: 'No computers found yet' }),
-        h('p', { class: 'muted small', text: 'Open LowRAM AI on the other computer and turn on Devices there.' }),
+        h('p', { class: 'strong', text: LR.t('No computers found yet') }),
+        h('p', { class: 'muted small', text: LR.t('Open LowRAM AI on the other computer and turn on Devices there.') }),
         h('ul', { class: 'hint-list' }, [
-          h('li', { text: 'Both computers need to be on the same Wi-Fi or network.' }),
-          h('li', { text: 'If it still does not appear, allow LowRAM AI in the firewall – or use a code instead.' }),
+          h('li', { text: LR.t('Both computers need to be on the same Wi-Fi or network.') }),
+          h('li', { text: LR.t('If it still does not appear, allow LowRAM AI in the firewall – or use a code instead.') }),
         ]),
       ]));
       return;
     }
-    ui.nearby.replaceChildren(errorNote || '', h('ul', { class: 'nearby-list', 'aria-label': 'Nearby computers' }, hosts.map((host) => h('li', { class: 'nearby-host' }, [
+    ui.nearby.replaceChildren(errorNote || '', h('ul', { class: 'nearby-list', 'aria-label': LR.t('Nearby computers') }, hosts.map((host) => h('li', { class: 'nearby-host' }, [
       h('span', { class: 'device-icon', 'aria-hidden': 'true' }, icon('laptop')),
       h('div', { class: 'device-main' }, [
-        h('p', { class: 'strong', text: LR.str(host.name, 'LowRAM AI computer') }),
+        h('p', { class: 'strong', text: LR.str(host.name, LR.t('LowRAM AI computer')) }),
         h('p', { class: 'muted small', text: [Array.isArray(host.addresses) ? host.addresses[0] : '', host.fingerprint_short ? 'ID ' + host.fingerprint_short : ''].filter(Boolean).join(' · ') }),
       ]),
-      LR.button({ text: 'Join', icon: 'link', variant: 'primary', cls: 'btn-join', label: 'Join ' + LR.str(host.name, 'this computer'), onclick: (ev) => joinHost(host, ev.currentTarget) }),
+      LR.button({ text: LR.t('Join'), icon: 'link', variant: 'primary', cls: 'btn-join', label: LR.t('Join ') + LR.str(host.name, LR.t('this computer')), onclick: (ev) => joinHost(host, ev.currentTarget) }),
     ]))));
   }
 
   async function joinHost(host, btn) {
-    LR.setBusy(btn, true, 'Joining…');
+    LR.setBusy(btn, true, LR.t('Joining…'));
     try {
       const data = await LR.post('/api/cluster/join', { host_id: host.id });
       if (data.worker && st.cluster) st.cluster.worker = data.worker;
@@ -103,7 +103,7 @@
       const verify = ui.worker.el.querySelector('.verify');
       if (verify) verify.scrollIntoView({ behavior: LR.reducedMotion() ? 'auto' : 'smooth', block: 'center' });
     } catch (err) {
-      LR.toast('Could not join: ' + err.message, 'error');
+      LR.toast(LR.t('Could not join: ') + err.message, 'error');
       if (btn.isConnected) LR.setBusy(btn, false);
       const fallback = ui.worker.el.querySelector('.code-fallback');
       if (fallback) fallback.open = true;
@@ -144,16 +144,16 @@
     const tone = d.status === 'online' ? 'ok' : d.status === 'busy' ? 'busy' : 'idle';
     const facts = [d.platform, LR.isNum(d.ram_total_bytes) ? fmt.gb(d.ram_total_bytes) + ' RAM' : '', d.model ? LR.modelName(d.model) : ''].filter(Boolean).join(' · ');
     const activity = d.current_task_id !== null && d.current_task_id !== undefined
-      ? 'Working on task ' + d.current_task_id
-      : d.status === 'offline' ? 'Last seen ' + (fmt.relative(d.last_seen) || 'a while ago') : 'Ready to help';
+      ? LR.t('Working on task ') + d.current_task_id
+      : d.status === 'offline' ? LR.t('Last seen ') + (fmt.relative(d.last_seen) || LR.t('a while ago')) : LR.t('Ready to help');
     return h('li', { class: 'device' }, [
       h('span', { class: 'device-icon', 'aria-hidden': 'true' }, icon('laptop')),
       h('div', { class: 'device-main' }, [
-        h('p', { class: 'device-name' }, [h('span', { class: 'dot dot-' + tone + (d.status === 'busy' ? ' is-pulsing' : ''), 'aria-hidden': 'true' }), h('span', { text: LR.str(d.name, 'Unnamed device') }), h('span', { class: 'visually-hidden', text: ' – ' + LR.str(d.status) })]),
+        h('p', { class: 'device-name' }, [h('span', { class: 'dot dot-' + tone + (d.status === 'busy' ? ' is-pulsing' : ''), 'aria-hidden': 'true' }), h('span', { text: LR.str(d.name, LR.t('Unnamed device')) }), h('span', { class: 'visually-hidden', text: ' – ' + LR.str(d.status) })]),
         facts ? h('p', { class: 'muted small', text: facts }) : null,
-        h('p', { class: 'device-activity', text: activity + ' · ' + fmt.plural(d.tasks_done || 0, 'task') + ' done' }),
+        h('p', { class: 'device-activity', text: activity + ' · ' + fmt.plural(d.tasks_done || 0, 'task') + LR.t(' done') }),
       ]),
-      LR.button({ text: 'Revoke', size: 'sm', variant: 'ghost', label: 'Revoke ' + LR.str(d.name, 'device'), onclick: (ev) => revoke(d, ev.currentTarget) }),
+      LR.button({ text: LR.t('Revoke'), size: 'sm', variant: 'ghost', label: LR.t('Revoke ') + LR.str(d.name, 'device'), onclick: (ev) => revoke(d, ev.currentTarget) }),
     ]);
   }
 
@@ -161,8 +161,8 @@
     const c = st.cluster || {};
     const enabled = Boolean(c.enabled);
     const sw = LR.switchRow({
-      label: 'Allow other devices on my network',
-      description: 'Paired computers can pick up tasks from your queue. Connections are encrypted and stay on your local network.',
+      label: LR.t('Allow other devices on my network'),
+      description: LR.t('Paired computers can pick up tasks from your queue. Connections are encrypted and stay on your local network.'),
       checked: enabled,
       onChange: (on, input) => toggle(on, input),
     });
@@ -172,36 +172,36 @@
     out.push(sw.el);
     if (enabled && 'discoverable' in c) {
       out.push(LR.switchRow({
-        label: 'Show this computer to nearby devices',
-        description: 'Lets other computers find it in their list. When off, they can still join with a code.',
+        label: LR.t('Show this computer to nearby devices'),
+        description: LR.t('Lets other computers find it in their list. When off, they can still join with a code.'),
         checked: c.discoverable !== false,
         onChange: async (on, input) => {
-          if (!(await LR.saveSetting('cluster', { discoverable: on }, on ? 'Visible to nearby computers' : 'Hidden from nearby computers'))) input.checked = !on;
+          if (!(await LR.saveSetting('cluster', { discoverable: on }, on ? LR.t('Visible to nearby computers') : LR.t('Hidden from nearby computers')))) input.checked = !on;
           poller.now();
         },
       }).el);
     }
-    if (c.host_name && enabled) out.push(h('p', { class: 'muted small' }, ['Other computers see this one as ', h('strong', { text: LR.str(c.host_name) }), '.']));
-    if (c.pairing_error) out.push(LR.callout({ tone: 'warn', title: 'Pairing problem', text: LR.str(c.pairing_error) }));
-    if (c.error) out.push(LR.callout({ tone: 'error', title: 'The device server has a problem', text: LR.str(c.error), role: 'alert' }));
+    if (c.host_name && enabled) out.push(h('p', { class: 'muted small' }, [LR.t('Other computers see this one as '), h('strong', { text: LR.str(c.host_name) }), '.']));
+    if (c.pairing_error) out.push(LR.callout({ tone: 'warn', title: LR.t('Pairing problem'), text: LR.str(c.pairing_error) }));
+    if (c.error) out.push(LR.callout({ tone: 'error', title: LR.t('The device server has a problem'), text: LR.str(c.error), role: 'alert' }));
     if (enabled) {
       const listen = c.listening;
       if (listen && Array.isArray(listen.addresses) && listen.addresses.length) {
         out.push(h('dl', { class: 'facts' }, [
-          h('div', null, [h('dt', { text: 'Reachable at' }), h('dd', null, h('ul', { class: 'addr-list' }, listen.addresses.map((a) => h('li', null, h('code', { text: (String(a).includes(':') && !String(a).startsWith('[') ? '[' + a + ']' : a) + (listen.port ? ':' + listen.port : '') })))))]),
-          c.fingerprint ? h('div', null, [h('dt', { text: 'Fingerprint' }), h('dd', { class: 'fingerprint' }, [h('code', { text: LR.str(c.fingerprint) }), LR.copyButton({ getText: () => LR.str(c.fingerprint), iconOnly: true, cls: 'icon-btn', ariaLabel: 'Copy fingerprint' })])]) : null,
+          h('div', null, [h('dt', { text: LR.t('Reachable at') }), h('dd', null, h('ul', { class: 'addr-list' }, listen.addresses.map((a) => h('li', null, h('code', { text: (String(a).includes(':') && !String(a).startsWith('[') ? '[' + a + ']' : a) + (listen.port ? ':' + listen.port : '') })))))]),
+          c.fingerprint ? h('div', null, [h('dt', { text: LR.t('Fingerprint') }), h('dd', { class: 'fingerprint' }, [h('code', { text: LR.str(c.fingerprint) }), LR.copyButton({ getText: () => LR.str(c.fingerprint), iconOnly: true, cls: 'icon-btn', ariaLabel: LR.t('Copy fingerprint') })])]) : null,
         ]));
       } else if (!c.error) {
-        out.push(h('p', { class: 'muted small' }, [LR.spinner(), ' Starting the device server…']));
+        out.push(h('p', { class: 'muted small' }, [LR.spinner(), LR.t(' Starting the device server…')]));
       }
       const devices = Array.isArray(c.devices) ? c.devices : [];
       out.push(h('div', { class: 'devices-head' }, [
-        h('h3', { class: 'section-label', text: 'Paired devices' }),
-        LR.button({ text: 'Add device', icon: 'plus', variant: 'primary', size: 'sm', onclick: openPairing }),
+        h('h3', { class: 'section-label', text: LR.t('Paired devices') }),
+        LR.button({ text: LR.t('Add device'), icon: 'plus', variant: 'primary', size: 'sm', onclick: openPairing }),
       ]));
       out.push(devices.length
         ? h('ul', { class: 'device-list' }, devices.map(deviceItem))
-        : LR.empty({ icon: 'devices', title: 'No helper devices yet', text: 'Add an older laptop or a second computer – it takes one code.' }));
+        : LR.empty({ icon: 'devices', title: LR.t('No helper devices yet'), text: LR.t('Add an older laptop or a second computer – it takes one code.') }));
     }
     ui.host.body.replaceChildren(...out);
   }
@@ -214,10 +214,10 @@
         st.cluster = data.cluster;
         st.sig = JSON.stringify(data.cluster);
       }
-      LR.toast(on ? 'Other devices can now join' : 'Device sharing turned off', 'info');
+      LR.toast(on ? LR.t('Other devices can now join') : LR.t('Device sharing turned off'), 'info');
     } catch (err) {
       input.checked = !on;
-      LR.toast('Could not change this: ' + err.message, 'error');
+      LR.toast(LR.t('Could not change this: ') + err.message, 'error');
     } finally {
       input.disabled = false;
       await load().catch(() => {});
@@ -226,14 +226,14 @@
   }
 
   async function revoke(d, btn) {
-    const ok = await LR.confirm({ title: 'Revoke ' + LR.str(d.name, 'this device') + '?', message: 'It can no longer connect or take tasks. You can pair it again later with a new code.', confirmText: 'Revoke', danger: true });
+    const ok = await LR.confirm({ title: LR.t('Revoke ') + LR.str(d.name, LR.t('this device')) + '?', message: LR.t('It can no longer connect or take tasks. You can pair it again later with a new code.'), confirmText: LR.t('Revoke'), danger: true });
     if (!ok) return;
     LR.setBusy(btn, true);
     try {
       await LR.post('/api/cluster/devices/' + encodeURIComponent(d.id) + '/revoke', {});
-      LR.toast('Device revoked');
+      LR.toast(LR.t('Device revoked'));
     } catch (err) {
-      LR.toast('Could not revoke: ' + err.message, 'error');
+      LR.toast(LR.t('Could not revoke: ') + err.message, 'error');
       if (btn.isConnected) LR.setBusy(btn, false);
     } finally {
       poller.now();
@@ -246,8 +246,8 @@
     const codeEl = h('p', { class: 'pair-code', 'aria-live': 'polite' }, LR.spinner());
     const countdown = h('p', { class: 'pair-expiry' });
     const cmd = h('code', { class: 'pair-cmd' });
-    const copyCode = LR.copyButton({ getText: () => current || '', label: 'Copy code', cls: 'btn btn-secondary btn-sm' });
-    const copyCmd = LR.copyButton({ getText: () => cmd.textContent, iconOnly: true, cls: 'icon-btn', ariaLabel: 'Copy command' });
+    const copyCode = LR.copyButton({ getText: () => current || '', label: LR.t('Copy code'), cls: 'btn btn-secondary btn-sm' });
+    const copyCmd = LR.copyButton({ getText: () => cmd.textContent, iconOnly: true, cls: 'icon-btn', ariaLabel: LR.t('Copy command') });
     const status = h('div', { class: 'pair-status', 'aria-live': 'polite' });
     let current = null;
     let expires = null;
@@ -256,27 +256,27 @@
     const body = [
       h('div', { class: 'pair-box' }, [codeEl, h('div', { class: 'pair-row' }, [countdown, copyCode])]),
       h('ol', { class: 'pair-steps' }, [
-        h('li', null, ['On the other computer, open ', h('strong', { text: 'LowRAM AI → Devices' }), ' and use ', h('strong', { text: 'Join another computer' }), '.']),
-        h('li', { text: 'Enter this code and give that computer a name.' }),
-        h('li', null, ['Or run this in a terminal there:', h('span', { class: 'cmd-line' }, [cmd, copyCmd])]),
+        h('li', null, [LR.t('On the other computer, open '), h('strong', { text: LR.t('LowRAM AI → Devices') }), LR.t(' and use '), h('strong', { text: LR.t('Join another computer') }), '.']),
+        h('li', { text: LR.t('Enter this code and give that computer a name.') }),
+        h('li', null, [LR.t('Or run this in a terminal there:'), h('span', { class: 'cmd-line' }, [cmd, copyCmd])]),
       ]),
       status,
     ];
-    const newCode = LR.button({ text: 'New code', icon: 'retry', variant: 'secondary', onclick: () => request() });
-    const m = LR.modal({ title: 'Add a device', sub: 'The code works once and expires after 10 minutes.', body, actions: [newCode, LR.button({ text: 'Done', variant: 'primary', onclick: () => m.close() })], onClose: () => { window.clearInterval(timer); st.pairingModal = null; } });
+    const newCode = LR.button({ text: LR.t('New code'), icon: 'retry', variant: 'secondary', onclick: () => request() });
+    const m = LR.modal({ title: 'Add a device', sub: LR.t('The code works once and expires after 10 minutes.'), body, actions: [newCode, LR.button({ text: LR.t('Done'), variant: 'primary', onclick: () => m.close() })], onClose: () => { window.clearInterval(timer); st.pairingModal = null; } });
 
     function tick() {
       if (!expires) { countdown.textContent = ''; return; }
       const left = expires.getTime() - Date.now();
       if (left <= 0) {
-        countdown.textContent = 'This code has expired.';
+        countdown.textContent = LR.t('This code has expired.');
         countdown.classList.add('is-expired');
         codeEl.classList.add('is-expired');
         return;
       }
       countdown.classList.remove('is-expired');
       codeEl.classList.remove('is-expired');
-      countdown.replaceChildren(icon('clock'), h('span', { text: 'Expires in ' + fmt.clock(left) }));
+      countdown.replaceChildren(icon('clock'), h('span', { text: LR.t('Expires in ') + fmt.clock(left) }));
     }
 
     async function request() {
@@ -287,11 +287,11 @@
         current = LR.str(p.code);
         expires = fmt.parseTime(p.expires_at);
         codeEl.textContent = current;
-        codeEl.setAttribute('aria-label', 'Pairing code ' + current.split('').join(' '));
+        codeEl.setAttribute('aria-label', LR.t('Pairing code ') + current.split('').join(' '));
         cmd.textContent = 'python3 lowram.py worker --join ' + current;
         tick();
       } catch (err) {
-        codeEl.replaceChildren(h('span', { class: 'pair-error', text: 'Could not create a code' }));
+        codeEl.replaceChildren(h('span', { class: 'pair-error', text: LR.t('Could not create a code') }));
         status.replaceChildren(LR.callout({ tone: 'error', text: err.message }));
       } finally {
         LR.setBusy(newCode, false);
@@ -304,8 +304,8 @@
         if (devices.length > startCount && !status.dataset.done) {
           status.dataset.done = '1';
           const newest = devices[devices.length - 1];
-          status.replaceChildren(LR.callout({ tone: 'ok', title: LR.str(newest.name, 'A new device') + ' joined', text: 'It will start helping with shared task lists.' }));
-          LR.announce(LR.str(newest.name, 'A new device') + ' joined');
+          status.replaceChildren(LR.callout({ tone: 'ok', title: LR.str(newest.name, LR.t('A new device')) + LR.t(' joined'), text: LR.t('It will start helping with shared task lists.') }));
+          LR.announce(LR.str(newest.name, LR.t('A new device')) + LR.t(' joined'));
         }
       },
     };
@@ -320,59 +320,59 @@
     const c = st.cluster || {};
     const w = c.worker || { state: 'idle' };
     const out = [];
-    const stateText = { idle: 'Not helping anyone', pairing: 'Connecting…', working: 'Helping', error: 'Problem', stopped: 'Stopped' };
+    const stateText = { idle: LR.t('Not helping anyone'), pairing: LR.t('Connecting…'), working: LR.t('Helping'), error: 'Problem', stopped: LR.t('Stopped') };
     if (w.state === 'awaiting_approval') {
       ui.worker.body.replaceChildren(h('div', { class: 'verify' }, [
-        h('p', { class: 'verify-label', text: 'Verification number' }),
-        h('p', { class: 'verify-code verify-big', 'aria-label': 'Verification number ' + LR.str(w.verification_code), text: LR.str(w.verification_code, '— — —') }),
-        h('p', { class: 'verify-help', text: 'Check that ' + LR.str(w.host, 'the other computer') + ' shows the same number, then click Allow there.' }),
-        h('p', { class: 'muted small verify-wait' }, [LR.spinner(), ' Waiting for approval…']),
-        LR.button({ text: 'Cancel', variant: 'ghost', onclick: (ev) => leave(ev.currentTarget) }),
+        h('p', { class: 'verify-label', text: LR.t('Verification number') }),
+        h('p', { class: 'verify-code verify-big', 'aria-label': LR.t('Verification number ') + LR.str(w.verification_code), text: LR.str(w.verification_code, '— — —') }),
+        h('p', { class: 'verify-help', text: LR.t('Check that ') + LR.str(w.host, LR.t('the other computer')) + LR.t(' shows the same number, then click Allow there.') }),
+        h('p', { class: 'muted small verify-wait' }, [LR.spinner(), LR.t(' Waiting for approval…')]),
+        LR.button({ text: LR.t('Cancel'), variant: 'ghost', onclick: (ev) => leave(ev.currentTarget) }),
       ]));
       return;
     }
     if (w.state === 'pairing' || isConnected(w)) {
       const task = w.current_task;
-      const taskText = task === null || task === undefined || task === '' ? '' : typeof task === 'object' ? 'Working on ' + LR.str(task.title || ('task ' + task.id)) : 'Working on task ' + task;
-      const host = LR.str(w.host, 'the other computer');
+      const taskText = task === null || task === undefined || task === '' ? '' : typeof task === 'object' ? LR.t('Working on ') + LR.str(task.title || (LR.t('task ') + task.id)) : LR.t('Working on task ') + task;
+      const host = LR.str(w.host, LR.t('the other computer'));
       const working = w.state === 'working' || Boolean(taskText);
-      const title = w.state === 'pairing' && !isConnected(w) ? 'Connecting to ' + host + '…' : working ? 'Helping ' + host : 'Connected to ' + host;
-      const detail = [taskText || LR.str(w.message, w.state === 'pairing' ? 'Checking the code…' : 'Waiting for tasks…')];
-      if (isConnected(w)) detail.push(fmt.plural(w.tasks_done || 0, 'task') + ' done');
+      const title = w.state === 'pairing' && !isConnected(w) ? LR.t('Connecting to ') + host + '…' : working ? LR.t('Helping ') + host : LR.t('Connected to ') + host;
+      const detail = [taskText || LR.str(w.message, w.state === 'pairing' ? LR.t('Checking the code…') : LR.t('Waiting for tasks…'))];
+      if (isConnected(w)) detail.push(fmt.plural(w.tasks_done || 0, 'task') + LR.t(' done'));
       out.push(h('div', { class: 'worker-state' }, [
         h('span', { class: 'dot dot-' + (working ? 'busy' : w.state === 'error' ? 'error' : 'ok') + (working || w.state === 'pairing' ? ' is-pulsing' : ''), 'aria-hidden': 'true' }),
         h('div', null, [h('p', { class: 'strong', text: title }), h('p', { class: 'muted small', text: detail.join(' · ') })]),
-        LR.button({ text: 'Leave', icon: 'power', size: 'sm', variant: 'secondary', onclick: (ev) => leave(ev.currentTarget) }),
+        LR.button({ text: LR.t('Leave'), icon: 'power', size: 'sm', variant: 'secondary', onclick: (ev) => leave(ev.currentTarget) }),
       ]));
-      if (w.state === 'error' && w.error) out.push(LR.callout({ tone: 'error', title: 'Connection problem', text: LR.str(w.error), role: 'alert' }));
+      if (w.state === 'error' && w.error) out.push(LR.callout({ tone: 'error', title: LR.t('Connection problem'), text: LR.str(w.error), role: 'alert' }));
       ui.worker.body.replaceChildren(...out);
       return;
     }
-    if (w.state === 'error' && w.error) out.push(LR.callout({ tone: 'error', title: 'Could not help', text: LR.str(w.error), role: 'alert' }));
-    else if (w.state === 'stopped' && LR.isNum(w.tasks_done) && w.tasks_done) out.push(h('p', { class: 'muted small', text: 'Last session: ' + fmt.plural(w.tasks_done, 'task') + ' done for ' + LR.str(w.host, 'another computer') + '.' }));
+    if (w.state === 'error' && w.error) out.push(LR.callout({ tone: 'error', title: LR.t('Could not help'), text: LR.str(w.error), role: 'alert' }));
+    else if (w.state === 'stopped' && LR.isNum(w.tasks_done) && w.tasks_done) out.push(h('p', { class: 'muted small', text: LR.t('Last session: ') + fmt.plural(w.tasks_done, 'task') + LR.t(' done for ') + LR.str(w.host, LR.t('another computer')) + '.' }));
     else out.push(h('p', { class: 'muted small', text: stateText[w.state] ? stateText[w.state] + '.' : '' }));
-    const code = h('input', { class: 'input mono', type: 'text', autocomplete: 'off', spellcheck: 'false', placeholder: 'Code from the other computer', maxlength: '512' });
-    const name = h('input', { class: 'input', type: 'text', autocomplete: 'off', maxlength: '80', placeholder: 'e.g. Old MacBook' });
+    const code = h('input', { class: 'input mono', type: 'text', autocomplete: 'off', spellcheck: 'false', placeholder: LR.t('Code from the other computer'), maxlength: '512' });
+    const name = h('input', { class: 'input', type: 'text', autocomplete: 'off', maxlength: '80', placeholder: LR.t('e.g. Old MacBook') });
     const settingsName = LR.state.settings && LR.state.settings.cluster ? LR.state.settings.cluster.device_name : '';
     if (settingsName) name.value = settingsName;
-    const fCode = LR.field({ label: 'Pairing code', control: code });
-    const fName = LR.field({ label: 'Name for this computer', control: name, optional: true });
-    const join = LR.button({ text: 'Join', icon: 'link', variant: 'primary', type: 'submit' });
+    const fCode = LR.field({ label: LR.t('Pairing code'), control: code });
+    const fName = LR.field({ label: LR.t('Name for this computer'), control: name, optional: true });
+    const join = LR.button({ text: LR.t('Join'), icon: 'link', variant: 'primary', type: 'submit' });
     const form = h('form', { class: 'form join-form', novalidate: true }, [h('div', { class: 'form-row' }, [fCode.el, fName.el]), h('div', { class: 'form-actions' }, [join])]);
     form.addEventListener('submit', async (ev) => {
       ev.preventDefault();
       fCode.setError('');
       if (!code.value.trim()) {
-        fCode.setError('Enter the code shown on the other computer.');
+        fCode.setError(LR.t('Enter the code shown on the other computer.'));
         code.focus();
         return;
       }
-      LR.setBusy(join, true, 'Joining…');
+      LR.setBusy(join, true, LR.t('Joining…'));
       try {
         const data = await LR.post('/api/cluster/join', { code: code.value.trim(), name: name.value.trim() || undefined });
         if (data.worker && st.cluster) st.cluster.worker = data.worker;
         st.fastUntil = Date.now() + 15000;
-        LR.toast('Joining…', 'info');
+        LR.toast(LR.t('Joining…'), 'info');
         poller.now();
       } catch (err) {
         fCode.setError(err.message);
@@ -383,9 +383,9 @@
       if (!ui.nearby) ui.nearby = h('div', { class: 'nearby', 'aria-live': 'polite' });
       st.nearbySig = '';
       renderNearby();
-      out.push(h('h3', { class: 'section-label', text: 'Nearby computers' }), ui.nearby);
+      out.push(h('h3', { class: 'section-label', text: LR.t('Nearby computers') }), ui.nearby);
       out.push(h('details', { class: 'more-options code-fallback' }, [
-        h('summary', null, [icon('chevron-right', 'summary-chevron'), h('span', { text: 'Use a code instead' })]),
+        h('summary', null, [icon('chevron-right', 'summary-chevron'), h('span', { text: LR.t('Use a code instead') })]),
         h('div', { class: 'details-body' }, form),
       ]));
     } else {
@@ -395,12 +395,12 @@
   }
 
   async function leave(btn) {
-    LR.setBusy(btn, true, 'Leaving…');
+    LR.setBusy(btn, true, LR.t('Leaving…'));
     try {
       await LR.post('/api/cluster/leave', {});
-      LR.toast('This computer stopped helping', 'info');
+      LR.toast(LR.t('This computer stopped helping'), 'info');
     } catch (err) {
-      LR.toast('Could not leave: ' + err.message, 'error');
+      LR.toast(LR.t('Could not leave: ') + err.message, 'error');
       if (btn.isConnected) LR.setBusy(btn, false);
     } finally {
       poller.now();
@@ -440,22 +440,22 @@
     const root = h('section', { class: 'view view-page', 'aria-labelledby': 'devices-title' });
     ui.page = h('div', { class: 'page' });
     root.append(ui.page);
-    ui.host = card('This computer', 'Share your task queue with other computers you own.');
-    ui.worker = card('Join another computer', 'Lend this computer’s memory to a LowRAM AI on your network.');
+    ui.host = card(LR.t('This computer'), LR.t('Share your task queue with other computers you own.'));
+    ui.worker = card(LR.t('Join another computer'), LR.t('Lend this computer’s memory to a LowRAM AI on your network.'));
     return root;
   }
 
   LR.registerView('devices', {
-    title: 'Devices',
+    title: LR.t('Devices'),
     create,
     show() {
-      const head = LR.pageHead({ title: 'Devices', sub: 'Spread long task lists across the computers you already have. Everything stays on your own network.' });
+      const head = LR.pageHead({ title: LR.t('Devices'), sub: LR.t('Spread long task lists across the computers you already have. Everything stays on your own network.') });
       head.querySelector('h1').id = 'devices-title';
       if (!LR.has('cluster')) {
-        ui.page.replaceChildren(head, LR.unavailable('Devices'));
+        ui.page.replaceChildren(head, LR.unavailable(LR.t('Devices')));
         return;
       }
-      ui.page.replaceChildren(head, ui.host.el, ui.worker.el, h('p', { class: 'page-note' }, [icon('shield'), h('span', { text: 'Devices pair with a one-time code and an encrypted, pinned connection. Revoke a device at any time.' })]));
+      ui.page.replaceChildren(head, ui.host.el, ui.worker.el, h('p', { class: 'page-note' }, [icon('shield'), h('span', { text: LR.t('Devices pair with a one-time code and an encrypted, pinned connection. Revoke a device at any time.') })]));
       st.sig = '';
       render();
       poller.start();

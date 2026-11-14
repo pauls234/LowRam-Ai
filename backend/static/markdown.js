@@ -561,10 +561,10 @@
     const codeEl = h('code', { class: block.lang ? 'language-' + block.lang : null });
     if (block.closed || final) highlight(block.text, block.lang, codeEl);
     else codeEl.textContent = block.text;
-    const pre = h('pre', { tabindex: '0', 'aria-label': (block.lang || 'Code') + ' code block' }, codeEl);
+    const pre = h('pre', { tabindex: '0', 'aria-label': (block.lang || 'Code') + LR.t(' code block') }, codeEl);
     const head = h('div', { class: 'code-head' }, [
       h('span', { class: 'code-lang', text: block.lang || 'code' }),
-      LR.copyButton({ getText: () => codeEl.textContent, cls: 'code-copy', label: 'Copy', ariaLabel: 'Copy code' }),
+      LR.copyButton({ getText: () => codeEl.textContent, cls: 'code-copy', label: LR.t('Copy'), ariaLabel: LR.t('Copy code') }),
     ]);
     const el = h('div', { class: 'code-block' }, [head, pre]);
     el._code = codeEl;
@@ -616,7 +616,7 @@
           inline(row[idx] || '', td, false, level);
           return td;
         }))));
-        return h('div', { class: 'table-wrap', tabindex: '0', role: 'group', 'aria-label': 'Table' }, h('table', null, [thead, tbody]));
+        return h('div', { class: 'table-wrap', tabindex: '0', role: 'group', 'aria-label': LR.t('Table') }, h('table', null, [thead, tbody]));
       }
       default: {
         const el = h('p', { class: tight ? 'md-tight' : null });
