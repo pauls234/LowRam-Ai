@@ -586,5 +586,109 @@ class StepTests(LowRAMTestCase):
         self.assertIn("Fix add", self.llm.user_prompt().split("Previously approved steps:")[1].split("\n")[0])
 
 
+def need_files(*paths):
+    return Text("<think>let me look</think>" + json.dumps({"need_files": list(paths)}))
+
+
+class ExplorationTests(LowRAMTestCase):
+    """The model may ask for more files (need_files) before it proposes."""
+
+    def setUp(self):
+        super().setUp()
+        self.repo = self.make_repo(
+            {"calc.py": BUGGY, "helpers.py": "def helper():\n    return 'HELPER-CONTENT'\n", "notes.txt": "NOTES\n"}
+        )
+        self.pid = agent.create_coding_project("Fix add", str(self.repo))
+        self.tid = agent.add_step(self.pid, "Fix add", ["calc.py"], "use plus")
+        self.before = self.snapshot(self.repo)
+
+    def messages(self, index):
+        return self.llm.requests[index]["json"]["messages"]
+
+    def test_need_files_then_proposal(self):
+        self.llm.push(
+            need_files("helpers.py", "missing.py", "calc.py"),
+            proposal_reply([{"path": "helpers.py", "content": "def helper():\n    return 1\n"},
+                            {"path": "calc.py", "content": FIXED}]),
+        )
+        out = agent.execute_coding_step(self.pid)
+        self.assertEqual(out["status"], "proposed", out)
+        self.assertEqual(out["explored_files"], ["helpers.py"])
+        self.assertEqual([f["path"] for f in out["files"]], ["helpers.py", "calc.py"])  # helpers.py was shown in full
+        self.assertEqual(len(self.llm.requests), 2)
+        first, second = self.messages(0), self.messages(1)
+        self.assertIn('"need_files"', first[-1]["content"])  # the option is explained
+        self.assertNotIn("HELPER-CONTENT", first[-1]["content"])
+        self.assertEqual(second[:2], first)  # same prefix: the engine can reuse its prompt cache
+        self.assertEqual(
+            second[2], {"role": "assistant", "content": json.dumps({"need_files": ["helpers.py", "missing.py", "calc.py"]})}
+        )
+        follow_up = second[3]["content"]
+        self.assertIn("### helpers.py\n```\ndef helper():\n    return 'HELPER-CONTENT'\n", follow_up)
+        self.assertIn("### missing.py\n(does not exist)", follow_up)
+        self.assertIn("### calc.py\n(already shown above)", follow_up)
+        raw = (self.home / "artifacts" / f"project_{self.pid}" / f"task_{self.tid}.raw.txt").read_text()
+        self.assertIn("===== model answer 2 =====", raw)
+        self.assertEqual(self.snapshot(self.repo), self.before)
+
+    def test_two_extra_rounds_and_bad_requests(self):
+        self.llm.push(
+            need_files(*[f"f{i}.py" for i in range(8)]),
+            Text(json.dumps({"need_files": "notes.txt"})),
+            proposal_reply([{"path": "calc.py", "content": FIXED}]),
+        )
+        out = agent.execute_coding_step(self.pid)
+        self.assertEqual(out["status"], "proposed", out)
+        self.assertEqual(out["explored_files"], [])
+        round1, round2 = self.llm.user_prompt(1), self.llm.user_prompt(2)
+        self.assertIn("### f5.py", round1)
+        self.assertNotIn("f6.py", round1)
+        self.assertIn(f"only the first {agent.MAX_NEED_FILES} requested files", round1)
+        self.assertIn("1 request(s) left", round1)
+        self.assertIn("need_files must be a list", round2)
+        self.assertIn("You cannot request more files", round2)
+
+    def test_too_many_rounds_fail(self):
+        self.llm.push(need_files("helpers.py"), need_files("notes.txt"), need_files("calc.py"))
+        out = agent.execute_coding_step(self.pid)
+        self.assertEqual(out["status"], "failed")
+        self.assertEqual(len(self.llm.requests), 3)
+        self.assertIn("asked for more files again after 2 extra rounds", out["errors"][0])
+        self.assertEqual(out["explored_files"], ["helpers.py", "notes.txt"])
+        task = db.get_task(self.tid)
+        self.assertEqual(task["status"], "failed")
+        self.assertIn("asked for more files", task["error"])
+        self.assertIn("===== model answer 3 =====", Path(out["raw_output"]).read_text())
+        self.assertEqual(self.snapshot(self.repo), self.before)
+
+    def test_path_escape_in_need_files_is_reported_not_loaded(self):
+        (self.tmp / "outside.py").write_text("OUTSIDE = 'TOP-SECRET'\n")
+        (self.repo / ".env").write_text("TOKEN=ENV-SECRET\n")
+        (self.repo / "link.py").symlink_to(self.tmp / "outside.py")
+        bad = ["../outside.py", str(self.tmp / "outside.py"), ".env", "link.py", "~/outside.py", 7]
+        self.llm.push(need_files(*bad), proposal_reply([{"path": "calc.py", "content": FIXED}]))
+        out = agent.execute_coding_step(self.pid)
+        self.assertEqual(out["status"], "proposed", out)
+        self.assertEqual(out["explored_files"], [])
+        self.assertEqual(self.llm.user_prompt(1).count("(not available:"), len(bad))
+        for request in self.llm.requests:
+            text = json.dumps(request["json"])
+            self.assertNotIn("TOP-SECRET", text)
+            self.assertNotIn("ENV-SECRET", text)
+
+    def test_requested_file_too_large_is_not_shown_and_not_writable(self):
+        self.set_memory(total_gib=1, available_mib=800)  # 20 % -> 2000 characters for files
+        (self.repo / "big.py").write_text("x = 1\n" * 1000)
+        self.before = self.snapshot(self.repo)
+        self.llm.push(need_files("big.py"), proposal_reply([{"path": "big.py", "content": "x = 2\n"}]))
+        out = agent.execute_coding_step(self.pid, 20)
+        self.assertEqual(out["status"], "failed")
+        self.assertIn("not shown – too large", self.llm.user_prompt(1))
+        self.assertNotIn("x = 1\nx = 1", self.llm.user_prompt(1))
+        self.assertEqual(out["explored_files"], [])
+        self.assertTrue(any("blind overwrite" in e for e in out["errors"]), out["errors"])
+        self.assertEqual(self.snapshot(self.repo), self.before)
+
+
 if __name__ == "__main__":
     unittest.main()
