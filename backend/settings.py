@@ -38,6 +38,9 @@ DEFAULTS: dict[str, Any] = {
         "discoverable": True,  # announce this host on the LAN so helpers can find it without a code
     },
     "ui": {"theme": "system"},
+    "desktop": {
+        "keep_running_in_menu_bar": True,  # closing the window keeps LowRAM AI in the macOS menu bar
+    },
     "chat": {
         "instructions": "",  # custom instructions added to every conversation (max 4000 chars)
     },
