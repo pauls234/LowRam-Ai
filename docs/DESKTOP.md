@@ -89,11 +89,16 @@ already installs; created on the main thread via `AppHelper.callAfter`):
   `Modell: bereit (qwen2.5-3b) · Aufgabe läuft`.
 * **Beenden** – clean shutdown (server, task loop, llama-server), then quit.
 
-With the menu-bar item present, closing the window only hides it and LowRAM
-AI keeps running (setting `desktop.keep_running_in_menu_bar`, default
-`true`; `false` = closing the window quits). The icon is optional: if pyobjc
-is missing or anything fails, this is logged and the app behaves as before
-(closing the window quits). Windows and Linux have no tray icon.
+Closing the window quits, as before. Opt-in (setting
+`desktop.keep_running_in_menu_bar`): closing the window only hides it and
+LowRAM AI keeps running in the menu bar – but only while the menu-bar item is
+confirmed on screen. **Cmd+Q**, the app menu's *Quit* and the Dock's *Quit*
+always quit cleanly (server, task loop, llama-server); a click on the Dock
+icon shows the window again. Should macOS route a quit through the window's
+close event anyway, a close while the window is hidden, or a second close
+within 10 s, quits. The icon is optional: if pyobjc is missing or anything
+fails, this is logged and the app behaves as before. Windows and Linux have no
+tray icon.
 
 ## Where things are
 

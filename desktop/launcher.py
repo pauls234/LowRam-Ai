@@ -798,15 +798,22 @@ def _status_for(backend: Backend) -> Callable[[], str]:
     return status
 
 
+CLOSE_AGAIN_QUITS_S = 10.0
+
+
 class WindowController:
     """Window + optional menu-bar icon: close-to-menu-bar, reopen, quit (thread-safe)."""
 
-    def __init__(self, window: Any, starter: Starter, tray_factory: Callable[..., Any] | None):
+    def __init__(self, window: Any, starter: Starter, tray_factory: Callable[..., Any] | None,
+                 clock: Callable[[], float] = time.monotonic):
         self.window = window
         self.starter = starter
         self.tray_factory = tray_factory
         self.tray: Any = None
         self.quitting = False
+        self.hidden = False
+        self._hidden_at: float | None = None
+        self._clock = clock
         self._lock = threading.Lock()
 
     def attach_tray(self, backend: Backend) -> None:
@@ -834,13 +841,33 @@ class WindowController:
                 log.info("Window close events unavailable; closing the window quits LowRAM AI")
 
     def on_closing(self, *args: Any) -> bool:
-        """pywebview ``closing`` handler: False keeps the app running in the menu bar."""
+        """pywebview ``closing`` handler: False keeps the app running in the menu bar.
+
+        pywebview also sends Cmd+Q / Dock "Quit" through this event (the tray routes both to
+        :meth:`quit` where it can). As a fallback, a close while the window is already hidden or a
+        second close within ``CLOSE_AGAIN_QUITS_S`` quits - then pywebview may end the process
+        right after this returns, so the clean shutdown happens here first.
+        """
         with self._lock:
-            keep = self.tray is not None and not self.quitting
-        if not keep or not keep_running_in_menu_bar():
+            tray = self.tray
+            if self.quitting or tray is None or getattr(tray, "visible", False) is not True:
+                return True  # never hide the window without a menu-bar icon the user can see
+            now = self._clock()
+            again = self.hidden or (self._hidden_at is not None and now - self._hidden_at < CLOSE_AGAIN_QUITS_S)
+        if again:
+            log.info("Closed again while hidden or within %gs; quitting", CLOSE_AGAIN_QUITS_S)
+            self._shutdown()
             return True
+        if not keep_running_in_menu_bar():
+            return True
+        try:
+            self.window.hide()
+        except Exception:
+            log.exception("Could not hide the window; quitting instead")
+            return True
+        with self._lock:
+            self.hidden, self._hidden_at = True, now
         log.info("Window hidden; LowRAM AI keeps running in the menu bar")
-        threading.Thread(target=self._call, args=("hide",), name="lowram-hide", daemon=True).start()
         return False
 
     def _call(self, name: str) -> None:
@@ -850,6 +877,8 @@ class WindowController:
             log.exception("Window %s failed", name)
 
     def show(self) -> None:
+        with self._lock:
+            self.hidden = False
         self._call("show")
         with contextlib.suppress(Exception):
             self.window.restore()
@@ -860,14 +889,22 @@ class WindowController:
         if tray is not None:
             tray.close()
 
-    def quit(self) -> None:
-        """Menu bar "Beenden": stop the server (and llama-server), then close the window."""
+    def _shutdown(self) -> None:
+        """Stop the server (and llama-server); the icon is removed whatever happens."""
         with self._lock:
             self.quitting = True
-        log.info("Quit from the menu bar")
-        self.starter.close()
-        self.close_tray()
-        self._call("destroy")
+        try:
+            self.starter.close()
+        finally:
+            self.close_tray()
+
+    def quit(self) -> None:
+        """Menu bar "Beenden", Cmd+Q, Dock "Quit": clean shutdown, then close the window."""
+        log.info("Quit from the menu bar or the app menu")
+        try:
+            self._shutdown()
+        finally:
+            self._call("destroy")
 
 
 def run_window(starter: Starter, storage_dir: Path, log_path: Path | None,

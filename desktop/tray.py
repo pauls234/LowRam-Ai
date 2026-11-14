@@ -71,6 +71,8 @@ class Tray:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self.last_status = ""
+        # True only while the icon is confirmed on screen: the window is never hidden otherwise.
+        self.visible = False
 
     # backends override these two
     def set_status(self, text: str) -> None:
@@ -129,6 +131,35 @@ class Tray:
 _TARGET_CLASS: Any = None
 
 
+def _fourcc(code: bytes) -> int:
+    return int.from_bytes(code, "big")
+
+
+AE_CORE_CLASS, AE_QUIT, AE_REOPEN = _fourcc(b"aevt"), _fourcc(b"quit"), _fourcc(b"rapp")
+
+
+def _selector_name(sel: Any) -> str:
+    return sel.decode("ascii", "replace") if isinstance(sel, bytes) else str(sel or "")
+
+
+def retarget_quit_items(app: Any, target: Any) -> int:
+    """Point the app menu's "Quit" (``terminate:``, Cmd+Q) at ``target.quitApp:``; returns the count.
+
+    pywebview turns ``terminate:`` into a window ``closing`` event, which looks exactly like a click
+    on the close button - with the window kept in the menu bar, Cmd+Q would only hide it.
+    """
+    count = 0
+    main = app.mainMenu()
+    for top in (main.itemArray() if main is not None else ()):
+        sub = top.submenu()
+        for entry in (sub.itemArray() if sub is not None else ()):
+            if _selector_name(entry.action()) == "terminate:":
+                entry.setTarget_(target)
+                entry.setAction_("quitApp:")
+                count += 1
+    return count
+
+
 def _target_class() -> Any:
     """The Objective-C menu target class (an ObjC class can be defined only once per process)."""
     global _TARGET_CLASS
@@ -141,6 +172,12 @@ def _target_class() -> Any:
 
             def quitApp_(self, sender):  # noqa: N802 - Objective-C selector
                 self.tray.quit()
+
+            def handleQuit_withReplyEvent_(self, event, reply):  # noqa: N802 - Dock "Quit", logout
+                self.tray.quit()
+
+            def handleReopen_withReplyEvent_(self, event, reply):  # noqa: N802 - click on the Dock icon
+                self.tray.open()
 
         _TARGET_CLASS = LowRAMTrayTarget
     return _TARGET_CLASS
@@ -162,6 +199,15 @@ class MacTray(Tray):
 
         bar = AppKit.NSStatusBar.systemStatusBar()
         item = bar.statusItemWithLength_(AppKit.NSVariableStatusItemLength)
+        self._status_item = item
+        try:
+            self._build_menu(AppKit, item)
+        except BaseException:
+            self.remove_now()
+            raise
+        self.visible = self._check_visible()
+
+    def _build_menu(self, AppKit: Any, item: Any) -> None:  # noqa: N803 - module
         item.button().setTitle_("LowRAM")
         item.button().setToolTip_("LowRAM AI")
         target = _target_class().alloc().init()
@@ -180,44 +226,109 @@ class MacTray(Tray):
         quitter.setTarget_(target)
         menu.addItem_(quitter)
         item.setMenu_(menu)
-        self._status_item, self._item, self._target = item, status, target
+        self._item, self._target = status, target
+
+    def _check_visible(self) -> bool:
+        """The status item really is in the menu bar: it has a button that sits in a window."""
+        item = self._status_item
+        if item is None:
+            return False
+        try:
+            button = item.button()
+            if button is None or button.window() is None:
+                return False
+            is_visible = getattr(item, "isVisible", None)  # macOS 10.12+; false once removed by the user
+            return bool(is_visible()) if callable(is_visible) else True
+        except Exception:
+            log.debug("Could not check the menu-bar icon", exc_info=True)
+            return False
+
+    def install_hooks(self) -> None:
+        """Main thread: Cmd+Q / app menu "Quit" and Dock "Quit" really quit (``on_quit``), and a
+        click on the Dock icon shows the window again. Each part is optional (logged on failure);
+        pywebview's own application delegate is left untouched."""
+        try:
+            import AppKit
+
+            count = retarget_quit_items(AppKit.NSApplication.sharedApplication(), self._target)
+            log.info("Quit menu items routed to a clean quit: %s", count)
+        except Exception as exc:
+            log.info("Could not route the Quit menu item (%s)", exc)
+        try:
+            from Foundation import NSAppleEventManager
+
+            manager = NSAppleEventManager.sharedAppleEventManager()
+            manager.setEventHandler_andSelector_forEventClass_andEventID_(
+                self._target, "handleQuit:withReplyEvent:", AE_CORE_CLASS, AE_QUIT)
+            manager.setEventHandler_andSelector_forEventClass_andEventID_(
+                self._target, "handleReopen:withReplyEvent:", AE_CORE_CLASS, AE_REOPEN)
+        except Exception as exc:
+            log.info("Could not install the Dock quit/reopen handlers (%s)", exc)
 
     def open(self) -> None:
         try:
             import AppKit
 
-            AppKit.NSApp.activateIgnoringOtherApps_(True)
+            AppKit.NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
         except Exception:
             log.debug("Could not activate the app", exc_info=True)
         super().open()
 
     def set_status(self, text: str) -> None:
         super().set_status(text)
-        if self._item is not None:
-            self._call_after(self._item.setTitle_, text)
+        line = self._item
+        if line is None:
+            return
+
+        def update() -> None:  # main thread
+            line.setTitle_(text)
+            self.visible = self._check_visible()
+
+        self._call_after(update)
+
+    def _take_item(self) -> Any:
+        item, self._status_item, self.visible = self._status_item, None, False
+        return item
 
     def _remove(self) -> None:
-        item = self._status_item
-        if item is None:
-            return
-        self._status_item = None
+        item = self._take_item()
+        if item is not None:
+            self._call_after(_remove_status_item, item)
 
-        def remove() -> None:
-            import AppKit
+    def remove_now(self) -> None:
+        """Remove the status item immediately (main thread only)."""
+        item = self._take_item()
+        if item is not None:
+            _remove_status_item(item)
 
-            AppKit.NSStatusBar.systemStatusBar().removeStatusItem_(item)
 
-        self._call_after(remove)
+def _remove_status_item(item: Any) -> None:
+    import AppKit
+
+    AppKit.NSStatusBar.systemStatusBar().removeStatusItem_(item)
 
 
 def _create_mac(on_open, on_quit, status, timeout: float) -> Tray | None:
     tray = MacTray(on_open, on_quit, status)
     done = threading.Event()
+    lock = threading.Lock()
+    state = {"built": False, "abandoned": False}
     errors: list[BaseException] = []
 
-    def build() -> None:
+    def build() -> None:  # main thread
         try:
+            with lock:
+                if state["abandoned"]:
+                    return  # the caller gave up waiting: create nothing
             tray.build()
+            with lock:
+                late = state["abandoned"]
+                state["built"] = not late
+            if late:
+                log.info("Removing the menu-bar icon that was created too late")
+                tray.remove_now()
+            else:
+                tray.install_hooks()
         except BaseException as exc:  # noqa: BLE001 - reported below, never raised into Cocoa
             errors.append(exc)
         finally:
@@ -225,8 +336,12 @@ def _create_mac(on_open, on_quit, status, timeout: float) -> Tray | None:
 
     tray._call_after(build)
     if not done.wait(timeout):
-        log.info("The menu-bar icon was not created in time; continuing without it")
-        return None
+        with lock:
+            state["abandoned"] = not state["built"]
+        if state["abandoned"]:  # a late build() removes its own status item
+            log.info("The menu-bar icon was not created in time; continuing without it")
+            return None
+        done.wait(timeout)  # built just now; the hooks are being installed
     if errors:
         log.info("No menu-bar icon: %s", errors[0])
         return None

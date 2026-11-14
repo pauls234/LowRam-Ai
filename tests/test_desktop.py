@@ -1,5 +1,6 @@
 """Desktop launcher (no GUI): ports, single instance, browser/window paths, signals, JS API, frozen paths."""
 
+import contextlib
 import json
 import logging
 import os
@@ -476,12 +477,92 @@ class _Hook:
 
 
 class FakeTray:
+    visible = True  # the icon is confirmed in the menu bar
+
     def __init__(self, on_open, on_quit, status):
         self.on_open, self.on_quit, self.status = on_open, on_quit, status
         self.closed = threading.Event()
 
     def close(self):
         self.closed.set()
+
+
+class FakeStarter:
+    def __init__(self, error=None):
+        self.closed, self.error = 0, error
+
+    def close(self):
+        self.closed += 1
+        if self.error:
+            raise self.error
+
+
+class _ObjC:
+    """Stand-in for a pyobjc object: records method calls and returns configured values."""
+
+    def __init__(self, **returns):
+        self.returns, self.calls = returns, []
+
+    def __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
+
+        def method(*args):
+            self.calls.append((name, args))
+            value = self.returns.get(name)
+            return value(*args) if callable(value) else value
+
+        return method
+
+
+class _FakeNSObject:
+    @classmethod
+    def alloc(cls):
+        return cls()
+
+    def init(self):
+        return self
+
+
+def fake_cocoa(mode="sync", button_window=True, item_gate=None):
+    """Fake AppKit/Foundation/PyObjCTools; ``mode``: how callAfter runs (sync, defer, thread)."""
+    queue = []
+
+    def call_after(func, *args):
+        if mode == "defer":
+            queue.append((func, args))
+        elif mode == "thread":
+            threading.Thread(target=func, args=args, daemon=True).start()
+        else:
+            func(*args)
+
+    def status_item_with_length(length):
+        if item_gate is not None:
+            item_gate.wait(5)
+        return status_item
+
+    apphelper = types.ModuleType("PyObjCTools.AppHelper")
+    apphelper.callAfter = call_after
+    package = types.ModuleType("PyObjCTools")
+    package.AppHelper = apphelper
+    status_item = _ObjC(button=_ObjC(window=_ObjC() if button_window else None), isVisible=True)
+    bar = _ObjC(statusItemWithLength_=status_item_with_length)
+    quit_item, other_item = _ObjC(action="terminate:"), _ObjC(action="hide:")
+    nsapp = _ObjC(mainMenu=_ObjC(itemArray=[_ObjC(submenu=_ObjC(itemArray=[other_item, quit_item]))]))
+    appkit = types.ModuleType("AppKit")
+    appkit.NSStatusBar = _ObjC(systemStatusBar=bar)
+    appkit.NSVariableStatusItemLength = -1
+    appkit.NSApplication = _ObjC(sharedApplication=nsapp)
+    appkit.NSMenu = _ObjC(alloc=_ObjC(init=_ObjC()))
+    appkit.NSMenuItem = _ObjC(alloc=_ObjC(initWithTitle_action_keyEquivalent_=lambda t, a, k: _ObjC(action=a)),
+                              separatorItem=_ObjC())
+    foundation = types.ModuleType("Foundation")
+    foundation.NSObject = _FakeNSObject
+    manager = _ObjC()
+    foundation.NSAppleEventManager = _ObjC(sharedAppleEventManager=manager)
+    modules = {"AppKit": appkit, "Foundation": foundation, "PyObjCTools": package, "PyObjCTools.AppHelper": apphelper}
+    return types.SimpleNamespace(modules=modules, queue=queue, bar=bar, item=status_item, quit_item=quit_item,
+                                 other_item=other_item, manager=manager)
 
 
 class TrayTests(DesktopTestCase):
@@ -622,6 +703,125 @@ class TrayTests(DesktopTestCase):
                 self.assertEqual(launcher.run_window(starter, self.home / "webview", None, tray_factory=factory), 0)
                 starter.close()
             self.assertEqual(window.events.closing.handlers, [])
+
+    def controller(self, calls, starter=None, clock=None):
+        c = launcher.WindowController(self._window(calls), starter or FakeStarter(), None,
+                                      clock=clock or (lambda: 100.0))
+        c.tray = FakeTray(None, None, str)
+        return c
+
+    @mock.patch("desktop.launcher.keep_running_in_menu_bar", return_value=True)
+    def test_close_while_hidden_or_twice_within_10s_really_quits(self, _keep):
+        # Cmd+Q / Dock "Quit" reach pywebview's closing event like a close click; while the
+        # window is hidden (or closed again within 10 s) that must quit, cleanly.
+        calls, starter = [], FakeStarter()
+        c = self.controller(calls, starter)
+        tray = c.tray
+        self.assertIs(c.on_closing(), False)
+        self.assertEqual((calls, c.hidden, starter.closed), (["hide"], True, 0))
+        self.assertIs(c.on_closing(), True)
+        self.assertEqual((starter.closed, c.quitting), (1, True))
+        self.assertTrue(tray.closed.is_set())
+        self.assertIsNone(c.tray)
+
+        now = [100.0]
+        for later, quits in ((5.0, True), (11.0, False)):
+            calls, starter = [], FakeStarter()
+            now[0] = 100.0
+            c = self.controller(calls, starter, clock=lambda: now[0])
+            self.assertIs(c.on_closing(), False)
+            c.show()  # reopened from the menu bar or the Dock
+            self.assertFalse(c.hidden)
+            now[0] += later
+            self.assertIs(c.on_closing(), quits)
+            self.assertEqual(starter.closed, 1 if quits else 0)
+            self.assertEqual(calls, ["hide", "show", "restore"] + ([] if quits else ["hide"]))
+
+    @mock.patch("desktop.launcher.keep_running_in_menu_bar", return_value=True)
+    def test_never_hides_without_a_visible_icon(self, _keep):
+        calls = []
+        c = self.controller(calls)
+        c.tray.visible = False  # e.g. the status item has no window (yet)
+        self.assertIs(c.on_closing(), True)
+        c.tray = None
+        self.assertIs(c.on_closing(), True)
+        self.assertEqual(calls, [])
+
+        c = self.controller(calls)
+        c.window.hide = mock.Mock(side_effect=RuntimeError("gone"))
+        self.assertIs(c.on_closing(), True)  # could not hide: close (quit) instead
+        self.assertFalse(c.hidden)
+
+    def test_quit_always_removes_icon_and_closes_window(self):
+        calls = []
+        c = self.controller(calls, FakeStarter(RuntimeError("shutdown failed")))
+        tray = c.tray
+        with self.assertRaises(RuntimeError):
+            c.quit()
+        self.assertTrue(tray.closed.is_set())
+        self.assertEqual(calls, ["destroy"])
+        self.assertIs(c.on_closing(), True)
+
+    def _mac(self, cocoa):
+        from desktop import tray
+
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch.dict(sys.modules, cocoa.modules))
+        stack.enter_context(mock.patch.object(tray, "_TARGET_CLASS", None))
+        self.addCleanup(stack.close)
+        return tray
+
+    def test_mac_tray_routes_quit_and_reopen_and_confirms_visibility(self):
+        cocoa = fake_cocoa()
+        tray = self._mac(cocoa)
+        opened, quit_done = threading.Event(), threading.Event()
+        t = tray.create(opened.set, quit_done.set, lambda: "Modell: aus", platform="darwin", timeout=2)
+        self.assertIsNotNone(t)
+        self.addCleanup(t.close)
+        self.assertIs(t.visible, True)
+        target = t._target
+        # Cmd+Q / app menu "Quit" -> clean quit instead of pywebview's closing event
+        self.assertEqual(cocoa.quit_item.calls[1:], [("setTarget_", (target,)), ("setAction_", ("quitApp:",))])
+        self.assertEqual(cocoa.other_item.calls, [("action", ())])
+        self.assertEqual([(c[0], c[1][1:]) for c in cocoa.manager.calls], [
+            ("setEventHandler_andSelector_forEventClass_andEventID_",
+             ("handleQuit:withReplyEvent:", tray.AE_CORE_CLASS, int.from_bytes(b"quit", "big"))),
+            ("setEventHandler_andSelector_forEventClass_andEventID_",
+             ("handleReopen:withReplyEvent:", tray.AE_CORE_CLASS, int.from_bytes(b"rapp", "big"))),
+        ])
+        target.handleReopen_withReplyEvent_(None, None)  # click on the Dock icon
+        self.assertTrue(opened.is_set())
+        target.handleQuit_withReplyEvent_(None, None)  # Dock "Quit"
+        self.assertTrue(quit_done.wait(5))
+        t.close()
+        self.assertIn(("removeStatusItem_", (cocoa.item,)), cocoa.bar.calls)
+        self.assertIs(t.visible, False)
+
+    def test_mac_tray_without_window_is_not_confirmed(self):
+        tray = self._mac(fake_cocoa(button_window=False))
+        t = tray.create(lambda: None, lambda: None, str, platform="darwin", timeout=2)
+        self.addCleanup(t.close)
+        self.assertIs(t.visible, False)
+
+    def test_mac_tray_created_too_late_removes_itself(self):
+        cocoa = fake_cocoa(mode="defer")  # the main thread never ran the build in time
+        tray = self._mac(cocoa)
+        self.assertIsNone(tray.create(lambda: None, lambda: None, str, platform="darwin", timeout=0.05))
+        func, args = cocoa.queue.pop()
+        func(*args)
+        self.assertEqual(cocoa.bar.calls, [])  # nothing created after the caller gave up
+
+        gate = threading.Event()  # the build is running while the caller gives up
+        cocoa = fake_cocoa(mode="thread", item_gate=gate)
+        tray = self._mac(cocoa)
+        self.assertIsNone(tray.create(lambda: None, lambda: None, str, platform="darwin", timeout=0.05))
+        gate.set()
+        for _ in range(500):
+            if ("removeStatusItem_", (cocoa.item,)) in cocoa.bar.calls:
+                break
+            threading.Event().wait(0.01)
+        self.assertIn(("removeStatusItem_", (cocoa.item,)), cocoa.bar.calls)
+        self.assertEqual(cocoa.manager.calls, [])  # no quit/reopen hooks for an abandoned icon
 
     def test_keep_running_setting_is_opt_in(self):
         self.assertFalse(launcher.keep_running_in_menu_bar())
