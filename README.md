@@ -48,6 +48,12 @@ internet afterwards – only model/engine downloads you start yourself.
 | **Devices** | Let other computers on your Wi-Fi help with a project: they take tasks in parallel with their own local model, and the host combines the results. |
 | **Your models** | Pick from a curated catalog with RAM-based recommendations, paste any Hugging Face GGUF repo/link, or use a `.gguf` file you already have. |
 | **External drive** | Keep models on an external SSD; LowRAM AI runs them from there and says so clearly when the drive is unplugged. |
+| **Turbo for little RAM** | Compressed KV cache (q8_0), flash attention and prompt-cache reuse are switched on automatically when your llama.cpp supports them; the context size is derived from your free RAM; profiles *Automatisch / Sparsam / Schnell*. |
+| **Holds on instead of giving up** | No fixed time limits on slow Macs (answers stream token by token), progress is saved while a task runs, an interrupted task continues after an engine crash, a RAM guard waits for memory instead of failing, and the model is unloaded when idle to free RAM. |
+| **Long chats & big jobs** | Long conversations are summarised instead of forgotten; a *Großauftrag* splits a big goal into small steps that fit into little RAM (optionally on several devices) and merges the results. |
+| **Knowledge base** | Chat with your own documents (local search, answers cite their sources). |
+| **Coding like Claude Code** | The agent looks at the files it needs, proposes diffs for your approval, and runs your test command on click – inside the macOS sandbox, with a warning before AI-written test code runs – then fixes failing tests. |
+| **Diagnostics** | Self-test, a copyable diagnosis report, update notice and a menu-bar icon (optional). |
 
 ### Models
 
