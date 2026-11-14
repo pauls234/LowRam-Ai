@@ -1583,8 +1583,11 @@ def submit_job(data: object) -> dict:
              db.utcnow()),
         )
         job_id = int(cur.lastrowid)
+        # Snapshot inside the transaction: once committed, the worker thread may
+        # start the job immediately, and the API should report what was queued.
+        job = _job_dict(_get_row(conn, job_id))
     WORKER.ensure_started()
-    return get_job(job_id)
+    return job
 
 
 def _wait_not_running(job_id: int, timeout: float) -> dict:
