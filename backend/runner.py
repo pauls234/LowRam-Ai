@@ -5,7 +5,8 @@ Every task outcome is recorded explicitly (``done`` with a result artifact, or
 giving up"):
 
 * while a task streams, its partial answer is checkpointed (atomically, every
-  ~5 s) to ``task_ID.partial.md``; on success the result file replaces it;
+  ~15 s, plus a final one on error) to ``task_ID.partial.md``; on success the
+  result file replaces it;
 * after a transient model error (engine crash/restart, dropped or stalled
   connection) the task waits for the model (up to 10 min) and continues ONCE
   from the checkpoint – if that fails too, it fails with the partial text kept;
@@ -31,10 +32,11 @@ from . import artifacts, config, db, llm, memory, power, settings
 
 log = logging.getLogger("lowram.runner")
 
-CHECKPOINT_INTERVAL_S = 5.0
+CHECKPOINT_INTERVAL_S = 15.0  # spare the SSD; a final checkpoint is always written on error
 ENGINE_WAIT_S = 600.0  # how long a task waits for the model after a transient error
 ENGINE_STEP_S = 30.0  # one engine.ensure_running() call; the stop request is checked in between
 ENGINE_POLL_S = 5.0
+ENGINE_READY_POLL_S = 1.0  # the engine says "ready" but its URL does not answer yet (stale state after a crash)
 RESUME_PROMPT = (
     "Deine Antwort oben wurde unterbrochen. Setze exakt dort fort, wo sie aufhört, ohne Wiederholung."
 )
@@ -250,7 +252,7 @@ def resume_messages(messages: list[dict], partial: str) -> list[dict]:
 
 
 class Checkpoint:
-    """Keeps a streaming answer in ``task_ID.partial.md`` (atomic writes, at most every ~5 s).
+    """Keeps a streaming answer in ``task_ID.partial.md`` (atomic writes, at most every ~15 s).
 
     ``prefix`` is the answer saved before a resume, ``current`` the visible
     text of the request that is running now; :attr:`text` combines both.
@@ -315,15 +317,18 @@ def _managed_engine():
         return None
 
 
-def wait_for_model(timeout: float | None = None, *, stop_event: threading.Event | None = None,
-                   on_wait: Callable[[str], None] | None = None) -> str | None:
-    """Wait until the model endpoint works again after a transient error.
+def await_model(timeout: float | None = None, *, stop_event: threading.Event | None = None,
+                on_wait: Callable[[str], None] | None = None) -> tuple[str | None, str | None]:
+    """Wait until the model endpoint answers again after a transient error.
 
-    Managed engine: ``engine.ensure_running`` (restarts/loads it if needed).
-    External endpoint or no engine module: polls the endpoint
-    (``llm.endpoint_ready``). Returns ``None`` when ready, else the reason
-    (timeout after ``ENGINE_WAIT_S`` or ``stop_event`` set – checked at least
-    every ``ENGINE_STEP_S``).
+    Returns ``(url, None)`` with the URL to use from now on, or ``(None,
+    reason)`` after ``ENGINE_WAIT_S`` or when ``stop_event`` is set (checked
+    at least every ``ENGINE_STEP_S``). Managed engine: the URL returned by
+    ``engine.ensure_running`` (restarts/loads it if needed) is only trusted
+    once ``llm.endpoint_ready`` confirms it – right after a crash the engine
+    may still report the old, dead port as ready; then it is asked again
+    every ``ENGINE_READY_POLL_S``. External endpoint or no engine module: the
+    configured URL is polled.
     """
     limit = ENGINE_WAIT_S if timeout is None else max(0.0, float(timeout))
     deadline = time.monotonic() + limit
@@ -332,23 +337,37 @@ def wait_for_model(timeout: float | None = None, *, stop_event: threading.Event 
         on_wait(WAITING_FOR_MODEL)
     while True:
         if stop_event is not None and stop_event.is_set():
-            return "stopped while waiting for the model"
+            return None, "stopped while waiting for the model"
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            return f"the model was not ready again within {limit / 60:g} min"
+            return None, f"the model was not ready again within {limit / 60:g} min"
+        pause = ENGINE_POLL_S
         if engine is not None:
             try:
-                engine.ensure_running(timeout=min(remaining, ENGINE_STEP_S))
-                return None
+                url = engine.ensure_running(timeout=min(remaining, ENGINE_STEP_S))
             except Exception as exc:  # noqa: BLE001 - EngineError (loading, paused, …): keep waiting
                 log.info("Waiting for the model: %s", exc)
-        elif llm.endpoint_ready(timeout=min(5.0, remaining)):
-            return None
-        pause = min(ENGINE_POLL_S, max(0.0, deadline - time.monotonic()))
+            else:
+                url = url if isinstance(url, str) and url else config.llm_url()
+                if llm.endpoint_ready(url, timeout=min(5.0, max(0.1, deadline - time.monotonic()))):
+                    return url, None
+                log.info("The engine reports %s as ready, but it does not answer yet", llm.redact_url(url))
+                pause = ENGINE_READY_POLL_S
+        else:
+            url = config.llm_url()
+            if llm.endpoint_ready(url, timeout=min(5.0, remaining)):
+                return url, None
+        pause = min(pause, max(0.0, deadline - time.monotonic()))
         if stop_event is not None:
             stop_event.wait(pause)
         else:
             time.sleep(pause)
+
+
+def wait_for_model(timeout: float | None = None, *, stop_event: threading.Event | None = None,
+                   on_wait: Callable[[str], None] | None = None) -> str | None:
+    """Like :func:`await_model`; returns ``None`` when the model answers again, else the reason."""
+    return await_model(timeout, stop_event=stop_event, on_wait=on_wait)[1]
 
 
 def call_with_overflow_retry(
@@ -391,6 +410,7 @@ def _generate(project_id: int, task: dict, mem: memory.MemoryPlan, checkpoint: C
     context = build_context(project_id, task, budget, skipped)
     info.update(attempts=0, resumed_from_checkpoint=False, transient_retries=0, context_retry=False,
                 context_chars=len(context))
+    url: str | None = None  # None = the configured URL at call time; after a crash: the one confirmed ready
     while True:
         messages = _messages(task, context)
         if checkpoint.prefix:
@@ -398,7 +418,7 @@ def _generate(project_id: int, task: dict, mem: memory.MemoryPlan, checkpoint: C
         info["attempts"] += 1
         checkpoint.current = ""
         try:
-            answer = llm.chat(messages, max_tokens=mem.max_tokens, on_text=checkpoint.on_text)
+            answer = llm.chat(messages, max_tokens=mem.max_tokens, url=url, on_text=checkpoint.on_text)
         except llm.LLMError as exc:
             if exc.context_overflow and not info["context_retry"] and context:
                 info["context_retry"] = True
@@ -413,9 +433,10 @@ def _generate(project_id: int, task: dict, mem: memory.MemoryPlan, checkpoint: C
                 raise
             info["transient_retries"] = 1
             log.warning("Task #%s: transient model error (%s); waiting for the model", task["id"], exc)
-            problem = wait_for_model(stop_event=stop_event, on_wait=on_wait)
+            url, problem = await_model(stop_event=stop_event, on_wait=on_wait)
             if problem is not None:
                 raise llm.LLMError(f"{exc} ({problem})") from exc
+            info["url"] = url  # never the URL from before the crash: the engine may have a new port
             info["resumed_from_checkpoint"] = bool(checkpoint.prefix.strip())
             continue
         return join_continuation(checkpoint.prefix, answer).strip()
@@ -459,7 +480,7 @@ def run_next(project_id: int, percent: object = memory.DEFAULT_PERCENT, *,
             "position": task["position"],
             "title": task["title"],
             "model": config.llm_model(),
-            "endpoint": llm.redact_url(config.llm_url()),
+            "endpoint": llm.redact_url(info.get("url") or config.llm_url()),
             "percent": pct,
             "max_tokens": mem.max_tokens,
             "context_chars": info.get("context_chars", 0),

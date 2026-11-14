@@ -183,6 +183,36 @@ class TokenTimeoutTests(StreamCase):
         self.assertTrue(ctx.exception.transient)
         self.assertEqual(ctx.exception.partial, "")
 
+    def test_first_token_timeout_is_capped_at_one_hour(self):
+        self.timeouts(99999, 300)
+        self.addCleanup(setattr, llm, "_first_token_clamp_logged", False)
+        llm._first_token_clamp_logged = False
+        with self.assertLogs("lowram.llm", "WARNING") as logs:
+            self.assertEqual(llm.token_timeouts(), (3600.0, 300.0))
+            self.assertEqual(llm.token_timeouts()[0], 3600.0)
+        self.assertEqual(len(logs.output), 1)  # logged once
+
+    def test_total_request_cap_while_tokens_flow(self):
+        self.timeouts(5, 5)
+        self.fake.push(Stream(["a "] * 80, delay=0.05))
+        started = time.monotonic()
+        with mock.patch.object(llm, "MAX_REQUEST_S", 0.6):
+            with self.assertRaisesRegex(llm.LLMError, "Zeitlimit von 3 Stunden") as ctx:
+                llm.chat(MSGS)
+        self.assertLess(time.monotonic() - started, 3)
+        self.assertFalse(ctx.exception.transient)
+        self.assertTrue(ctx.exception.partial.startswith("a a"))
+
+    def test_total_request_cap_before_first_token(self):
+        self.timeouts(5, 5)
+        self.fake.push(Stream(["zu spät"], first_delay=8))
+        started = time.monotonic()
+        with mock.patch.object(llm, "MAX_REQUEST_S", 0.5):
+            with self.assertRaisesRegex(llm.LLMError, "Zeitlimit") as ctx:
+                llm.chat(MSGS)
+        self.assertLess(time.monotonic() - started, 3)
+        self.assertFalse(ctx.exception.transient)
+
     def test_connection_drop_is_transient(self):
         self.fake.push(Stream(["abc "], end=False))
         with self.assertRaisesRegex(llm.LLMError, "closed the connection") as ctx:
@@ -260,6 +290,41 @@ class CheckpointResumeTests(StreamCase):
         self.assertEqual(waits, [runner.WAITING_FOR_MODEL])
         self.assertGreaterEqual(self.fake.health_checks, 1)
 
+    def test_engine_restarted_on_a_new_port(self):
+        """Old engine behaviour: right after the crash ensure_running still reports the dead port as ready."""
+        pid = runner.create_project("p", "Schreibe etwas")
+        partial = runner.partial_path(pid, db.list_tasks(pid)[0]["id"])
+        hold = threading.Event()
+        self.fake.push(Stream(["Erster ", "Teil."], hold=hold, end=False))
+        restarted = StreamLLM()
+        self.addCleanup(restarted.close)
+        restarted.push(Stream(["Zweiter Teil."]))
+        old_url, calls, result = self.fake.url, [], {}
+
+        def ensure_running(timeout):
+            calls.append(timeout)
+            return old_url if len(calls) <= 2 else restarted.url
+
+        engine = types.SimpleNamespace(ensure_running=ensure_running)
+        with mock.patch.object(runner, "_managed_engine", return_value=engine), \
+                mock.patch.object(runner, "ENGINE_READY_POLL_S", 0.05):
+            worker = threading.Thread(target=lambda: result.update(out=runner.run_next(pid)))
+            worker.start()
+            self.assertTrue(wait_until(lambda: partial.exists() and partial.read_text() == "Erster Teil."))
+            self.fake.close()  # the engine crashes: its port is gone …
+            hold.set()  # … and the running answer breaks off
+            worker.join(15)
+        out = result["out"]
+        self.assertEqual(out["status"], "done", out["error"])
+        self.assertEqual(out["result"], "Erster Teil. Zweiter Teil.")
+        meta = self.meta(out)
+        self.assertEqual((meta["resumed_from_checkpoint"], meta["attempts"]), (True, 2))
+        self.assertEqual(meta["endpoint"], restarted.url)
+        self.assertGreaterEqual(len(calls), 3)  # the stale "ready" URL was not trusted
+        self.assertEqual(len(restarted.requests), 1)
+        self.assertEqual(restarted.requests[0]["messages"][-2], {"role": "assistant", "content": "Erster Teil."})
+        self.assertFalse(partial.exists())
+
     def test_failed_resume_keeps_partial_and_says_so(self):
         pid = runner.create_project("p", "t")
         self.fake.push(Stream(["Anfang "], end=False), Stream(["mehr "], end=False))
@@ -271,6 +336,34 @@ class CheckpointResumeTests(StreamCase):
         self.assertIn("partial answer", out["error"])
         self.assertIn(partial.name, task["error"])
         self.assertEqual(len(self.fake.requests), 2)  # resumed only once
+
+    def test_request_cap_fails_task_without_retry_and_frees_the_slot(self):
+        pid = runner.create_project("p", "t")
+        self.fake.push(Stream(["a "] * 80, delay=0.05))
+        with mock.patch.object(llm, "MAX_REQUEST_S", 0.6):
+            out = runner.run_next(pid)
+        self.assertEqual(out["status"], "failed")
+        self.assertIn(llm.REQUEST_LIMIT_MESSAGE, out["error"])
+        self.assertIn("partial answer", out["error"])
+        self.assertEqual(len(self.fake.requests), 1)  # not transient: no resume
+        self.assertIsNone(db.busy_reason())
+
+    def test_checkpoint_every_15_s_and_on_error(self):
+        settings.update("resilience", {"retry_transient": False})
+        pid = runner.create_project("p", "t")
+        partial = runner.partial_path(pid, db.list_tasks(pid)[0]["id"])
+        hold, result = threading.Event(), {}
+        self.fake.push(Stream(["Anfang ", "mehr"], hold=hold, end=False))
+        with mock.patch.object(runner, "CHECKPOINT_INTERVAL_S", 15.0):
+            worker = threading.Thread(target=lambda: result.update(out=runner.run_next(pid)))
+            worker.start()
+            self.assertTrue(wait_until(lambda: len(self.fake.requests) == 1))
+            time.sleep(0.3)
+            self.assertFalse(partial.exists())  # no write before 15 s
+            hold.set()
+            worker.join(15)
+        self.assertEqual(result["out"]["status"], "failed")
+        self.assertEqual(partial.read_text(), "Anfang mehr")  # final checkpoint on error
 
     def test_no_retry_when_disabled(self):
         settings.update("resilience", {"retry_transient": False})
@@ -304,10 +397,13 @@ class CheckpointResumeTests(StreamCase):
         self.assertEqual(len(self.fake.requests), 1)
 
     def test_wait_for_model_uses_the_managed_engine(self):
-        engine = types.SimpleNamespace(ensure_running=mock.Mock(side_effect=[RuntimeError("loading"), "http://x"]))
-        with mock.patch.object(runner, "_managed_engine", return_value=engine):
-            self.assertIsNone(runner.wait_for_model(timeout=5))
-        self.assertEqual(engine.ensure_running.call_count, 2)
+        engine = types.SimpleNamespace(
+            ensure_running=mock.Mock(side_effect=[RuntimeError("loading"), closed_port_url(), self.fake.url])
+        )
+        with mock.patch.object(runner, "_managed_engine", return_value=engine), \
+                mock.patch.object(runner, "ENGINE_READY_POLL_S", 0.05):
+            self.assertEqual(runner.await_model(timeout=5), (self.fake.url, None))
+        self.assertEqual(engine.ensure_running.call_count, 3)  # a URL that does not answer is not trusted
         self.assertLessEqual(engine.ensure_running.call_args.kwargs["timeout"], runner.ENGINE_STEP_S)
 
     def test_wait_for_model_stops_promptly(self):
@@ -519,6 +615,28 @@ class PressureTests(LowRAMTestCase):
         self.assertFalse(first.is_alive())
         self.assertFalse(memory.sampler_running())
         memory.stop_pressure_sampler()  # no-op
+
+    def test_sampler_cadence_follows_activity(self):
+        with mock.patch("backend.db.busy_reason", return_value="chat #1"):
+            self.assertTrue(memory._something_active())
+        with mock.patch("backend.db.busy_reason", return_value=None):
+            self.assertFalse(memory._something_active())
+        for active, expected in ((False, 0.5), (True, 0.05)):
+            with mock.patch.object(memory, "_something_active", return_value=active):
+                memory.start_pressure_sampler(interval=0.05, idle_interval=0.5)
+                self.assertTrue(wait_until(lambda: memory._cadence == expected))
+                memory.stop_pressure_sampler()
+        self.assertEqual(memory._cadence, memory.PRESSURE_INTERVAL_S)  # reset when stopped
+        self.assertEqual((memory.PRESSURE_INTERVAL_S, memory.PRESSURE_IDLE_INTERVAL_S), (3.0, 20.0))
+        run = mock.Mock(return_value=subprocess.CompletedProcess([], 0, stdout="1\n", stderr=""))
+        with mock.patch.object(memory, "_is_macos", return_value=True), \
+                mock.patch.object(memory.subprocess, "run", run), mock.patch.object(memory, "_cadence", 20.0):
+            memory._mac_cache = (time.monotonic() - 5, "warn")
+            self.assertEqual(memory.mac_pressure_level(), "warn")  # idle: sysctl only every 20 s
+            run.assert_not_called()
+            memory._cadence = 3.0
+            self.assertEqual(memory.mac_pressure_level(), "ok")
+            run.assert_called_once()
 
     def test_import_starts_no_thread(self):
         code = "import threading, backend.app; print(sorted(t.name for t in threading.enumerate()))"
