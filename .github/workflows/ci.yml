@@ -2,10 +2,16 @@ name: CI
 
 on:
   push:
+    branches: [main]  # pull requests are tested by the pull_request event – no double runs
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:  # a newer push replaces the run of the older commit (macOS minutes are precious)
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:

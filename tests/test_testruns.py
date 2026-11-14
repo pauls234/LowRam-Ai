@@ -332,6 +332,79 @@ class SandboxProfileTests(LowRAMTestCase):
         self.assertEqual(agent._sandbox_state(), "unsupported")
 
 
+SANDBOX_PROBE = """
+import json, socket, sys
+
+def attempt(action):
+    try:
+        action()
+        return "ok"
+    except OSError as exc:
+        return f"{type(exc).__name__}:{exc.errno}"
+
+def write(path):
+    with open(path, "w") as handle:
+        handle.write("x")
+
+def read(path):
+    with open(path) as handle:
+        handle.read()
+
+def connect(host, port):
+    socket.create_connection((host, port), timeout=5).close()
+
+repo, outside, secret, data, port = sys.argv[1:6]
+print(json.dumps({
+    "repo": attempt(lambda: write(repo + "/written.txt")),
+    "outside": attempt(lambda: write(outside)),
+    "secret": attempt(lambda: read(secret)),
+    "lowram_data": attempt(lambda: read(data)),
+    "internet": attempt(lambda: connect("1.1.1.1", 443)),
+    "localhost": attempt(lambda: connect("127.0.0.1", int(port))),
+}))
+"""
+
+
+@unittest.skipUnless(sys.platform == "darwin" and os.access(agent.SANDBOX_EXEC, os.X_OK), "needs macOS sandbox-exec")
+class RealSandboxTests(LowRAMTestCase):
+    """On a real Mac (the macOS CI runners): the test-run sandbox blocks what the README promises."""
+
+    def test_sandbox_blocks_home_secrets_app_data_and_internet(self):
+        import pwd
+        import socket
+        import subprocess
+        import tempfile
+
+        base = Path(tempfile.mkdtemp()).resolve()
+        self.addCleanup(shutil.rmtree, base, True)
+        repo, home, data = base / "repo", base / "home", base / "lowram-data"
+        repo.mkdir()
+        (home / ".ssh").mkdir(parents=True)
+        (home / ".ssh" / "id_test").write_text("secret key")
+        data.mkdir()
+        (data / "settings.json").write_text("{}")
+        real_home = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()  # the tests point HOME at a temp folder
+        outside = real_home / f".lowram-sandbox-probe-{os.getpid()}"
+        self.addCleanup(lambda: outside.unlink(missing_ok=True))
+        server = socket.socket()
+        self.addCleanup(server.close)
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        profile = agent.sandbox_profile(repo, home=home, data_dir=data)
+        result = subprocess.run(
+            [agent.SANDBOX_EXEC, "-p", profile, "--", sys.executable, "-I", "-c", SANDBOX_PROBE, str(repo), str(outside),
+             str(home / ".ssh" / "id_test"), str(data / "settings.json"), str(server.getsockname()[1])],
+            capture_output=True, text=True, timeout=60, cwd=repo,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        seen = json.loads(result.stdout.strip().splitlines()[-1])
+        denied = "PermissionError:1"  # EPERM: "Operation not permitted" from the sandbox
+        self.assertEqual(seen, {"repo": "ok", "outside": denied, "secret": denied, "lowram_data": denied,
+                                "internet": denied, "localhost": "ok"})
+        self.assertEqual((repo / "written.txt").read_text(), "x")
+        self.assertFalse(outside.exists())
+
+
 @unittest.skipUnless(POSIX_PY, "needs python3 on PATH and POSIX process groups")
 class RunRecordTests(TestRunCase):
     @unittest.skipIf(sys.platform == "darwin", "runs are sandboxed on macOS")

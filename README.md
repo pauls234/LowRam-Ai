@@ -182,6 +182,5 @@ builds the macOS and Windows apps on every `v*` tag.
 
 ## Not yet
 
-Signed/notarized app builds, test-based verification of coding steps
-(sandboxed test runs), web browsing, fine-tuning, and devices across different
-networks (internet relay).
+Signed/notarized app builds, web browsing, fine-tuning, and devices across
+different networks (internet relay).
