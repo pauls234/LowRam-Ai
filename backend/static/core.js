@@ -378,12 +378,12 @@
     let timer = 0;
     btn.addEventListener('click', async () => {
       const ok = await LR.copy(opts.getText());
-      btn.replaceChildren(icon(ok ? 'check' : 'alert'), opts.iconOnly ? null : h('span', { text: ok ? 'Copied' : 'Copy failed' }));
+      btn.replaceChildren(...[icon(ok ? 'check' : 'alert'), opts.iconOnly ? null : h('span', { text: ok ? 'Copied' : 'Copy failed' })].filter(Boolean));
       btn.classList.toggle('is-done', ok);
       if (opts.iconOnly) LR.announce(ok ? 'Copied to clipboard' : 'Copy failed');
       window.clearTimeout(timer);
       timer = window.setTimeout(() => {
-        btn.replaceChildren(icon('copy'), textEl);
+        btn.replaceChildren(...[icon('copy'), textEl].filter(Boolean));
         btn.classList.remove('is-done');
       }, 1600);
     });

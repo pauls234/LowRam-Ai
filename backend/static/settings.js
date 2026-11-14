@@ -439,7 +439,7 @@
     const st = LR.state.status || {};
     const feats = LR.state.features ? [...LR.state.features] : [];
     const names = { chat: 'Chat', api_coding: 'Coding projects', engine: 'Model engine', media: 'Images & video', cluster: 'Devices' };
-    ui.about.body.replaceChildren(
+    ui.about.body.replaceChildren(...[
       h('dl', { class: 'facts' }, [
         h('div', null, [h('dt', { text: 'Version' }), h('dd', { text: st.version ? 'LowRAM AI ' + st.version : '—' })]),
         h('div', null, [h('dt', { text: 'Modules' }), h('dd', { class: 'badges' }, Object.keys(names).map((k) => LR.badge(names[k] + (feats.includes(k) ? '' : ' – not in this build'), feats.includes(k) ? 'ok' : 'neutral')))]),
@@ -448,7 +448,7 @@
         ? LR.callout({ tone: 'warn', title: 'Startup problems', text: st.startup_errors.join(' · ') })
         : null,
       h('p', { class: 'muted small' }, [icon('shield'), ' Everything runs on this computer. Chats, files and models never leave it unless you add helper devices on your own network.']),
-    );
+    ].filter(Boolean));
   }
 
   /* ------------------------------------------------------------ own models (v0.3.1) */
@@ -683,6 +683,166 @@
     }
   }
 
+  /* ------------------------------------------------------------ custom instructions (v0.3.2) */
+
+  const MAX_INSTRUCTIONS = 4000;
+
+  function buildInstructions() {
+    const sec = section('Custom instructions', 'Added to every conversation – tell LowRAM AI how you like your answers.');
+    ui.instr = sec;
+    const ta = h('textarea', {
+      class: 'input textarea instr-input',
+      rows: '4',
+      maxlength: String(MAX_INSTRUCTIONS),
+      placeholder: 'Antworte immer auf Deutsch und fasse dich kurz.\nOr: Always answer in English, with short paragraphs and an example.',
+    });
+    const field = LR.field({ label: 'Instructions', control: ta, hint: 'Up to 4000 characters. Used for every new answer in all chats.' });
+    const counter = h('span', { class: 'counter' });
+    const status = h('span', { class: 'muted small', role: 'status' });
+    const save = LR.button({ text: 'Save instructions', variant: 'primary', type: 'submit' });
+    const form = h('form', { class: 'form', novalidate: true }, [field.el, h('div', { class: 'form-actions' }, [save, status, h('span', { class: 'spacer' }), counter])]);
+    const update = () => {
+      counter.textContent = fmt.int(ta.value.length) + ' / ' + fmt.int(MAX_INSTRUCTIONS);
+      counter.classList.toggle('is-warn', ta.value.length > MAX_INSTRUCTIONS - 200);
+    };
+    ta.addEventListener('input', () => {
+      update();
+      status.textContent = ta.value.trim() !== (ui.instrSaved || '') ? 'Not saved yet' : '';
+    });
+    form.addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      LR.setBusy(save, true, 'Saving…');
+      const value = ta.value.trim().slice(0, MAX_INSTRUCTIONS);
+      const ok = await saveSetting('chat', { instructions: value }, value ? 'Instructions saved' : 'Instructions cleared');
+      LR.setBusy(save, false);
+      if (ok) {
+        ui.instrSaved = value;
+        ta.value = value;
+        update();
+        status.textContent = 'Saved';
+      }
+    });
+    ui.instrTa = ta;
+    ui.instrUpdate = update;
+    update();
+    sec.body.append(form);
+    return sec.el;
+  }
+
+  function syncInstructions() {
+    if (!ui.instr) return;
+    const s = LR.state.settings;
+    const has = Boolean(s && s.chat && typeof s.chat === 'object');
+    ui.instr.el.hidden = !has || !LR.has('chat');
+    if (has && document.activeElement !== ui.instrTa && ui.instrTa.value.trim() === (ui.instrSaved || '')) {
+      ui.instrSaved = LR.str(s.chat.instructions);
+      ui.instrTa.value = ui.instrSaved;
+      ui.instrUpdate();
+    }
+  }
+
+  /* ------------------------------------------------------------ MacBook & power (v0.3.2) */
+
+  let powerSupported = null;
+  let powerTimer = 0;
+
+  function buildPower() {
+    const sec = section('MacBook & power', 'Long jobs keep your Mac awake and can pause when the battery runs low.');
+    ui.power = sec;
+    sec.el.hidden = true;
+    return sec.el;
+  }
+
+  async function loadPower() {
+    window.clearTimeout(powerTimer);
+    if (!ui.power || powerSupported === false) return;
+    const s = LR.state.settings;
+    if (!LR.has('power') && !(s && s.power)) {
+      ui.power.el.hidden = true;
+      return;
+    }
+    try {
+      const data = await LR.get('/api/power');
+      powerSupported = true;
+      ui.power.el.hidden = false;
+      renderPower(data);
+    } catch (err) {
+      if (err.status === 404) {
+        powerSupported = false; // this build has no power module
+        ui.power.el.hidden = true;
+        return;
+      }
+    }
+    powerTimer = window.setTimeout(loadPower, 15000);
+  }
+
+  function renderPower(p) {
+    const sig = JSON.stringify(p);
+    if (sig === ui.powerSig || (ui.powerRange && document.activeElement === ui.powerRange)) return;
+    ui.powerSig = sig;
+    const bat = p.battery || {};
+    const awake = p.keep_awake || {};
+    const cfg = p.settings || (LR.state.settings && LR.state.settings.power) || {};
+    const out = [];
+    if (bat.available && LR.isNum(bat.percent)) {
+      const bar = LR.progress({ size: 'sm', label: 'Battery level', value: bat.percent / 100 });
+      bar.el.classList.toggle('is-error', !bat.plugged && bat.percent < 20);
+      bar.el.classList.toggle('is-done', Boolean(bat.plugged));
+      out.push(h('div', { class: 'battery-row' }, [
+        h('span', { class: 'machine-icon', 'aria-hidden': 'true' }, icon(bat.plugged ? 'bolt' : 'battery')),
+        h('div', { class: 'battery-main' }, [
+          h('p', { class: 'strong', text: Math.round(bat.percent) + ' % · ' + (bat.plugged ? 'Plugged in' : 'On battery') }),
+          bar.el,
+        ]),
+      ]));
+    }
+    const active = Array.isArray(awake.active) ? awake.active.filter(Boolean) : [];
+    if (active.length) {
+      out.push(h('p', { class: 'awake-note' }, [LR.dot('ok'), h('span', { text: 'Keeping your Mac awake: ' + active.join(', ') })]));
+    }
+    out.push(LR.switchRow({
+      label: 'Keep my Mac awake during long jobs',
+      description: 'Prevents sleep while a task loop, image or video job runs – the display may still turn off.',
+      checked: cfg.keep_awake !== false,
+      onChange: (on, input) => saveSetting('power', { keep_awake: on }, on ? 'Will keep your Mac awake' : 'Your Mac may sleep during jobs').then((ok) => { if (!ok) input.checked = !on; ui.powerSig = ''; }),
+    }).el);
+    out.push(LR.switchRow({
+      label: 'Notify me when long jobs finish',
+      description: 'A system notification when a task loop, an image or video, or a merged result is ready.',
+      checked: cfg.notifications !== false,
+      onChange: (on, input) => saveSetting('power', { notifications: on }, on ? 'Notifications on' : 'Notifications off').then((ok) => { if (!ok) input.checked = !on; ui.powerSig = ''; }),
+    }).el);
+    const id = LR.uid('battery');
+    const value = LR.isNum(cfg.battery_min_percent) ? cfg.battery_min_percent : 20;
+    const range = h('input', { class: 'range', type: 'range', id, min: '0', max: '50', step: '5', value: String(value), 'aria-describedby': id + '-help' });
+    const output = h('output', { class: 'range-output', for: id });
+    const label = (v) => (v === 0 ? 'Never' : 'Below ' + v + ' %');
+    const show = () => {
+      const v = Number(range.value);
+      output.textContent = label(v);
+      range.setAttribute('aria-valuetext', v === 0 ? 'Never pause on battery' : 'Pause below ' + v + ' percent');
+    };
+    let timer = 0;
+    range.addEventListener('input', () => {
+      show();
+      window.clearTimeout(timer);
+      timer = window.setTimeout(async () => {
+        const v = Number(range.value);
+        await saveSetting('power', { battery_min_percent: v }, v === 0 ? 'Long jobs never pause on battery' : 'Long jobs pause below ' + v + ' % battery');
+        ui.powerSig = '';
+      }, 400);
+    });
+    ui.powerRange = range;
+    show();
+    out.push(h('div', { class: 'range-field' }, [
+      h('div', { class: 'range-head' }, [h('label', { class: 'label', for: id, text: 'Pause long jobs on battery' }), output]),
+      range,
+      h('div', { class: 'range-scale', 'aria-hidden': 'true' }, [h('span', { text: 'Never' }), h('span', { text: '25 %' }), h('span', { text: '50 %' })]),
+      h('p', { class: 'help', id: id + '-help', text: 'When your Mac runs on battery below this level, task loops stop and image jobs wait until you plug in.' }),
+    ]));
+    ui.power.body.replaceChildren(...out);
+  }
+
   /* ------------------------------------------------------------ view */
 
   function create() {
@@ -700,7 +860,7 @@
     const storage = buildStorage();
     own.hidden = true;
     storage.hidden = true;
-    page.append(head, ui.engine.el, ui.models.el, own, ui.downloads.el, storage, buildMemory(), buildPrefs(), ui.about.el);
+    page.append(head, ui.engine.el, ui.models.el, own, ui.downloads.el, storage, buildMemory(), buildInstructions(), buildPrefs(), buildPower(), ui.about.el);
     root.append(page);
     return root;
   }
@@ -718,6 +878,8 @@
       syncPrefs();
       ui.storage.el.hidden = true;
       syncExtras();
+      syncInstructions();
+      loadPower();
       renderMemory(LR.state.memory);
       if (engineOk) LR.loadCatalog().catch(() => {});
       if (!unmountDownloads && !ui.downloads.el.hidden) {
@@ -727,7 +889,7 @@
         LR.on('engine', renderEngine),
         LR.on('catalog', () => { renderModels(); renderEngine(); syncExtras(); }),
         LR.on('memory', (m) => { if (document.activeElement !== ui.range) renderMemory(m); }),
-        LR.on('settings', syncPrefs),
+        LR.on('settings', () => { syncPrefs(); syncInstructions(); }),
         LR.on('status', renderAbout),
         LR.downloads.subscribe((list) => {
           const sig = list.filter(LR.downloads.isActive).map((d) => d.id).join(',');
@@ -742,6 +904,7 @@
     },
     hide() {
       window.clearTimeout(storageTimer);
+      window.clearTimeout(powerTimer);
       while (offs.length) offs.pop()();
       if (unmountDownloads) { unmountDownloads(); unmountDownloads = null; }
     },
