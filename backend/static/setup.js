@@ -222,8 +222,10 @@
         LR.setBusy(find, false);
       }
     });
+    const search = LR.hfSearch ? LR.hfSearch((repo) => { source.value = repo; LR.submitForm(form); }) : null;
     return h('section', { class: 'card setup-card setup-own', 'aria-labelledby': 'setup-hf-title' }, [
       h('h2', { class: 'card-title', id: 'setup-hf-title', text: LR.t('Load your own model from Hugging Face') }),
+      search ? search.el : null,
       form,
     ]);
   }

@@ -100,7 +100,7 @@
       else link.removeAttribute('aria-current');
       const feature = FEATURE_OF[route];
       const missing = Boolean(feature && LR.state.features && !LR.has(feature));
-      if (route === 'knowledge' || route === 'diagnostics') link.parentElement.hidden = LR[route + 'Available'] === false;
+      if (route === 'knowledge' || route === 'diagnostics') link.parentElement.hidden = LR[route + 'Available'] === false || !LR.mayHave(route);
       link.classList.toggle('is-unavailable', missing);
       link.title = missing ? LR.t('Not available in this build') : '';
     }
@@ -147,11 +147,18 @@
       case 'starting': return { tone: 'warn', text: LR.t('Starting ') + (name || LR.t('the model')) + '…', pulse: true };
       case 'error': return { tone: 'error', text: LR.t('Model error') };
       default: {
+        if (eng.unloaded_idle || server.unloaded_idle) return { tone: 'idle', text: LR.t('Model paused (loads with your next question)') };
         const anyInstalled = LR.state.catalog && Array.isArray(LR.state.catalog.models) && LR.state.catalog.models.some((m) => m.installed);
         return { tone: 'idle', text: eng.runtime && eng.runtime.installed && anyInstalled ? LR.t('Model stopped') : LR.t('Set up a model') };
       }
     }
   }
+
+  const PRESSURE_TEXT = {
+    ok: LR.t('Memory is fine'),
+    warn: LR.t('Memory is tight – big tasks wait automatically'),
+    critical: LR.t('Memory is very tight – big tasks wait automatically; closing other apps helps'),
+  };
 
   const diagTarget = () => (LR.views.has('diagnostics') && LR.diagnosticsAvailable !== false ? '#/diagnostics' : '#/settings');
 
@@ -175,9 +182,16 @@
     text.textContent = s.text;
     const mem = LR.state.memory;
     const free = mem && LR.isNum(mem.available_bytes) ? fmt.gb(mem.available_bytes) + LR.t(' free') : '';
-    ram.textContent = busy ? LR.t('Busy: ') + busy : free;
+    // RAM pressure from the backend sampler (v0.4): ok / warn / critical.
+    const level = mem && mem.pressure && ['ok', 'warn', 'critical'].includes(mem.pressure.level) ? mem.pressure.level : null;
+    const pressureText = level ? PRESSURE_TEXT[level] : '';
+    ram.replaceChildren(...[
+      level && !busy ? h('span', { class: 'pressure-dot is-' + level, 'aria-hidden': 'true' }) : null,
+      busy ? LR.t('Busy: ') + busy : free,
+    ].filter(Boolean));
     ram.classList.toggle('is-busy', Boolean(busy));
-    pill.title = [s.text, free ? 'RAM ' + free : '', busy ? LR.t('Busy: ') + busy : ''].filter(Boolean).join(' · ');
+    ram.classList.toggle('is-pressure', level === 'warn' || level === 'critical');
+    pill.title = [s.text, free ? 'RAM ' + free : '', level && level !== 'ok' ? pressureText : '', busy ? LR.t('Busy: ') + busy : ''].filter(Boolean).join(' · ');
     pill.dataset.target = s.tone === 'error' ? diagTarget() : '#/settings';
     pill.setAttribute('aria-label', LR.t('Status: ') + pill.title + (pill.dataset.target === '#/diagnostics' ? LR.t('. Open Diagnostics') : LR.t('. Open Models and Settings')));
   }

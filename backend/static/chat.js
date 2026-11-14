@@ -124,7 +124,7 @@
     ui.form = h('form', { class: 'composer', novalidate: true }, [
       ui.atts,
       ui.input,
-      h('div', { class: 'composer-bar' }, [ui.attach, ui.mode.el, buildKnowledgePicker(), h('span', { class: 'composer-spacer' }), ui.stop, ui.send]),
+      h('div', { class: 'composer-bar' }, [ui.attach, ui.mode.el, buildKnowledgePicker(), h('span', { class: 'composer-spacer' }), buildBigJobButton(), ui.stop, ui.send]),
       ui.fileInput,
     ]);
     let dragDepth = 0;
@@ -218,6 +218,43 @@
     ui.kbWrap.classList.toggle('is-on', Boolean(S.collectionId));
   }
 
+  /* ------------------------------------------------------------ long-chat memory + big jobs (v0.4) */
+
+  /** "Older messages were summarised" note with the summary behind a disclosure. */
+  function ensureSummary(pane, summary) {
+    const text = LR.str(summary).trim();
+    let li = pane.list.querySelector(':scope > .msg-summary');
+    if (!text) {
+      if (li) li.remove();
+      return;
+    }
+    if (!li) {
+      li = h('li', { class: 'msg msg-summary' });
+      pane.list.prepend(li);
+    } else if (li.dataset.text === text) return;
+    li.dataset.text = text;
+    li.replaceChildren(h('details', { class: 'summary-note' }, [
+      h('summary', null, [icon('info'), h('span', { text: LR.t('Older messages were summarised') }), icon('chevron-down', 'summary-chevron')]),
+      h('div', { class: 'summary-body' }, [
+        h('p', { class: 'summary-text', text }),
+        h('p', { class: 'muted small', text: LR.t('The model keeps this summary instead of the older messages, so even long chats fit into memory.') }),
+      ]),
+    ]));
+  }
+
+  function buildBigJobButton() {
+    const ui = S.ui;
+    ui.bigJob = h('button', {
+      type: 'button',
+      class: 'icon-btn bigjob-btn',
+      'aria-label': LR.t('Run as a big job'),
+      title: LR.t('Run as a big job – split into subtasks that run one after another'),
+      hidden: true,
+      onclick: () => { if (LR.bigJob) LR.bigJob.open(ui.input.value.trim()); },
+    }, icon('merge'));
+    return ui.bigJob;
+  }
+
   function sourcesBlock(sources) {
     if (!Array.isArray(sources) || !sources.length) return null;
     const id = LR.uid('src');
@@ -284,6 +321,7 @@
     ui.mode.set(mode);
     const fixed = Boolean(pane && pane.id !== null);
     ui.mode.setDisabled(fixed, fixed ? LR.t('The mode is fixed per conversation – start a new chat to switch.') : null);
+    if (ui.bigJob) ui.bigJob.hidden = !(LR.has('autosplit') && LR.bigJob);
     ui.examples.hidden = hasMessages;
     if (!hasMessages) {
       ui.examples.replaceChildren(...EXAMPLES[mode].map((ex) => h('button', {
@@ -377,6 +415,7 @@
       pane.chat = data.chat || pane.chat;
       const messages = Array.isArray(data.messages) ? data.messages : [];
       pane.list.replaceChildren();
+      ensureSummary(pane, (data.chat && data.chat.summary) || data.summary);
       let lastUser = '';
       let pendingReload = false;
       for (const m of messages) {
@@ -802,6 +841,7 @@
             ctx.gotStart = true;
             if (ev.chat && ev.chat.id === ctx.chatId) {
               pane.chat = ev.chat;
+              if (ev.chat.summary) ensureSummary(pane, ev.chat.summary);
               S.chats = [ev.chat, ...S.chats.filter((c) => c.id !== ev.chat.id)];
               renderHistory();
               if (S.currentId === ctx.chatId) renderChrome();

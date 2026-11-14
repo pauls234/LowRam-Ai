@@ -64,7 +64,7 @@
     const states = {
       ready: ['ok', LR.t('Running')],
       starting: ['warn', LR.t('Starting…')],
-      error: ['error', 'Error'],
+      error: ['error', LR.t('Error')],
       stopped: ['idle', LR.t('Stopped')],
     };
     const st = states[server.state] || states.stopped;
@@ -74,9 +74,10 @@
     else if (server.state === 'starting') line = LR.t('Loading ') + (name || LR.t('the model')) + LR.t(' into memory – this can take a minute.');
     else if (server.state === 'error') line = LR.t('The engine stopped with an error.');
     if (eng.paused) line = LR.t('Paused while an image or video is generated – the model restarts by itself afterwards.');
+    else if (server.state !== 'ready' && server.state !== 'starting' && (eng.unloaded_idle || server.unloaded_idle)) line = LR.t('Paused to free memory – the model loads again with your next question.');
     out.push(h('div', { class: 'engine-row' }, [
       h('span', { class: 'dot dot-' + st[0] + (server.state === 'starting' ? ' is-pulsing' : ''), 'aria-hidden': 'true' }),
-      h('div', { class: 'engine-text' }, [h('p', { class: 'engine-state', text: line }), h('p', { class: 'muted small', text: st[1] + (server.port ? LR.t(' · port ') + server.port : '') + (server.ctx_size ? LR.t(' · context ') + fmt.int(server.ctx_size) + ' tokens' : '') + (server.started_at ? LR.t(' · since ') + fmt.time(server.started_at) : '') })]),
+      h('div', { class: 'engine-text' }, [h('p', { class: 'engine-state', text: line }), h('p', { class: 'muted small', text: st[1] + (server.port ? LR.t(' · port ') + server.port : '') + (server.ctx_size ? LR.t(' · context ') + fmt.int(server.ctx_size) + LR.t(' tokens') : '') + (server.started_at ? LR.t(' · since ') + fmt.time(server.started_at) : '') })]),
     ]));
     const facts = h('dl', { class: 'facts' }, [
       h('div', null, [h('dt', { text: LR.t('Runtime') }), h('dd', { text: runtime.installed ? 'llama.cpp' + (runtime.version ? ' ' + runtime.version : '') + (runtime.source ? ' (' + runtime.source + ')' : '') : LR.t('Not installed') })]),
@@ -605,7 +606,12 @@
         LR.setBusy(add, false);
       }
     });
-    sec.body.append(form, h('div', { class: 'or-rule', 'aria-hidden': 'true' }, h('span', { text: 'or' })), localForm);
+    const search = hfSearch((repo) => {
+      source.value = repo;
+      LR.submitForm(form);
+      source.scrollIntoView({ block: 'nearest', behavior: LR.reducedMotion() ? 'auto' : 'smooth' });
+    });
+    sec.body.append(search.el, form, h('div', { class: 'or-rule', 'aria-hidden': 'true' }, h('span', { text: LR.t('or') })), localForm);
     return sec.el;
   }
 
@@ -912,6 +918,244 @@
     ui.power.body.replaceChildren(...out);
   }
 
+  /* ------------------------------------------------------------ performance (v0.4) */
+
+  const PROFILES = ['auto', 'saver', 'fast'];
+  const PROFILE_DESC = {
+    auto: 'Adapts to your free memory (recommended).',
+    saver: 'Smaller context, leaves the most memory for other apps.',
+    fast: 'More speed for answers, needs more memory.',
+  };
+
+  function buildPerf() {
+    const sec = section(LR.t('Performance'), LR.t('How the model engine uses your memory.'));
+    ui.perf = sec;
+    ui.profile = LR.segmented({
+      label: LR.t('Profile'),
+      value: 'auto',
+      options: [
+        { value: 'auto', label: LR.t('Automatic'), icon: 'sparkle' },
+        { value: 'saver', label: LR.t('Saver'), icon: 'battery' },
+        { value: 'fast', label: LR.t('Fast'), icon: 'zap' },
+      ],
+      onChange: async (value) => {
+        const prev = (LR.state.settings && LR.state.settings.engine && LR.state.settings.engine.profile) || 'auto';
+        const ok = await saveSetting('engine', { profile: value }, LR.t('Saved'));
+        if (!ok) ui.profile.set(prev);
+        ui.perfSig = null;
+        renderPerf();
+      },
+    });
+    ui.profileDesc = h('p', { class: 'switch-desc' });
+    ui.perfFacts = h('div', { class: 'perf-facts' });
+    sec.body.append(
+      h('div', { class: 'switch-row' }, [h('div', { class: 'switch-text' }, [h('p', { class: 'switch-label', text: LR.t('Profile') }), ui.profileDesc]), ui.profile.el]),
+      ui.perfFacts,
+    );
+    return sec.el;
+  }
+
+  function renderPerf() {
+    if (!ui.perf) return;
+    const s = LR.state.settings || {};
+    const engineS = s.engine || {};
+    const eng = LR.state.engine;
+    const available = LR.has('engine') && 'profile' in engineS && !(eng && eng.external);
+    ui.perf.el.hidden = !available;
+    if (!available) return;
+    const profile = PROFILES.includes(engineS.profile) ? engineS.profile : 'auto';
+    ui.profile.set(profile);
+    ui.profileDesc.textContent = LR.t(PROFILE_DESC[profile]);
+    const server = (eng && eng.server) || {};
+    const tun = server.tuning && typeof server.tuning === 'object' ? server.tuning : null;
+    const running = server.state === 'ready' || server.state === 'starting';
+    const sig = JSON.stringify([profile, tun, server.restarts, running, server.model_id]);
+    if (sig === ui.perfSig) return;
+    ui.perfSig = sig;
+    const out = [];
+    if (tun && running) {
+      const onOff = (v) => (v ? LR.t('on') : LR.t('off'));
+      const reuse = tun.cache_reuse;
+      out.push(h('dl', { class: 'facts' }, [
+        h('div', null, [h('dt', { text: LR.t('Active profile') }), h('dd', { text: tun.profile && PROFILES.includes(tun.profile) ? LR.t(PROFILE_NAME[tun.profile]) : LR.str(tun.profile, '—') })]),
+        h('div', null, [h('dt', { text: LR.t('Context') }), h('dd', { text: LR.isNum(tun.ctx_size) ? fmt.int(tun.ctx_size) + LR.t(' tokens') : '—' })]),
+        h('div', null, [h('dt', { text: LR.t('KV cache') }), h('dd', { text: tun.kv_cache ? LR.str(tun.kv_cache) + (/^q/i.test(String(tun.kv_cache)) ? LR.t(' (saves memory)') : '') : '—' })]),
+        h('div', null, [h('dt', { text: 'Flash Attention' }), h('dd', { text: onOff(tun.flash_attn) })]),
+        h('div', null, [h('dt', { text: LR.t('Prompt cache') }), h('dd', { text: reuse ? LR.t('on') + (LR.isNum(reuse) ? ' (' + reuse + LR.t(' tokens') + ')' : '') : LR.t('off') })]),
+        LR.isNum(server.restarts) ? h('div', null, [h('dt', { text: LR.t('Automatic restarts') }), h('dd', { text: String(server.restarts) })]) : null,
+      ]));
+    }
+    if (running && tun && tun.profile && tun.profile !== profile) {
+      out.push(LR.callout({
+        tone: 'info',
+        title: LR.t('Restart the model to use this profile'),
+        text: LR.t('The model briefly stops and loads again with the new settings.'),
+        actions: [LR.button({ text: LR.t('Restart now'), icon: 'retry', size: 'sm', variant: 'primary', onclick: (ev) => restartEngine(server.model_id, ev.currentTarget) })],
+      }));
+    } else {
+      out.push(h('p', { class: 'muted small', text: LR.t('A new profile applies the next time the model starts – a running model restarts briefly for it.') }));
+    }
+    ui.perfFacts.replaceChildren(...out);
+  }
+  const PROFILE_NAME = { auto: 'Automatic', saver: 'Saver', fast: 'Fast' };
+
+  async function restartEngine(modelId, btn) {
+    LR.setBusy(btn, true, LR.t('Restarting…'));
+    try {
+      await LR.post('/api/engine/stop', {});
+      const data = await LR.post('/api/engine/start', modelId ? { model_id: modelId } : {});
+      if (data && data.server) LR.state.engine = Object.assign({}, LR.state.engine || {}, { server: data.server });
+      LR.toast(LR.t('The model is restarting with the new profile'));
+    } catch (err) {
+      LR.toast(LR.t('Could not start the model: ') + err.message, 'error');
+    } finally {
+      if (btn.isConnected) LR.setBusy(btn, false);
+      ui.perfSig = null;
+      LR.refreshStatus();
+    }
+  }
+
+  /* ------------------------------------------------------------ Hugging Face search (v0.4) */
+
+  /** Debounced search over GGUF repos; onPick(repo) opens the file list. Hides itself on a 404. */
+  function hfSearch(onPick) {
+    const input = h('input', { class: 'input', type: 'search', placeholder: LR.t('e.g. qwen coder, llama 3.2, mistral'), autocomplete: 'off', spellcheck: 'false' });
+    const field = LR.field({ label: LR.t('Search models on Hugging Face'), control: input, hint: LR.t('Only GGUF models are listed. Pick one to see its files and which one fits your memory.') });
+    const list = h('div', { class: 'hf-results', 'aria-live': 'polite' });
+    const wrap = h('div', { class: 'hf-search', role: 'search' }, [field.el, list]);
+    let timer = 0;
+    let seq = 0;
+    input.addEventListener('input', () => {
+      window.clearTimeout(timer);
+      const q = input.value.trim();
+      if (q.length < 2) {
+        seq++;
+        list.replaceChildren();
+        return;
+      }
+      timer = window.setTimeout(() => run(q), 450);
+    });
+    input.addEventListener('keydown', (ev) => {
+      if (ev.key !== 'Enter') return;
+      ev.preventDefault();
+      window.clearTimeout(timer);
+      const q = input.value.trim();
+      if (q.length >= 2) run(q);
+    });
+    async function run(q) {
+      const my = ++seq;
+      list.replaceChildren(LR.skeleton(3));
+      try {
+        const data = await LR.get('/api/engine/search?q=' + encodeURIComponent(q) + '&limit=20');
+        if (my !== seq) return;
+        const models = Array.isArray(data.models) ? data.models : [];
+        if (!models.length) {
+          list.replaceChildren(h('p', { class: 'muted small', text: LR.t('No GGUF models found for “{q}”.', { q }) }));
+          return;
+        }
+        list.replaceChildren(h('ul', { class: 'hf-list', 'aria-label': LR.t('Search results') }, models.map((m) => {
+          const repo = LR.str(m.repo);
+          const meta = [
+            LR.isNum(m.downloads) ? LR.t('{n} downloads', { n: LR.compact(m.downloads) }) : '',
+            LR.isNum(m.likes) ? LR.t('{n} likes', { n: LR.compact(m.likes) }) : '',
+            m.license ? LR.str(m.license) : '',
+            m.updated ? LR.t('updated {date}', { date: fmt.time(m.updated) }) : '',
+          ].filter(Boolean).join(' · ');
+          return h('li', null, h('button', { type: 'button', class: 'hf-item', onclick: () => onPick(repo) }, [
+            h('span', { class: 'hf-main' }, [h('span', { class: 'hf-repo', text: repo }), meta ? h('span', { class: 'hf-meta', text: meta }) : null]),
+            icon('chevron-right', 'hf-chevron'),
+          ]));
+        })));
+      } catch (err) {
+        if (my !== seq) return;
+        if (LR.isMissingRoute(err)) {
+          wrap.hidden = true; // this backend has no model search
+          return;
+        }
+        list.replaceChildren(LR.callout({ tone: 'error', text: err.message }));
+      }
+    }
+    return { el: wrap, input };
+  }
+  LR.hfSearch = (onPick) => (LR.has('engine') ? hfSearch(onPick) : null);
+
+  /** Submit a form the way the user would (runs its submit handler). */
+  LR.submitForm = function (form) {
+    if (typeof form.requestSubmit === 'function') form.requestSubmit();
+    else form.dispatchEvent(new Event('submit', { cancelable: true }));
+  };
+
+  /* ------------------------------------------------------------ stability (v0.4 resilience) */
+
+  const RES_FIELDS = [
+    { key: 'idle_unload_minutes', label: 'Unload the model after idle time', hint: 'Frees memory when you have not asked anything for a while; your next question loads it again. 0 = never.', min: 0, max: 120, unit: 'min' },
+    { key: 'wait_for_ram_minutes', label: 'When memory is tight, wait up to', hint: 'A task loop waits this long for free memory before it pauses. 0 = do not wait.', min: 0, max: 240, unit: 'min' },
+  ];
+  const RES_ADVANCED = [
+    { key: 'first_token_timeout_s', label: 'Wait for the first word', hint: 'Slow computers sometimes need many minutes to read a long prompt.', min: 60, max: 7200, unit: 's' },
+    { key: 'idle_token_timeout_s', label: 'Wait between two words', hint: 'If no new word arrives for this long, the request counts as stuck.', min: 30, max: 1800, unit: 's' },
+  ];
+
+  function numberField(o) {
+    const input = h('input', { class: 'input input-number', type: 'number', min: String(o.min), max: String(o.max), step: '1', inputmode: 'numeric' });
+    const field = LR.field({ label: LR.t(o.label), control: input, hint: LR.t(o.hint) });
+    const row = h('div', { class: 'input-row input-row-unit' });
+    input.replaceWith(row);
+    row.append(input, h('span', { class: 'input-unit', text: o.unit === 'min' ? LR.t('minutes') : LR.t('seconds') }));
+    input.addEventListener('change', async () => {
+      const n = Number(input.value);
+      if (input.value.trim() === '' || !Number.isInteger(n) || n < o.min || n > o.max) {
+        field.setError(LR.t('Choose a whole number from {min} to {max}.', { min: o.min, max: o.max }));
+        return;
+      }
+      field.setError('');
+      const ok = await saveSetting('resilience', { [o.key]: n }, LR.t('Saved'));
+      if (!ok) syncResilience(true);
+    });
+    return { el: field.el, input, key: o.key };
+  }
+
+  function buildResilience() {
+    const sec = section(LR.t('Stability'), LR.t('How LowRAM AI holds on when memory is tight or the model crashes – instead of giving up.'));
+    ui.res = sec;
+    ui.resFields = RES_FIELDS.map(numberField);
+    ui.resRetry = LR.switchRow({
+      label: LR.t('Continue automatically after a crash'),
+      description: LR.t('If the model crashes in the middle of a task, LowRAM AI restarts it and continues the task once from where it stopped.'),
+      checked: true,
+      onChange: (on, input) => saveSetting('resilience', { retry_transient: on }, LR.t('Saved')).then((ok) => { if (!ok) input.checked = !on; }),
+    });
+    ui.resAdvanced = RES_ADVANCED.map(numberField);
+    const adv = h('details', { class: 'advanced' }, [
+      h('summary', { text: LR.t('Advanced') }),
+      h('div', { class: 'advanced-body' }, [
+        h('p', { class: 'muted small', text: LR.t('Answers stream word by word, so there is no fixed overall time limit – only these two waiting times.') }),
+        ...ui.resAdvanced.map((f) => f.el),
+      ]),
+    ]);
+    sec.body.append(h('div', { class: 'form res-form' }, [...ui.resFields.map((f) => f.el), ui.resRetry.el, adv]));
+    sec.el.hidden = true;
+    return sec.el;
+  }
+
+  function syncResilience(force) {
+    if (!ui.res) return;
+    const r = LR.state.settings && LR.state.settings.resilience;
+    const available = Boolean(r && typeof r === 'object');
+    ui.res.el.hidden = !available;
+    if (!available) return;
+    for (const f of [...ui.resFields, ...ui.resAdvanced]) {
+      if (!(f.key in r)) {
+        f.el.hidden = true;
+        continue;
+      }
+      f.el.hidden = false;
+      if (force || document.activeElement !== f.input) f.input.value = LR.isNum(r[f.key]) ? String(r[f.key]) : '';
+    }
+    ui.resRetry.el.hidden = !('retry_transient' in r);
+    ui.resRetry.input.checked = r.retry_transient !== false;
+  }
+
   /* ------------------------------------------------------------ view */
 
   function create() {
@@ -929,7 +1173,9 @@
     const storage = buildStorage();
     own.hidden = true;
     storage.hidden = true;
-    page.append(head, ui.engine.el, ui.models.el, own, ui.downloads.el, storage, buildMemory(), buildInstructions(), buildPrefs(), buildPower(), ui.about.el);
+    const perf = buildPerf();
+    perf.hidden = true;
+    page.append(head, ui.engine.el, perf, ui.models.el, own, ui.downloads.el, storage, buildMemory(), buildResilience(), buildInstructions(), buildPrefs(), buildPower(), ui.about.el);
     root.append(page);
     return root;
   }
@@ -942,6 +1188,9 @@
       ui.engine.el.hidden = false;
       ui.downloads.el.hidden = !engineOk && !LR.has('media');
       renderEngine();
+      ui.perfSig = null;
+      renderPerf();
+      syncResilience(true);
       renderModels();
       renderAbout();
       syncPrefs();
@@ -955,10 +1204,10 @@
         unmountDownloads = LR.downloads.mount(ui.downloadsList, null, { empty: h('p', { class: 'muted', text: LR.t('No downloads yet. Models you install show their progress here.') }) });
       }
       offs.push(
-        LR.on('engine', renderEngine),
+        LR.on('engine', () => { renderEngine(); renderPerf(); }),
         LR.on('catalog', () => { renderModels(); renderEngine(); syncExtras(); }),
         LR.on('memory', (m) => { if (document.activeElement !== ui.range) renderMemory(m); }),
-        LR.on('settings', () => { syncPrefs(); syncInstructions(); }),
+        LR.on('settings', () => { syncPrefs(); syncInstructions(); renderPerf(); syncResilience(); }),
         LR.on('status', renderAbout),
         LR.downloads.subscribe((list) => {
           const sig = list.filter(LR.downloads.isActive).map((d) => d.id).join(',');

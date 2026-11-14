@@ -11,7 +11,7 @@
   const STATUS_TEXT = { pending: LR.t('Pending'), running: LR.t('Working'), done: LR.t('Done'), failed: LR.t('Failed'), proposed: LR.t('Needs review'), approved: LR.t('Applied'), rejected: LR.t('Rejected') };
   const MAX_DIFF_LINES = 3000;
   const ui = {};
-  const st = { projects: [], loaded: false, selected: null, detail: null, busy: null, review: null };
+  const st = { projects: [], loaded: false, selected: null, detail: null, busy: null, review: null, tests: new Map(), testsMissing: false };
 
   /* ------------------------------------------------------------ diff viewer */
 
@@ -192,7 +192,7 @@
         h('span', { class: 'proj-name', text: p.goal || p.name || LR.t('Untitled project') }),
         h('span', { class: 'proj-path' }, [icon('folder'), h('span', { text: LR.str(p.repo_path) })]),
         bar.el,
-        h('span', { class: 'proj-meta', text: total ? finished + LR.t(' of ') + fmt.plural(total, 'step') + LR.t(' applied') + (counts.proposed ? ' · ' + counts.proposed + ' to review' : '') : LR.t('No steps yet') }),
+        h('span', { class: 'proj-meta', text: total ? finished + LR.t(' of ') + fmt.plural(total, 'step') + LR.t(' applied') + (counts.proposed ? ' · ' + counts.proposed + LR.t(' to review') : '') : LR.t('No steps yet') }),
       ]));
     })));
   }
@@ -268,7 +268,8 @@
       }))
       : LR.empty({ icon: 'list', title: LR.t('No steps yet'), text: LR.t('Let the model plan small steps for this goal, or add one yourself.') });
 
-    ui.detail.replaceChildren(head, safety, controls, busyEl, ui.outcome, ui.reviewSlot, h('h3', { class: 'section-label', text: LR.t('Steps') }), stepsList);
+    ui.detail.replaceChildren(head, safety, controls, busyEl, ui.outcome, ui.reviewSlot, h('h3', { class: 'section-label', text: LR.t('Steps') }), stepsList, ui.testsSlot);
+    renderTests(project);
   }
 
   function showOutcome(node) {
@@ -366,7 +367,7 @@
     } else if (result.status === 'empty') {
       showOutcome(LR.callout({ tone: 'info', title: LR.t('Nothing to run'), text: LR.str(result.reason, LR.t('No pending steps.')) }));
     } else {
-      showOutcome(LR.callout({ tone: 'info', title: LR.t('Step finished'), text: 'Status: ' + LR.str(result.status) }));
+      showOutcome(LR.callout({ tone: 'info', title: LR.t('Step finished'), text: LR.t('Status: ') + (STATUS_TEXT[result.status] || LR.str(result.status)) }));
     }
   }
 
@@ -497,6 +498,188 @@
 
   /* ------------------------------------------------------------ view */
 
+  /* ------------------------------------------------------------ tests (v0.4 test & fix loop) */
+
+  const RUN_STATE = {
+    running: ['accent', 'Tests are running…'],
+    passed: ['ok', 'Tests passed'],
+    failed: ['error', 'Tests failed'],
+    error: ['error', 'The test command could not run'],
+    timeout: ['warn', 'Tests stopped after 10 minutes'],
+  };
+
+  function testState(pid) {
+    if (!st.tests.has(pid)) st.tests.set(pid, {});
+    return st.tests.get(pid);
+  }
+
+  /** Shown when the backend stores a test command per project (`test_command` in the project). */
+  function renderTests(project) {
+    const slot = ui.testsSlot;
+    if (!project || !('test_command' in project) || st.testsMissing) {
+      slot.replaceChildren();
+      slot.hidden = true;
+      ui.testsFor = null;
+      return;
+    }
+    slot.hidden = false;
+    const pid = project.id;
+    const t = testState(pid);
+    if (t.savedCommand === undefined) t.savedCommand = LR.str(project.test_command);
+    if (ui.testsFor !== pid) {
+      ui.testsFor = pid;
+      const cmd = h('input', { class: 'input mono', type: 'text', maxlength: '300', spellcheck: 'false', autocomplete: 'off', placeholder: LR.t('e.g. pytest -q') });
+      cmd.value = t.savedCommand;
+      const field = LR.field({ label: LR.t('Test command'), control: cmd, hint: LR.t('Runs in the project folder as a plain program call (no shell), for at most 10 minutes.') });
+      const save = LR.button({ text: LR.t('Save'), variant: 'secondary', type: 'submit' });
+      const row = h('div', { class: 'input-row' });
+      cmd.replaceWith(row);
+      row.append(cmd, save);
+      const form = h('form', { class: 'form', novalidate: true }, field.el);
+      form.addEventListener('submit', (ev) => {
+        ev.preventDefault();
+        saveCommand(pid, cmd, field, save);
+      });
+      ui.testsRunBtn = LR.button({ text: LR.t('Run tests'), icon: 'play', variant: 'primary', onclick: () => runTests(pid) });
+      ui.testsRun = h('div', { class: 'tests-run', 'aria-live': 'polite' });
+      slot.replaceChildren(h('section', { class: 'tests-panel', 'aria-labelledby': 'tests-title' }, [
+        h('h3', { class: 'section-label', id: 'tests-title', text: LR.t('Tests') }),
+        form,
+        h('div', { class: 'row-actions' }, [ui.testsRunBtn]),
+        h('p', { class: 'muted small tests-note' }, [icon('shield'), h('span', { text: LR.t('Commands only run when you click “Run tests” – never automatically and never because the AI suggests it.') })]),
+        ui.testsRun,
+      ]));
+    }
+    renderTestRun(pid);
+  }
+
+  function renderTestRun(pid) {
+    if (ui.testsFor !== pid || !ui.testsRun) return;
+    const t = testState(pid);
+    const run = t.run;
+    const running = Boolean(run && run.state === 'running') || Boolean(t.starting);
+    const hasCommand = Boolean(LR.str(t.savedCommand).trim());
+    ui.testsRunBtn.disabled = running || !hasCommand || Boolean(st.busy);
+    ui.testsRunBtn.title = hasCommand ? '' : LR.t('Save a test command first');
+    const label = ui.testsRunBtn.querySelector('span');
+    if (label) label.textContent = running ? LR.t('Tests are running…') : LR.t('Run tests');
+    const out = [];
+    if (t.error) out.push(LR.callout({ tone: 'error', role: 'alert', title: LR.t('Could not run the tests'), text: t.error }));
+    if (run) {
+      const state = RUN_STATE[run.state] || ['info', LR.str(run.state)];
+      const meta = [
+        LR.isNum(run.exit_code) ? LR.t('exit code {n}', { n: run.exit_code }) : '',
+        run.started_at && run.finished_at ? fmt.duration((fmt.parseTime(run.finished_at) - fmt.parseTime(run.started_at)) / 1000) : '',
+      ].filter(Boolean).join(' · ');
+      out.push(h('p', { class: 'tests-state tone-' + state[0] }, [
+        run.state === 'running' ? LR.spinner() : icon(run.state === 'passed' ? 'check' : 'alert'),
+        h('span', { class: 'strong', text: LR.t(state[1]) }),
+        meta ? h('span', { class: 'muted small', text: meta }) : null,
+      ]));
+      if (run.output_tail) out.push(h('pre', { class: 'tests-output', tabindex: '0', 'aria-label': LR.t('Test output (last lines)'), text: LR.str(run.output_tail) }));
+      if (run.state === 'failed' || run.state === 'timeout') {
+        out.push(h('div', { class: 'row-actions' }, [LR.button({
+          text: LR.t('Let the AI fix the failures'),
+          icon: 'sparkle',
+          variant: 'primary',
+          disabled: Boolean(st.busy) || Boolean(t.fixing),
+          onclick: (ev) => fixTests(pid, run.id, ev.currentTarget),
+        })]));
+      }
+    }
+    ui.testsRun.replaceChildren(...out);
+    const pre = ui.testsRun.querySelector('.tests-output');
+    if (pre) pre.scrollTop = pre.scrollHeight;
+  }
+
+  function testsMissing() {
+    st.testsMissing = true;
+    ui.testsSlot.replaceChildren();
+    ui.testsSlot.hidden = true;
+    ui.testsFor = null;
+  }
+
+  async function saveCommand(pid, cmd, field, btn) {
+    field.setError('');
+    const value = cmd.value.trim();
+    LR.setBusy(btn, true, LR.t('Saving…'));
+    try {
+      const data = await LR.post('/api/coding/projects/' + pid + '/test-command', { command: value });
+      const t = testState(pid);
+      t.savedCommand = LR.str(data.command, value);
+      cmd.value = t.savedCommand;
+      LR.toast(LR.t('Test command saved'));
+    } catch (err) {
+      if (LR.isMissingRoute(err)) { testsMissing(); return; }
+      field.setError(err.message);
+    } finally {
+      if (btn.isConnected) LR.setBusy(btn, false);
+      renderTestRun(pid);
+    }
+  }
+
+  async function runTests(pid) {
+    const t = testState(pid);
+    if (t.starting || (t.run && t.run.state === 'running')) return;
+    t.error = null;
+    t.starting = true;
+    renderTestRun(pid);
+    try {
+      const data = await LR.post('/api/coding/projects/' + pid + '/run-tests', {});
+      t.run = data.run || null;
+      pollRun(pid);
+    } catch (err) {
+      if (LR.isMissingRoute(err)) { testsMissing(); return; }
+      t.error = err.message;
+    } finally {
+      t.starting = false;
+      renderTestRun(pid);
+    }
+  }
+
+  function pollRun(pid) {
+    const t = testState(pid);
+    window.clearTimeout(t.timer);
+    if (!t.run || t.run.state !== 'running' || t.run.id === undefined) return;
+    t.timer = window.setTimeout(async () => {
+      try {
+        const data = await LR.get('/api/coding/projects/' + pid + '/test-runs/' + encodeURIComponent(t.run.id));
+        if (data.run) t.run = data.run;
+      } catch (err) {
+        if (err.status === 404) {
+          t.error = err.message;
+          t.run = null;
+        }
+      }
+      renderTestRun(pid);
+      if (t.run && t.run.state === 'running') pollRun(pid);
+      else if (t.run) LR.announce(LR.t((RUN_STATE[t.run.state] || ['', 'Tests finished'])[1]));
+    }, 1500);
+  }
+
+  async function fixTests(pid, runId, btn) {
+    const t = testState(pid);
+    t.fixing = true;
+    LR.setBusy(btn, true, LR.t('Adding a step…'));
+    try {
+      await LR.post('/api/coding/projects/' + pid + '/fix-tests', { run_id: runId });
+      showOutcome(LR.callout({
+        tone: 'ok',
+        title: LR.t('New step: fix the failing tests'),
+        text: LR.t('Run it like any other step and review the proposed change. Then run the tests again.'),
+        actions: [LR.button({ text: LR.t('Run next step'), icon: 'zap', size: 'sm', variant: 'primary', onclick: (ev) => runStep(ev.currentTarget) })],
+      }));
+      await loadDetail();
+    } catch (err) {
+      if (LR.isMissingRoute(err)) { testsMissing(); return; }
+      t.error = err.message;
+    } finally {
+      t.fixing = false;
+      if (btn.isConnected) LR.setBusy(btn, false);
+      renderTestRun(pid);
+    }
+  }
+
   function create() {
     const root = h('section', { class: 'view view-page', 'aria-labelledby': 'code-title' });
     ui.page = h('div', { class: 'page page-wide' });
@@ -505,6 +688,7 @@
     ui.detail = h('div', { class: 'card detail-card', tabindex: '-1' });
     ui.outcome = h('div', { class: 'outcome', 'aria-live': 'polite' });
     ui.reviewSlot = h('div', { class: 'review-slot' });
+    ui.testsSlot = h('div', { class: 'tests-slot', hidden: true });
     return root;
   }
 

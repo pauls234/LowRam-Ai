@@ -10,6 +10,13 @@
   const fmt = LR.fmt;
   const STATUS_ORDER = ['pending', 'running', 'done', 'failed', 'proposed', 'approved', 'rejected'];
   const STATUS_TONE = { pending: 'neutral', running: 'accent', done: 'ok', failed: 'error', proposed: 'warn', approved: 'ok', rejected: 'neutral' };
+  const STATUS_LABEL = {
+    pending: LR.t('pending'), running: LR.t('running'), done: LR.t('done'), failed: LR.t('failed'),
+    proposed: LR.t('to review'), approved: LR.t('applied'), rejected: LR.t('rejected'),
+  };
+  const statusLabel = (s) => STATUS_LABEL[s] || s;
+  /** Loop/task messages about waiting for memory are information, not errors (v0.4 RAM guard). */
+  const isWaitMessage = (text) => /arbeitsspeicher|speicher|memory|\bram\b/i.test(LR.str(text)) && /warte|wait/i.test(LR.str(text));
   const STOP_REASONS = {
     queue_empty: ['ok', LR.t('Queue empty: every pending task was processed.')],
     max_tasks: ['ok', LR.t('Reached the task limit for this loop.')],
@@ -158,9 +165,9 @@
       return h('li', null, h('a', { class: 'proj-item', href: '#/tasks/' + p.id, 'aria-current': p.id === st.selected ? 'page' : null }, [
         h('span', { class: 'proj-name' }, [
           h('span', { text: p.name || LR.t('Untitled') }),
-          p.kind === 'coding' ? LR.badge('coding', 'info') : null,
-          p.id === loopPid ? LR.badge('loop', 'accent') : null,
-          st.run && st.run.projectId === p.id ? LR.badge('running', 'accent') : null,
+          p.kind === 'coding' ? LR.badge(LR.t('coding'), 'info') : null,
+          p.id === loopPid ? LR.badge(LR.t('loop'), 'accent') : null,
+          st.run && st.run.projectId === p.id ? LR.badge(LR.t('running'), 'accent') : null,
         ]),
         bar.el,
         h('span', { class: 'proj-meta', text: parts.join(' · ') }),
@@ -209,7 +216,7 @@
     bar.set(planned ? Math.min(1, (completed + failed) / planned) : null, completed + LR.t(' done') + (planned ? LR.t(' of ') + planned : ''));
     const parts = [completed + LR.t(' done')];
     if (failed) parts.push(failed + LR.t(' failed'));
-    if (active && left !== null) parts.push(left + ' left');
+    if (active && left !== null) parts.push(LR.t('{n} left', { n: left }));
     if (max) parts.push(LR.t('limit ') + max);
     let tone = 'accent';
     let title = loop.stop_requested ? LR.t('Loop stopping…') : LR.t('Loop running');
@@ -226,7 +233,8 @@
     if (active) actions.push(LR.button({ text: loop.stop_requested ? LR.t('Stopping…') : LR.t('Stop loop'), icon: 'stop', size: 'sm', variant: 'secondary', disabled: loop.stop_requested, onclick: stopLoop }));
     else actions.push(LR.button({ text: LR.t('Dismiss'), size: 'sm', variant: 'ghost', onclick: () => { st.loopDismissed = loopKey(loop); LR.store.set('lowram.loopDismissed', st.loopDismissed); renderLoop(); } }));
     ui.loop.className = 'loop-banner tone-' + tone + (active ? ' is-active' : '');
-    ui.loop.replaceChildren(
+    // (null children would be inserted as the text "null")
+    ui.loop.replaceChildren(...[
       h('div', { class: 'loop-head' }, [
         active ? LR.spinner() : icon(tone === 'error' ? 'alert' : 'check'),
         h('div', { class: 'loop-heading' }, [
@@ -236,9 +244,13 @@
         h('div', { class: 'loop-actions' }, actions),
       ]),
       bar.el,
-      loop.last_message ? h('p', { class: 'loop-msg', text: LR.str(loop.last_message) }) : null,
+      loop.last_message
+        ? (isWaitMessage(loop.last_message)
+          ? h('p', { class: 'loop-msg is-info' }, [icon('clock'), h('span', { text: LR.str(loop.last_message) })])
+          : h('p', { class: 'loop-msg', text: LR.str(loop.last_message) }))
+        : null,
       !active && loop.stopped_because === 'on_battery' ? h('p', { class: 'loop-msg loop-hint' }, [LR.icon('bolt'), h('span', { text: LR.t('Plug in your Mac and run the loop again – or lower the battery limit in Models & Settings.') })]) : null,
-    );
+    ].filter(Boolean));
   }
 
   /* ------------------------------------------------------------ detail */
@@ -262,7 +274,7 @@
         h('h2', { class: 'detail-title', text: p.name || LR.t('Untitled') }),
         h('p', { class: 'muted small', text: (coding ? LR.t('Coding project') : LR.t('Task project')) + (p.created_at ? LR.t(' · created ') + fmt.dateLong(p.created_at) : '') }),
       ]),
-      h('ul', { class: 'count-chips', 'aria-label': LR.t('Task counts') }, STATUS_ORDER.filter((s) => counts[s]).map((s) => h('li', { class: 'badge badge-' + STATUS_TONE[s], text: counts[s] + ' ' + s }))),
+      h('ul', { class: 'count-chips', 'aria-label': LR.t('Task counts') }, STATUS_ORDER.filter((s) => counts[s]).map((s) => h('li', { class: 'badge badge-' + STATUS_TONE[s], text: counts[s] + ' ' + statusLabel(s) }))),
     ]);
     const out = [head];
     if (coding) {
@@ -332,7 +344,7 @@
     LR.md.render(body, f.content);
     ui.finalSlot.replaceChildren(h('section', { class: 'final-card', 'aria-labelledby': 'final-title' }, [
       h('div', { class: 'final-head' }, [
-        h('div', null, [h('p', { class: 'eyebrow', text: LR.t('Merged from all devices') }), h('h3', { class: 'final-title', id: 'final-title', text: LR.t('Final result') })]),
+        h('div', null, [h('p', { class: 'eyebrow', text: LR.t('Combined from all results') }), h('h3', { class: 'final-title', id: 'final-title', text: LR.t('Final result') })]),
         LR.copyButton({ getText: () => f.content }),
       ]),
       body,
@@ -343,7 +355,10 @@
   function taskTable(tasks, coding) {
     const rows = tasks.map((t) => {
       const status = STATUS_ORDER.includes(t.status) ? t.status : 'pending';
-      const titleCell = h('td', { class: 'col-title' }, h('span', { class: 'task-title', text: t.title || LR.t('(untitled task)') }));
+      const titleCell = h('td', { class: 'col-title' }, [
+        h('span', { class: 'task-title', text: t.title || LR.t('(untitled task)') }),
+        resumed(t) ? LR.badge(LR.t('continued after a crash'), 'info') : null,
+      ]);
       if (t.status === 'failed' && t.error) {
         const err = LR.str(t.error);
         const p = h('p', { class: 'task-error' });
@@ -359,7 +374,7 @@
       return h('tr', { class: isCurrent ? 'is-running' : null }, [
         h('td', { class: 'col-pos', text: LR.isNum(t.position) ? String(t.position) : '' }),
         titleCell,
-        h('td', { class: 'col-status' }, h('span', { class: 'badge badge-' + STATUS_TONE[status] }, [isCurrent ? LR.spinner('spinner-xs') : null, h('span', { text: status })])),
+        h('td', { class: 'col-status' }, h('span', { class: 'badge badge-' + STATUS_TONE[status] }, [isCurrent ? LR.spinner('spinner-xs') : null, h('span', { text: statusLabel(status) })])),
         h('td', { class: 'col-attempts' }, [h('span', { class: 'cell-label', text: LR.t('Attempts ') }), String(LR.isNum(t.attempts) ? t.attempts : 0)]),
         h('td', { class: 'col-finished' }, t.finished_at ? h('time', { datetime: String(t.finished_at), title: fmt.dateLong(t.finished_at), text: fmt.time(t.finished_at) }) : h('span', { class: 'muted', text: '—' })),
         h('td', { class: 'col-actions' }, actions.length ? h('div', { class: 'row-actions' }, actions) : null),
@@ -403,11 +418,11 @@
       const label = taskLabel(task);
       if (data.status === 'done') showOutcome('ok', label + LR.t(' done'), task ? task.title : '', task ? [LR.button({ text: LR.t('View result'), size: 'sm', onclick: () => openResult(task) })] : []);
       else if (data.status === 'failed') showOutcome('error', label + LR.t(' failed'), LR.str(data.error || data.reason, LR.t('Unknown error.')), task ? [LR.button({ text: LR.t('Retry task'), size: 'sm', onclick: (ev) => retryTask(task, ev.currentTarget) })] : []);
-      else if (data.status === 'paused') showOutcome('warn', LR.t('Paused – low RAM'), LR.str(data.reason, LR.t('Not enough free memory to start a task.')));
+      else if (data.status === 'paused') showOutcome(isWaitMessage(data.reason) ? 'info' : 'warn', LR.t('Paused – low RAM'), LR.str(data.reason, LR.t('Not enough free memory to start a task.')));
       else if (data.status === 'empty') showOutcome('info', LR.t('Nothing to run'), LR.str(data.reason, LR.t('This project has no pending tasks.')));
       else if (data.status === 'on_battery') showOutcome('warn', LR.t('Paused – on battery'), LR.str(data.reason, LR.t('Plug in your Mac to run long tasks.')), [LR.button({ text: LR.t('Power settings'), icon: 'battery', size: 'sm', onclick: () => LR.go('#/settings') })]);
       else if (data.status === 'no_model') showOutcome('warn', LR.t('No model is running'), LR.str(data.reason, LR.t('Start a model first.')), modelsButton());
-      else showOutcome('info', LR.t('Run finished'), 'Status: ' + LR.str(data.status));
+      else showOutcome('info', LR.t('Run finished'), LR.t('Status: ') + statusLabel(LR.str(data.status)));
     } catch (err) {
       showOutcome(err.status === 409 ? 'warn' : 'error', err.status === 409 ? LR.t('Busy') : LR.t('Run failed'), err.network ? LR.t('LowRAM AI could not be reached. The task may still be running.') : err.message);
     } finally {
@@ -534,7 +549,7 @@
     try {
       const data = await LR.get('/api/tasks/' + task.id + '/result');
       content = LR.str(data.content);
-      m.setSub((data.path ? data.path + ' · ' : '') + fmt.int(content.length) + LR.t(' characters') + (data.truncated ? LR.t(' (truncated)') : ''));
+      m.setSub((data.path ? data.path + ' · ' : '') + fmt.int(content.length) + LR.t(' characters') + (data.truncated ? LR.t(' (truncated)') : '') + (resumed(data) || resumed(task) ? ' · ' + LR.t('continued after a crash') : ''));
       if (content) LR.md.render(body, content);
       else body.replaceChildren(h('p', { class: 'muted', text: LR.t('The result file is empty.') }));
       raw.textContent = content;
@@ -547,8 +562,8 @@
   function newProject() {
     const name = h('input', { class: 'input', type: 'text', maxlength: '200', autocomplete: 'off', placeholder: LR.t('e.g. Release notes') });
     const tasks = h('textarea', { class: 'input textarea', rows: '7', placeholder: LR.t('Summarize the changelog\nDraft the announcement\nList open questions') });
-    const count = h('p', { class: 'help', 'aria-live': 'polite', text: '0 tasks' });
-    const fName = LR.field({ label: 'Name', control: name });
+    const count = h('p', { class: 'help', 'aria-live': 'polite', text: fmt.plural(0, 'task') });
+    const fName = LR.field({ label: LR.t('Name'), control: name });
     const fTasks = LR.field({ label: LR.t('Tasks – one per line'), control: tasks });
     fTasks.el.append(count);
     const lines = () => tasks.value.split('\n').map((l) => l.trim()).filter(Boolean);
@@ -577,6 +592,87 @@
     name.focus();
   }
 
+  /* ------------------------------------------------------------ big job (v0.4 autosplit) */
+
+  function resumed(o) {
+    if (!o || typeof o !== 'object') return false;
+    if (o.resumed_from_checkpoint) return true;
+    const meta = o.metadata || o.meta;
+    return Boolean(meta && typeof meta === 'object' && meta.resumed_from_checkpoint);
+  }
+
+  /** "Großauftrag": the model splits one big goal into subtasks, runs them and combines the results. */
+  function bigJob(prefill) {
+    const goal = h('textarea', { class: 'input textarea', rows: '6', maxlength: '4000', placeholder: LR.t('e.g. Write a detailed comparison of three laptops for students – with a table and a recommendation') });
+    goal.value = LR.str(prefill).slice(0, 4000);
+    const max = h('input', { class: 'input input-number', type: 'number', min: '2', max: '12', step: '1', inputmode: 'numeric', value: LR.store.get('lowram.bigJobMax') || '8' });
+    const fGoal = LR.field({ label: LR.t('What should be done?'), control: goal, hint: LR.t('Up to 4000 characters. Every subtask sees this goal.') });
+    const fMax = LR.field({ label: LR.t('At most this many subtasks'), control: max, hint: LR.t('2 to 12. More subtasks: smaller steps that fit into little memory, but more time overall.') });
+    const out = [fGoal.el, fMax.el];
+    let helpers = null;
+    if (LR.has('cluster')) {
+      const id = LR.uid('helpers');
+      helpers = h('input', { type: 'checkbox', id, class: 'checkbox', checked: LR.store.get('lowram.bigJobHelpers') === '1' });
+      out.push(h('div', { class: 'field' }, [
+        h('label', { class: 'check-row', for: id }, [helpers, h('span', { text: LR.t('Let other devices help') })]),
+        h('p', { class: 'help', text: LR.t('Paired computers take over subtasks. Without other devices, this computer does everything itself.') }),
+      ]));
+    }
+    const status = h('div', { class: 'bigjob-status', 'aria-live': 'polite' });
+    out.push(status);
+    const form = h('form', { class: 'form', novalidate: true }, out);
+    const startBtn = LR.button({ text: LR.t('Start big job'), icon: 'play', variant: 'primary', type: 'submit', onclick: (ev) => { ev.preventDefault(); submit(); } });
+    let busy = false;
+    let stopTimer = null;
+    async function submit() {
+      if (busy) return;
+      fGoal.setError('');
+      fMax.setError('');
+      const text = goal.value.trim();
+      const n = Number(max.value);
+      if (!text) { fGoal.setError(LR.t('Describe what should be done.')); goal.focus(); return; }
+      if (!Number.isInteger(n) || n < 2 || n > 12) { fMax.setError(LR.t('Choose a whole number from {min} to {max}.', { min: 2, max: 12 })); max.focus(); return; }
+      LR.store.set('lowram.bigJobMax', n);
+      if (helpers) LR.store.set('lowram.bigJobHelpers', helpers.checked ? '1' : '0');
+      busy = true;
+      LR.setBusy(startBtn, true, LR.t('Planning…'));
+      const elapsed = h('span', { class: 'run-elapsed' });
+      status.replaceChildren(h('p', { class: 'run-busy' }, [LR.spinner(), h('span', { text: LR.t('The model splits the job into subtasks – on small computers this can take a few minutes…') }), elapsed]));
+      stopTimer = LR.elapsed(elapsed);
+      try {
+        const body = { goal: text, percent: LR.budgetPercent(), max_tasks: n };
+        if (helpers) body.distribute = helpers.checked;
+        const data = await LR.post('/api/autosplit', body);
+        const project = data.project || {};
+        const count = Array.isArray(data.tasks) ? data.tasks.length : 0;
+        if (LR.isNum(project.id)) {
+          st.distributed.add(project.id);
+          LR.store.set('lowram.distributed', [...st.distributed].slice(-50).join(','));
+        }
+        m.close();
+        LR.toast(LR.t('Big job started: {n}', { n: fmt.plural(count, 'subtask') }));
+        await loadProjects().catch(() => {});
+        if (LR.isNum(project.id)) LR.go('#/tasks/' + project.id);
+        poller.now();
+      } catch (err) {
+        status.replaceChildren(LR.callout({ tone: err.status === 409 ? 'warn' : 'error', role: 'alert', title: LR.t('Could not start the big job'), text: err.message }));
+      } finally {
+        busy = false;
+        if (stopTimer) stopTimer();
+        if (startBtn.isConnected) LR.setBusy(startBtn, false);
+      }
+    }
+    form.addEventListener('submit', (ev) => { ev.preventDefault(); submit(); });
+    const m = LR.modal({
+      title: LR.t('Big job'),
+      sub: LR.t('For jobs that are too big for one go: LowRAM AI splits them into small subtasks, works through them one after another and combines the results at the end.'),
+      body: form,
+      actions: [LR.button({ text: LR.t('Cancel'), onclick: () => m.close() }), startBtn],
+    });
+    goal.focus();
+  }
+  LR.bigJob = { open: (goal) => { if (LR.has('autosplit')) bigJob(goal); } };
+
   /* ------------------------------------------------------------ view */
 
   function create() {
@@ -584,7 +680,11 @@
     const head = LR.pageHead({
       title: LR.t('Task queue'),
       sub: LR.t('Queue up text tasks and let the local model work through them one at a time – even overnight.'),
-      actions: [LR.button({ text: LR.t('Recover stuck tasks'), variant: 'ghost', onclick: recover }), LR.button({ text: LR.t('New project'), icon: 'plus', variant: 'primary', onclick: newProject })],
+      actions: [
+        LR.button({ text: LR.t('Recover stuck tasks'), variant: 'ghost', onclick: recover }),
+        ui.bigJobBtn = LR.button({ text: LR.t('Big job'), icon: 'merge', variant: 'secondary', onclick: () => bigJob('') }),
+        LR.button({ text: LR.t('New project'), icon: 'plus', variant: 'primary', onclick: newProject }),
+      ],
     });
     head.querySelector('h1').id = 'tasks-title';
     ui.list = h('div', { class: 'proj-list-wrap' });
@@ -603,6 +703,7 @@
     title: LR.t('Task queue'),
     create,
     show(params) {
+      if (ui.bigJobBtn) ui.bigJobBtn.hidden = !LR.has('autosplit');
       const id = params[0] && /^\d+$/.test(params[0]) ? Number(params[0]) : null;
       if (id !== st.selected) {
         st.selected = id;
