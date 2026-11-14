@@ -129,21 +129,40 @@ Everything is configurable in the Studio. Environment variables override it:
 * `desktop/` – the app launcher (pywebview window) and PyInstaller build.
 * Contract and design rules: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-## Security
+## Security & trust
 
-* The Studio listens on **127.0.0.1 only**, checks the `Host` header, requires a
-  per-process token for every change (CSRF) and sends a strict CSP. Model
-  output is always rendered as text.
-* The managed llama-server only accepts requests with a random per-start key.
-* Downloaded programs and models are only accepted from GitHub/Hugging Face
-  over HTTPS and only with a verified SHA-256 checksum.
-* The coding agent cannot run commands, never writes outside the chosen
-  project, never touches `.git`, CI workflows or secret-looking files, and
-  rejects invisible/control characters so the diff you approve is the file you get.
-* The only network listener is the optional Devices server (TLS, pinned
-  certificate, per-device HMAC keys, replay protection, rate limits). A paired
-  device is trusted to return honest answers – only pair your own computers.
-* No accounts, no telemetry, no cloud.
+What LowRAM AI does – and does not do – on your Mac:
+
+* **Nothing is reachable from outside by default.** The Studio listens on
+  `127.0.0.1` only (Host-header check, per-process CSRF token, strict CSP);
+  the managed llama-server also listens on `127.0.0.1` and only answers with a
+  random key that changes on every start. The only listener on your network is
+  the optional **Devices** server (TLS with a pinned certificate, per-device
+  HMAC keys, replay protection, rate limits) – it is **off** until you turn it
+  on. A small UDP listener only *receives* discovery announcements (bounded,
+  never replies). When Devices is on and "discoverable", your device name and
+  certificate fingerprint are announced on the local network – turn
+  discoverable off on public Wi-Fi.
+* **No telemetry, no accounts, no cloud.** Outbound connections happen only
+  for what you start: model/engine downloads and searches (Hugging Face,
+  GitHub) and an update check against GitHub (at most every 6 h; switch it off
+  in Settings). HTTPS only, allow-listed hosts, redirects checked on every hop.
+* **Downloads are verified.** Programs (llama.cpp, stable-diffusion.cpp) are
+  only installed from their official GitHub releases with the SHA-256 published
+  there; models only with the SHA-256 that Hugging Face reports. This protects
+  against corrupted or tampered transfers – it cannot make a malicious model
+  repository trustworthy. **Only download models from publishers you trust**
+  (the catalog lists well-known ones); model files are parsed by llama.cpp /
+  stable-diffusion.cpp, and a deliberately crafted file could target a bug in
+  those parsers.
+* **Your files stay yours.** LowRAM AI writes only inside `~/.lowram-ai`, the
+  models folder you choose, and – after you click *Approve* – the project
+  folder you gave the coding agent. The model can never run commands; your
+  test command runs only when you click *Tests ausführen*.
+* **Gentle on the hardware.** One heavy job at a time, RAM guard and waiting
+  instead of overloading, model unloaded when idle, battery pause, and the Mac
+  is kept awake only while a long job runs.
+* A paired device is trusted to return honest answers – only pair your own computers.
 
 ## Tests
 
