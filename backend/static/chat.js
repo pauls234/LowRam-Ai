@@ -32,6 +32,12 @@
     newPane: null,
     stream: null,
     stick: true,
+    attachments: [],
+    attachTimer: 0,
+    query: '',
+    results: null,
+    searchTimer: 0,
+    searchSeq: 0,
     ui: {},
     historyEl: null,
     menu: null,
@@ -104,16 +110,50 @@
     });
     ui.send = h('button', { type: 'submit', class: 'send-btn', 'aria-label': 'Send message', title: 'Send (Enter)', disabled: true }, icon('arrow-up'));
     ui.stop = h('button', { type: 'button', class: 'stop-btn', 'aria-label': 'Stop generating', title: 'Stop (Esc)', hidden: true, onclick: stopStream }, icon('stop'));
+    ui.fileInput = h('input', {
+      type: 'file', multiple: true, class: 'visually-hidden', tabindex: '-1', 'aria-hidden': 'true',
+      accept: '.txt,.md,.markdown,.csv,.tsv,.json,.yaml,.yml,.toml,.ini,.xml,.html,.css,.js,.mjs,.ts,.tsx,.jsx,.py,.rb,.go,.rs,.java,.kt,.swift,.c,.h,.cpp,.hpp,.cs,.php,.sh,.zsh,.sql,.log,.env.example,text/*',
+    });
+    ui.fileInput.addEventListener('change', () => {
+      addFiles(ui.fileInput.files);
+      ui.fileInput.value = '';
+    });
+    ui.attach = h('button', { type: 'button', class: 'icon-btn attach-btn', 'aria-label': 'Attach text or code files', title: 'Attach files (text or code, up to 200 KB)', onclick: () => ui.fileInput.click() }, icon('paperclip'));
+    ui.atts = h('ul', { class: 'att-list composer-atts', 'aria-label': 'Files to send', hidden: true });
+    ui.attachMsg = h('p', { class: 'attach-msg', role: 'status', hidden: true });
     ui.form = h('form', { class: 'composer', novalidate: true }, [
+      ui.atts,
       ui.input,
-      h('div', { class: 'composer-bar' }, [ui.mode.el, h('span', { class: 'composer-spacer' }), ui.stop, ui.send]),
+      h('div', { class: 'composer-bar' }, [ui.attach, ui.mode.el, h('span', { class: 'composer-spacer' }), ui.stop, ui.send]),
+      ui.fileInput,
     ]);
+    let dragDepth = 0;
+    ui.form.addEventListener('dragenter', (ev) => {
+      if (!ev.dataTransfer || ![...ev.dataTransfer.types].includes('Files')) return;
+      ev.preventDefault();
+      dragDepth++;
+      ui.form.classList.add('is-drop');
+    });
+    ui.form.addEventListener('dragover', (ev) => {
+      if (ev.dataTransfer && [...ev.dataTransfer.types].includes('Files')) ev.preventDefault();
+    });
+    ui.form.addEventListener('dragleave', () => {
+      dragDepth = Math.max(0, dragDepth - 1);
+      if (!dragDepth) ui.form.classList.remove('is-drop');
+    });
+    ui.form.addEventListener('drop', (ev) => {
+      if (!ev.dataTransfer || !ev.dataTransfer.files.length) return;
+      ev.preventDefault();
+      dragDepth = 0;
+      ui.form.classList.remove('is-drop');
+      addFiles(ev.dataTransfer.files);
+    });
     ui.hint = h('p', { class: 'composer-hint', id: 'composer-hint' }, [
       icon('shield'),
       h('span', { text: 'Runs locally – answers can take a little longer. Nothing leaves this computer.' }),
     ]);
     ui.examples = h('div', { class: 'examples', role: 'list', 'aria-label': 'Example prompts' });
-    ui.dock = h('div', { class: 'composer-dock' }, [ui.notice, ui.form, ui.hint, ui.examples]);
+    ui.dock = h('div', { class: 'composer-dock' }, [ui.notice, ui.form, ui.attachMsg, ui.hint, ui.examples]);
     ui.status = h('div', { class: 'visually-hidden', 'aria-live': 'polite', 'aria-atomic': 'true' });
     ui.root.append(ui.heading, ui.scroll, ui.jump, ui.dock, ui.status);
 
@@ -153,7 +193,7 @@
     const busy = Boolean(S.stream);
     ui.send.hidden = busy;
     ui.stop.hidden = !busy;
-    ui.send.disabled = busy || !ui.input.value.trim() || !LR.has('chat');
+    ui.send.disabled = busy || !(ui.input.value.trim() || S.attachments.length) || !LR.has('chat');
     ui.stop.disabled = busy && S.stream.stopRequested;
   }
 
@@ -292,17 +332,17 @@
       for (const m of messages) {
         if (m.role === 'user') {
           lastUser = LR.str(m.content);
-          pane.list.append(userMessage(lastUser));
+          pane.list.append(userMessage(lastUser, m.attachments));
         } else {
           const a = assistantMessage();
-          const retryText = lastUser;
-          a.setRetry(() => send(retryText));
+          wireAssistant(pane, a, lastUser);
           a.finish(m);
           if (m.status === 'streaming') pendingReload = true;
           pane.list.append(a.li);
         }
       }
       pane.loaded = true;
+      renderLastActions(pane);
       if (pendingReload && !(S.stream && S.stream.chatId === pane.id)) {
         window.setTimeout(() => {
           pane.loaded = false;
@@ -334,15 +374,29 @@
 
   /* ------------------------------------------------------------ messages */
 
-  function userMessage(content) {
+  function attachmentChips(list) {
+    if (!Array.isArray(list) || !list.length) return null;
+    return h('ul', { class: 'att-list', 'aria-label': 'Attached files' }, list.map((a) => h('li', { class: 'att-chip' }, [
+      icon('file'),
+      h('span', { class: 'att-name', text: LR.str(a.name, 'file') }),
+      LR.isNum(a.size) ? h('span', { class: 'att-size', text: fmt.bytes(a.size) })
+        : LR.isNum(a.chars) ? h('span', { class: 'att-size', text: fmt.int(a.chars) + ' chars' }) : null,
+    ])));
+  }
+
+  function userMessage(content, attachments) {
     return h('li', { class: 'msg msg-user' }, [
       h('h2', { class: 'visually-hidden', text: 'You said:' }),
-      h('div', { class: 'bubble', text: content }),
+      content ? h('div', { class: 'bubble', text: content }) : null,
+      attachmentChips(attachments),
       h('div', { class: 'msg-actions' }, [
         LR.copyButton({ getText: () => content, iconOnly: true, cls: 'icon-btn', ariaLabel: 'Copy your message' }),
       ]),
     ]);
   }
+
+  /** v0.3.2 backends report token stats; that is also our signal for regenerate/continue. */
+  const isSmart = (m) => Boolean(m) && ('finish_reason' in m || 'tokens_per_s' in m || 'truncated' in m);
 
   function assistantMessage() {
     const thinkId = LR.uid('think');
@@ -358,34 +412,55 @@
     const waitText = h('span', { class: 'wait-text', text: 'Working on it…' });
     const wait = h('div', { class: 'msg-wait' }, [h('span', { class: 'typing', 'aria-hidden': 'true' }, [h('i'), h('i'), h('i')]), waitText]);
     const extra = h('div', { class: 'msg-extra' });
+    const cont = h('div', { class: 'msg-continue', hidden: true });
     const meta = h('span', { class: 'msg-meta' });
     let answerText = '';
+    let reasoningText = '';
     const copyBtn = LR.copyButton({ getText: () => answerText, iconOnly: true, cls: 'icon-btn', ariaLabel: 'Copy answer' });
     const retryBtn = h('button', { type: 'button', class: 'icon-btn', 'aria-label': 'Retry', title: 'Retry', hidden: true }, icon('retry'));
-    const actions = h('div', { class: 'msg-actions', hidden: true }, [copyBtn, retryBtn, meta]);
+    const regenBtn = h('button', { type: 'button', class: 'icon-btn', 'aria-label': 'Regenerate answer', title: 'Regenerate', hidden: true }, icon('retry'));
+    const actions = h('div', { class: 'msg-actions', hidden: true }, [copyBtn, retryBtn, regenBtn, meta]);
     const li = h('li', { class: 'msg msg-assistant' }, [
       h('h2', { class: 'visually-hidden', text: 'LowRAM AI said:' }),
       think,
       body,
       wait,
       extra,
+      cont,
       actions,
     ]);
-    const renderer = LR.md.createRenderer(body);
-    const thinkRenderer = LR.md.createRenderer(thinkBody);
+    let renderer = LR.md.createRenderer(body);
+    let thinkRenderer = LR.md.createRenderer(thinkBody);
     let userToggled = false;
     let retryFn = null;
+    let handlers = {};
+    let message = null;
+    let extraReasoning = '';
+    let isLast = false;
     let frame = 0;
     let throttle = 0;
     let lastRender = 0;
     let pending = null;
     let thinkStart = 0;
     let thinkSecs = null;
-    const started = Date.now();
-    const waitTimer = window.setInterval(() => {
-      const sec = (Date.now() - started) / 1000;
-      if (sec > 6) waitText.textContent = (statusText || 'Still working – local models can take a moment') + ' · ' + fmt.clock(Date.now() - started);
-    }, 1000);
+    let statusText = '';
+    let started = Date.now();
+    let waitTimer = 0;
+    function startWait() {
+      started = Date.now();
+      statusText = '';
+      waitText.textContent = 'Working on it…';
+      window.clearInterval(waitTimer);
+      waitTimer = window.setInterval(() => {
+        if ((Date.now() - started) / 1000 > 6) waitText.textContent = (statusText || 'Still working – local models can take a moment') + ' · ' + fmt.clock(Date.now() - started);
+      }, 1000);
+    }
+    function stopTimers() {
+      window.clearInterval(waitTimer);
+      if (frame) { window.cancelAnimationFrame(frame); frame = 0; }
+      if (throttle) { window.clearTimeout(throttle); throttle = 0; }
+    }
+    startWait();
 
     function setExpanded(open) {
       thinkToggle.setAttribute('aria-expanded', String(open));
@@ -397,10 +472,12 @@
       setExpanded(thinkBody.hidden);
     });
     retryBtn.addEventListener('click', () => { if (retryFn) retryFn(); });
+    regenBtn.addEventListener('click', () => { if (handlers.regenerate) handlers.regenerate(); });
 
     function apply(reasoning, answer, streaming) {
       if (reasoning && reasoning.trim()) {
         if (!thinkStart) thinkStart = Date.now();
+        reasoningText = reasoning;
         think.hidden = false;
         thinkRenderer.render(reasoning, streaming && !answer);
         const thinking = streaming && !answer;
@@ -418,19 +495,65 @@
         answerText = answer;
         renderer.render(answer, streaming);
       }
-      const waiting = streaming && !answer && !(reasoning && reasoning.trim());
-      wait.hidden = !waiting;
+      wait.hidden = !(streaming && !answer && !(reasoning && reasoning.trim()));
       li.classList.toggle('is-streaming', streaming);
     }
 
-    let statusText = '';
-    return {
+    function syncLast() {
+      const busy = li.classList.contains('is-streaming') || Boolean(S.stream);
+      regenBtn.hidden = !(isLast && !busy && handlers.regenerate && isSmart(message) && message.status !== 'streaming');
+      const truncated = Boolean(message && (message.truncated || message.finish_reason === 'length'));
+      cont.hidden = !(isLast && !busy && truncated && handlers.cont);
+    }
+
+    const api = {
       li,
+      get message() { return message; },
+      get answer() { return answerText; },
+      get reasoning() { return reasoningText; },
+      get extraReasoning() { return extraReasoning; },
       setRetry(fn) { retryFn = fn; },
+      setHandlers(next) {
+        handlers = next || {};
+        syncLast();
+      },
+      setLast(last) {
+        isLast = last;
+        syncLast();
+      },
       /** Backend progress note ("Loading the model…") shown until tokens arrive. */
       status(text) {
         statusText = text;
         if (text) waitText.textContent = text;
+      },
+      /** Clear the bubble before a regenerated answer streams in. */
+      reset() {
+        stopTimers();
+        body.replaceChildren();
+        thinkBody.replaceChildren();
+        renderer = LR.md.createRenderer(body);
+        thinkRenderer = LR.md.createRenderer(thinkBody);
+        answerText = '';
+        reasoningText = '';
+        thinkStart = 0;
+        thinkSecs = null;
+        userToggled = false;
+        think.hidden = true;
+        extra.replaceChildren();
+        cont.hidden = true;
+        actions.hidden = true;
+        wait.hidden = false;
+        li.classList.remove('is-error', 'is-stopped');
+        li.classList.add('is-streaming');
+        startWait();
+      },
+      /** Keep the text and stream more of it (continue). */
+      resume() {
+        stopTimers();
+        startWait();
+        cont.hidden = true;
+        regenBtn.hidden = true;
+        li.classList.add('is-streaming');
       },
       /**
        * Coalesced to one render per animation frame (≤10/s for long answers).
@@ -452,59 +575,75 @@
             scrollToBottom(false);
           });
         };
-        const wait = answerText.length > 20000 ? Math.max(0, 100 - (performance.now() - lastRender)) : 0;
-        if (wait > 0) throttle = window.setTimeout(run, wait);
+        const delay = answerText.length > 20000 ? Math.max(0, 100 - (performance.now() - lastRender)) : 0;
+        if (delay > 0) throttle = window.setTimeout(run, delay);
         else run();
       },
-      finish(message, extraReasoning) {
-        window.clearInterval(waitTimer);
-        if (frame) { window.cancelAnimationFrame(frame); frame = 0; }
-        if (throttle) { window.clearTimeout(throttle); throttle = 0; }
-        const m = message || {};
+      finish(msg, extraR) {
+        stopTimers();
+        const m = msg || {};
+        message = m;
+        extraReasoning = extraR || '';
         const split = LR.md.splitThinking(LR.str(m.content));
-        const reasoning = (extraReasoning || '') + split.reasoning;
-        apply(reasoning, split.answer, false);
+        apply(extraReasoning + split.reasoning, split.answer, false);
         wait.hidden = true;
         actions.hidden = false;
+        // Quiet stats line: "14 tok/s · 38 s · Qwen3 4B"
         const parts = [];
-        if (m.model) parts.push(LR.modelName(m.model));
+        if (LR.isNum(m.tokens_per_s) && m.tokens_per_s > 0) parts.push((m.tokens_per_s < 10 ? m.tokens_per_s.toFixed(1) : Math.round(m.tokens_per_s)) + ' tok/s');
         if (LR.isNum(m.duration_s)) parts.push(fmt.duration(m.duration_s));
+        if (m.model) parts.push(LR.modelName(m.model));
         meta.textContent = parts.join(' · ');
+        meta.title = LR.isNum(m.tokens) ? fmt.int(m.tokens) + ' tokens' : '';
         extra.replaceChildren();
         li.classList.remove('is-error', 'is-stopped');
+        retryBtn.hidden = true;
         if (m.status === 'stopped') {
           li.classList.add('is-stopped');
           extra.append(h('p', { class: 'msg-note' }, [icon('stop'), h('span', { text: split.answer ? 'Stopped – the partial answer was kept.' : 'Stopped before an answer arrived.' })]));
-          retryBtn.hidden = !retryFn;
+          retryBtn.hidden = !retryFn || isSmart(m);
         } else if (m.status === 'error') {
-          this.fail(m.error || 'The answer could not be completed.');
+          api.fail(m.error || 'The answer could not be completed.');
         } else if (m.status === 'streaming') {
           extra.append(h('p', { class: 'msg-note' }, [LR.spinner(), h('span', { text: 'Still generating… this view refreshes by itself.' })]));
           actions.hidden = true;
-        } else {
-          retryBtn.hidden = true;
-          if (!split.answer) extra.append(h('p', { class: 'msg-note', text: 'The model returned an empty answer.' }));
+        } else if (!split.answer) {
+          extra.append(h('p', { class: 'msg-note', text: 'The model returned an empty answer.' }));
         }
+        cont.replaceChildren(
+          h('p', { class: 'msg-note' }, [icon('info'), h('span', { text: 'The answer reached the length limit.' })]),
+          LR.button({ text: 'Continue', icon: 'arrow-down', size: 'sm', variant: 'secondary', onclick: () => { if (handlers.cont) handlers.cont(); } }),
+        );
+        syncLast();
         scrollToBottom(false);
       },
       fail(error, partial) {
-        window.clearInterval(waitTimer);
-        if (frame) { window.cancelAnimationFrame(frame); frame = 0; }
-        if (throttle) { window.clearTimeout(throttle); throttle = 0; }
+        stopTimers();
         if (partial !== undefined) apply(partial[0], partial[1], false);
         else li.classList.remove('is-streaming');
         wait.hidden = true;
         li.classList.add('is-error');
         const modelIssue = /model|engine|llama|server|start/i.test(LR.str(error));
         const btns = [];
-        if (retryFn) btns.push(LR.button({ text: 'Retry', icon: 'retry', size: 'sm', variant: 'secondary', onclick: () => retryFn() }));
+        if (handlers.regenerate && isSmart(message)) btns.push(LR.button({ text: 'Regenerate', icon: 'retry', size: 'sm', variant: 'secondary', onclick: () => handlers.regenerate() }));
+        else if (retryFn) btns.push(LR.button({ text: 'Retry', icon: 'retry', size: 'sm', variant: 'secondary', onclick: () => retryFn() }));
         if (modelIssue && LR.has('engine')) btns.push(LR.button({ text: 'Open Models', icon: 'sliders', size: 'sm', variant: 'ghost', onclick: () => LR.go('#/settings') }));
         extra.replaceChildren(LR.callout({ tone: 'error', title: 'The answer could not be completed', text: LR.str(error, 'Unknown error.'), actions: btns, role: 'alert' }));
         actions.hidden = !answerText;
         retryBtn.hidden = true;
+        cont.hidden = true;
         scrollToBottom(false);
       },
     };
+    li._ctx = api;
+    return api;
+  }
+
+  /** Regenerate / continue are offered on the last assistant message only. */
+  function renderLastActions(pane) {
+    if (!pane) return;
+    const items = pane.list.querySelectorAll('.msg-assistant');
+    items.forEach((el, idx) => { if (el._ctx) el._ctx.setLast(idx === items.length - 1); });
   }
 
   /* ------------------------------------------------------------ notices */
@@ -513,79 +652,97 @@
     if (S.ui.notice) S.ui.notice.replaceChildren();
   }
 
-  function showNotice(err) {
+  function showNotice(err, retry) {
     const busy = err.status === 409;
     const noModel = err.status === 400 || /model|engine|llama|not running|start/i.test(err.message);
     let title = 'Could not send your message';
     if (err.network) title = 'LowRAM AI is not reachable';
     else if (busy && !noModel) title = 'LowRAM AI is busy right now';
     else if (noModel) title = 'No model is ready yet';
-    const text = err.message + (busy ? ' Your message is still in the box – send it again in a moment.' : '');
+    const text = err.message + (busy && !retry ? ' Your message is still in the box – send it again in a moment.' : '');
     const actions = [];
     if (LR.has('engine') && (noModel || busy)) actions.push(LR.button({ text: 'Open Models', icon: 'sliders', size: 'sm', variant: 'primary', onclick: () => LR.go('#/settings') }));
-    actions.push(LR.button({ text: 'Try again', icon: 'retry', size: 'sm', onclick: () => send() }));
+    actions.push(LR.button({ text: 'Try again', icon: 'retry', size: 'sm', onclick: () => { clearNotice(); if (retry) retry(); else send(); } }));
     actions.push(LR.button({ text: 'Dismiss', size: 'sm', variant: 'ghost', onclick: clearNotice }));
     S.ui.notice.replaceChildren(LR.callout({ tone: busy ? 'warn' : 'error', title, text, actions, role: 'alert', cls: 'notice-pop' }));
   }
 
-  /* ------------------------------------------------------------ sending */
+  /* ------------------------------------------------------------ attachments */
 
-  async function send(retryText) {
-    const ui = S.ui;
-    if (S.stream || !LR.has('chat')) return;
-    const fromComposer = typeof retryText !== 'string';
-    const content = (fromComposer ? ui.input.value : retryText).trim();
-    if (!content) return;
-    clearNotice();
-    let pane = currentPane();
-    const restore = fromComposer ? ui.input.value : null;
-    if (fromComposer) {
-      ui.input.value = '';
-      autosize();
-      LR.store.remove(draftKey(S.currentId));
+  const MAX_FILES = 5;
+  const MAX_FILE_BYTES = 200 * 1024;
+  const BINARY_EXT = /\.(png|jpe?g|gif|webp|heic|bmp|ico|tiff?|pdf|zip|gz|tgz|bz2|xz|7z|rar|dmg|pkg|exe|dll|so|dylib|bin|iso|mp3|wav|m4a|flac|ogg|mp4|mov|avi|mkv|webm|docx?|xlsx?|pptx?|key|pages|numbers|sqlite|db|gguf|safetensors|pt|onnx|class|jar|o|a|woff2?|ttf|otf)$/i;
+
+  function attachNote(text) {
+    const el = S.ui.attachMsg;
+    el.textContent = text;
+    el.hidden = !text;
+    window.clearTimeout(S.attachTimer);
+    if (text) S.attachTimer = window.setTimeout(() => attachNote(''), 7000);
+  }
+
+  async function addFiles(fileList) {
+    const files = [...(fileList || [])];
+    const problems = [];
+    for (const file of files) {
+      if (S.attachments.length >= MAX_FILES && !S.attachments.some((a) => a.name === file.name)) {
+        problems.push('You can attach up to ' + MAX_FILES + ' files.');
+        break;
+      }
+      if (file.size > MAX_FILE_BYTES) { problems.push(file.name + ' is larger than 200 KB.'); continue; }
+      if (BINARY_EXT.test(file.name) || /^(image|audio|video)\//.test(file.type) || /pdf|zip|octet-stream/.test(file.type)) {
+        problems.push(file.name + ' is not a text file.');
+        continue;
+      }
+      let text;
+      try { text = await file.text(); } catch (_) { problems.push(file.name + ' could not be read.'); continue; }
+      const bad = (text.match(/�/g) || []).length;
+      if (text.includes('\u0000') || bad > Math.max(4, text.length / 100)) { problems.push(file.name + ' looks like a binary file.'); continue; }
+      S.attachments = S.attachments.filter((a) => a.name !== file.name).concat({ name: file.name, size: file.size, content: text });
     }
-    const ctx = { chatId: S.currentId, stopRequested: false, gotStart: false, done: false, tokens: '', reasoning: '', controller: new AbortController() };
+    attachNote(problems.length ? problems.join(' ') + ' Only text and code files up to 200 KB work.' : '');
+    renderAttachments();
+  }
+
+  function renderAttachments() {
+    const ui = S.ui;
+    ui.atts.replaceChildren(...S.attachments.map((a) => h('li', { class: 'att-chip is-removable' }, [
+      icon('file'),
+      h('span', { class: 'att-name', text: a.name }),
+      h('span', { class: 'att-size', text: fmt.bytes(a.size) }),
+      h('button', { type: 'button', class: 'att-remove', 'aria-label': 'Remove ' + a.name, onclick: () => {
+        S.attachments = S.attachments.filter((x) => x !== a);
+        renderAttachments();
+        ui.input.focus();
+      } }, icon('x')),
+    ])));
+    ui.atts.hidden = !S.attachments.length;
+    updateSend();
+  }
+
+  /* ------------------------------------------------------------ streaming */
+
+  const budget = () => (LR.state.settings && LR.isNum(LR.state.settings.budget_percent) ? LR.state.settings.budget_percent : undefined);
+
+  /** Stream an answer into assistant bubble `o.a` (send, continue and regenerate). */
+  async function runStream(o) {
+    const ui = S.ui;
+    const a = o.a;
+    const pane = o.pane;
+    const ctx = { chatId: o.chatId, stopRequested: false, gotStart: false, done: false, tokens: '', reasoning: '', controller: new AbortController() };
     S.stream = ctx;
     updateSend();
-
-    if (ctx.chatId === null) {
-      try {
-        const data = await LR.post('/api/chats', { mode: S.newMode });
-        const chat = data.chat;
-        pane = S.newPane;
-        pane.id = chat.id;
-        pane.chat = chat;
-        pane.loaded = true;
-        S.panes.set(chat.id, pane);
-        S.newPane = null;
-        S.currentId = chat.id;
-        ctx.chatId = chat.id;
-        S.chats = [chat, ...S.chats.filter((c) => c.id !== chat.id)];
-        window.history.replaceState(null, '', '#/chat/' + chat.id);
-      } catch (err) {
-        S.stream = null;
-        if (restore !== null && !ui.input.value) { ui.input.value = restore; autosize(); }
-        showNotice(err);
-        updateSend();
-        return;
-      }
-    }
-
-    const userLi = userMessage(content);
-    const a = assistantMessage();
-    a.setRetry(() => send(content));
-    pane.list.append(userLi, a.li);
-    renderChrome();
-    scrollToBottom(true);
+    renderHistoryState();
+    renderLastActions(pane);
     ui.status.textContent = 'LowRAM AI is answering…';
-
+    const base = o.base || { reasoning: '', answer: '' };
+    const extraBefore = o.extra || '';
     const view = () => {
       const split = LR.md.splitThinking(ctx.tokens);
-      return [ctx.reasoning + split.reasoning, split.answer];
+      return [base.reasoning + ctx.reasoning + split.reasoning, base.answer + split.answer];
     };
-    const percent = LR.state.settings && LR.isNum(LR.state.settings.budget_percent) ? LR.state.settings.budget_percent : undefined;
     try {
-      await LR.stream('/api/chats/' + encodeURIComponent(ctx.chatId) + '/messages', { content, percent }, {
+      await LR.stream(o.path, o.body, {
         signal: ctx.controller.signal,
         onEvent(ev) {
           if (ev.type === 'ping') return;
@@ -611,32 +768,24 @@
             a.stream(view);
           } else if (ev.type === 'done') {
             ctx.done = true;
-            const msg = ev.message || { content: ctx.tokens, status: ctx.stopRequested ? 'stopped' : 'complete' };
-            a.finish(msg, ctx.reasoning);
+            a.finish(ev.message || { content: base.answer + ctx.tokens, status: ctx.stopRequested ? 'stopped' : 'complete' }, extraBefore + ctx.reasoning);
           } else if (ev.type === 'error') {
             ctx.done = true;
             const msg = ev.message;
-            const split = LR.md.splitThinking(msg && typeof msg.content === 'string' ? msg.content : ctx.tokens);
-            a.fail(ev.error || 'The answer could not be completed.', [ctx.reasoning + split.reasoning, split.answer]);
+            const split = LR.md.splitThinking(msg && typeof msg.content === 'string' ? msg.content : base.answer + ctx.tokens);
+            a.fail(ev.error || 'The answer could not be completed.', [extraBefore + ctx.reasoning + split.reasoning, split.answer]);
           }
         },
       });
       if (!ctx.done) {
-        const v = view();
-        if (ctx.stopRequested) a.finish({ content: ctx.tokens, status: 'stopped' }, ctx.reasoning);
-        else a.fail('The answer ended unexpectedly. The model server may have stopped.', v);
+        if (ctx.stopRequested) a.finish({ content: base.answer + ctx.tokens, status: 'stopped' }, extraBefore + ctx.reasoning);
+        else a.fail('The answer ended unexpectedly. The model server may have stopped.', view());
       }
     } catch (err) {
       if (err && err.name === 'AbortError') {
-        a.finish({ content: ctx.tokens, status: 'stopped' }, ctx.reasoning);
+        a.finish({ content: base.answer + ctx.tokens, status: 'stopped' }, extraBefore + ctx.reasoning);
       } else if (!ctx.gotStart && err.status) {
-        userLi.remove();
-        a.li.remove();
-        if (restore !== null && !ui.input.value) {
-          ui.input.value = restore;
-          autosize();
-        }
-        showNotice(err);
+        o.onRejected(err);
       } else {
         a.fail(err.message, view());
       }
@@ -645,10 +794,127 @@
       ui.status.textContent = 'Answer finished.';
       if (S.currentId === ctx.chatId) renderChrome();
       updateSend();
+      renderLastActions(pane);
       refreshList();
       LR.emit('status-refresh');
       window.setTimeout(() => LR.emit('status-refresh'), 900);
     }
+  }
+
+  function wireAssistant(pane, a, userText) {
+    a.setRetry(() => send(userText));
+    a.setHandlers({
+      regenerate: () => regenerate(pane, a),
+      cont: () => continueAnswer(pane, a),
+    });
+  }
+
+  function regenerate(pane, a) {
+    if (S.stream || pane.id === null) return;
+    clearNotice();
+    const prev = a.message;
+    const prevExtra = a.extraReasoning;
+    a.reset();
+    runStream({
+      pane, a, chatId: pane.id,
+      path: '/api/chats/' + encodeURIComponent(pane.id) + '/regenerate',
+      body: { percent: budget() },
+      onRejected: (err) => {
+        a.finish(prev, prevExtra);
+        showNotice(err, () => regenerate(pane, a));
+      },
+    });
+  }
+
+  function continueAnswer(pane, a) {
+    if (S.stream || pane.id === null) return;
+    clearNotice();
+    const prev = a.message;
+    const prevExtra = a.extraReasoning;
+    const base = { reasoning: a.reasoning, answer: a.answer + (/\s$/.test(a.answer) ? '' : '') };
+    a.resume();
+    runStream({
+      pane, a, chatId: pane.id, base, extra: prevExtra,
+      path: '/api/chats/' + encodeURIComponent(pane.id) + '/continue',
+      body: { percent: budget() },
+      onRejected: (err) => {
+        a.finish(prev, prevExtra);
+        showNotice(err, () => continueAnswer(pane, a));
+      },
+    });
+  }
+
+  /* ------------------------------------------------------------ sending */
+
+  async function send(retryText) {
+    const ui = S.ui;
+    if (S.stream || !LR.has('chat')) return;
+    const fromComposer = typeof retryText !== 'string';
+    const attachments = fromComposer ? S.attachments.slice() : [];
+    let content = (fromComposer ? ui.input.value : retryText).trim();
+    if (!content && !attachments.length) return;
+    if (!content) content = attachments.length === 1 ? 'Please take a look at the attached file.' : 'Please take a look at the attached files.';
+    clearNotice();
+    let pane = currentPane();
+    const restore = fromComposer ? ui.input.value : null;
+    if (fromComposer) {
+      ui.input.value = '';
+      autosize();
+      LR.store.remove(draftKey(S.currentId));
+      S.attachments = [];
+      renderAttachments();
+    }
+    const restoreComposer = () => {
+      if (restore !== null && !ui.input.value) { ui.input.value = restore; autosize(); }
+      if (attachments.length && !S.attachments.length) { S.attachments = attachments; renderAttachments(); }
+    };
+    S.stream = { chatId: S.currentId, stopRequested: false, done: false, controller: new AbortController() };
+    updateSend();
+
+    if (pane.id === null) {
+      try {
+        const data = await LR.post('/api/chats', { mode: S.newMode });
+        const chat = data.chat;
+        pane = S.newPane;
+        pane.id = chat.id;
+        pane.chat = chat;
+        pane.loaded = true;
+        S.panes.set(chat.id, pane);
+        S.newPane = null;
+        S.currentId = chat.id;
+        S.chats = [chat, ...S.chats.filter((c) => c.id !== chat.id)];
+        window.history.replaceState(null, '', '#/chat/' + chat.id);
+      } catch (err) {
+        S.stream = null;
+        restoreComposer();
+        showNotice(err);
+        updateSend();
+        return;
+      }
+    }
+    S.stream = null;
+
+    const userLi = userMessage(content, attachments);
+    const a = assistantMessage();
+    wireAssistant(pane, a, content);
+    pane.list.append(userLi, a.li);
+    renderChrome();
+    scrollToBottom(true);
+
+    const body = { content, percent: budget() };
+    if (attachments.length) body.attachments = attachments.map((x) => ({ name: x.name, content: x.content }));
+    await runStream({
+      pane, a, chatId: pane.id, body,
+      path: '/api/chats/' + encodeURIComponent(pane.id) + '/messages',
+      onRejected: (err) => {
+        userLi.remove();
+        a.li.remove();
+        restoreComposer();
+        renderChrome();
+        renderLastActions(pane);
+        showNotice(err);
+      },
+    });
   }
 
   async function stopStream() {
@@ -702,12 +968,26 @@
     const el = S.historyEl;
     if (!el) return;
     closeMenu();
+    if (S.searchBox) S.searchBox.hidden = !LR.has('chat') || (S.listLoaded && !S.chats.length && S.results === null);
     if (!LR.has('chat')) {
       el.replaceChildren(h('p', { class: 'history-empty', text: 'Chat history appears here.' }));
       return;
     }
     if (!S.listLoaded) {
       el.replaceChildren(LR.skeleton(5, 'history-skeleton'));
+      return;
+    }
+    if (S.results !== null) {
+      if (!S.results.length) {
+        el.replaceChildren(h('p', { class: 'history-empty', text: 'No chats match “' + S.query + '”.' }));
+        return;
+      }
+      const id = LR.uid('hist');
+      el.replaceChildren(h('div', { class: 'history-group' }, [
+        h('h3', { class: 'history-label', id, text: fmt.plural(S.results.length, 'result') }),
+        h('ul', { class: 'history-list', 'aria-labelledby': id }, S.results.map(historyItem)),
+      ]));
+      renderHistoryState();
       return;
     }
     if (!S.chats.length) {
@@ -733,7 +1013,7 @@
     const title = chat.title || 'Untitled chat';
     const link = h('a', { class: 'hist-item', href: '#/chat/' + chat.id, dataset: { id: String(chat.id) } }, [
       chat.mode === 'code' ? icon('code', 'hist-mode') : null,
-      h('span', { class: 'hist-title', text: title }),
+      h('span', { class: 'hist-title' }, S.results !== null ? highlight(title, S.query) : title),
       h('span', { class: 'hist-live', 'aria-hidden': 'true' }),
     ]);
     const more = h('button', {
@@ -749,6 +1029,91 @@
       else openMenu(more, chat);
     });
     return h('li', { class: 'hist-li', dataset: { id: String(chat.id) } }, [link, more]);
+  }
+
+  /** Title with case-insensitive matches wrapped in <mark> (text nodes only). */
+  function highlight(text, query) {
+    const q = query.trim().toLowerCase();
+    if (!q) return text;
+    const lower = text.toLowerCase();
+    const out = [];
+    let i = 0;
+    let j;
+    while ((j = lower.indexOf(q, i)) !== -1 && out.length < 40) {
+      if (j > i) out.push(text.slice(i, j));
+      out.push(h('mark', { text: text.slice(j, j + q.length) }));
+      i = j + q.length;
+    }
+    out.push(text.slice(i));
+    return out;
+  }
+
+  function onSearch() {
+    const q = S.searchInput.value.trim();
+    S.searchClear.hidden = !S.searchInput.value;
+    window.clearTimeout(S.searchTimer);
+    if (!q) {
+      S.query = '';
+      S.results = null;
+      renderHistory();
+      return;
+    }
+    S.searchTimer = window.setTimeout(async () => {
+      const seq = ++S.searchSeq;
+      try {
+        const data = await LR.get('/api/chats?q=' + encodeURIComponent(q));
+        if (seq !== S.searchSeq) return;
+        let chats = Array.isArray(data.chats) ? data.chats : [];
+        // A backend without search returns everything: then filter titles here.
+        const matches = (c) => LR.str(c.title).toLowerCase().includes(q.toLowerCase());
+        if (S.chats.length && chats.length === S.chats.length && !chats.every(matches)) chats = chats.filter(matches);
+        S.query = q;
+        S.results = chats;
+        renderHistory();
+        LR.announce(fmt.plural(chats.length, 'chat') + ' found');
+      } catch (_) { /* keep the previous list */ }
+    }, 250);
+  }
+
+  function mountSearch(el) {
+    S.searchInput = h('input', { type: 'search', class: 'history-search-input', placeholder: 'Search chats', 'aria-label': 'Search chats', autocomplete: 'off', spellcheck: 'false' });
+    S.searchClear = h('button', { type: 'button', class: 'icon-btn search-clear', 'aria-label': 'Clear search', hidden: true, onclick: () => {
+      S.searchInput.value = '';
+      onSearch();
+      S.searchInput.focus();
+    } }, icon('x'));
+    S.searchInput.addEventListener('input', onSearch);
+    S.searchInput.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Escape' && S.searchInput.value) {
+        ev.preventDefault();
+        S.searchInput.value = '';
+        onSearch();
+      }
+    });
+    S.searchBox = h('div', { class: 'history-search', role: 'search' }, [icon('search'), S.searchInput, S.searchClear]);
+    el.before(S.searchBox);
+  }
+
+  async function exportChat(chat) {
+    try {
+      const res = await fetch('/api/chats/' + encodeURIComponent(chat.id) + '/export', { credentials: 'same-origin', cache: 'no-store' });
+      if (res.status === 404) {
+        LR.toast('Export is not available in this version', 'info');
+        return;
+      }
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const blob = await res.blob();
+      const url = URL.createObjectURL(new Blob([blob], { type: 'text/markdown' }));
+      const name = (LR.str(chat.title, 'chat').replace(/[^\w\- .]+/g, '').trim().slice(0, 60) || 'chat') + '.md';
+      const a = h('a', { href: url, download: name, class: 'visually-hidden' });
+      document.body.append(a);
+      a.click();
+      a.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 4000);
+      LR.toast('Exported ' + name);
+    } catch (err) {
+      LR.toast('Could not export: ' + err.message, 'error');
+    }
   }
 
   function renderHistoryState() {
@@ -776,6 +1141,7 @@
     closeMenu();
     const items = [
       h('button', { type: 'button', role: 'menuitem', class: 'menu-item', onclick: () => { closeMenu(); startRename(chat); } }, [icon('pencil'), h('span', { text: 'Rename' })]),
+      h('button', { type: 'button', role: 'menuitem', class: 'menu-item', onclick: () => { closeMenu(); exportChat(chat); } }, [icon('export'), h('span', { text: 'Export as Markdown' })]),
       h('button', { type: 'button', role: 'menuitem', class: 'menu-item menu-danger', onclick: () => { closeMenu(); deleteChat(chat); } }, [icon('trash'), h('span', { text: 'Delete' })]),
     ];
     const el = h('div', { class: 'menu', role: 'menu', 'aria-label': 'Chat options' }, items);
@@ -899,6 +1265,7 @@
   LR.chat = {
     mountHistory(el) {
       S.historyEl = el;
+      mountSearch(el);
       renderHistory();
     },
     refreshList,

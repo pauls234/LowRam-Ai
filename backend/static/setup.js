@@ -126,8 +126,8 @@
       h('p', { class: 'card-sub', text: 'You can add or switch models later in Models & Settings.' }),
       models.length ? h('div', { class: 'choice-list' }, choices) : LR.empty({ icon: 'cpu', title: 'No models available', text: 'The catalog of this build is empty.' }),
     ]);
-    ui.inner.replaceChildren(hero(), machine, pick, ownModelBox(models), h('div', { class: 'setup-actions' }, [ui.go, skip]),
-      h('p', { class: 'setup-note' }, [icon('shield'), h('span', { text: 'Downloads come only from trusted sources over HTTPS and are verified before use.' })]));
+    ui.inner.replaceChildren(...[hero(), machine, pick, ownModelBox(models), h('div', { class: 'setup-actions' }, [ui.go, skip]),
+      h('p', { class: 'setup-note' }, [icon('shield'), h('span', { text: 'Downloads come only from trusted sources over HTTPS and are verified before use.' })])].filter(Boolean));
   }
 
   /** "Use a model file I already have" + link to Hugging Face models (v0.3.1 backends). */

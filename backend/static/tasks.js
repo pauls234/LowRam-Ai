@@ -19,6 +19,7 @@
     busy: ['warn', 'Did not start: something else was running.'],
     error: ['error', 'Stopped because of an unexpected error.'],
     no_model: ['warn', 'Stopped: no model is running.'],
+    on_battery: ['warn', 'Paused: your Mac is on battery.'],
   };
   const MERGE_TEXT = { waiting: 'Waiting for all tasks before combining the results…', running: 'Combining the results on this computer…', failed: 'Combining the results failed.' };
   const ERROR_PREVIEW = 240;
@@ -221,6 +222,7 @@
     const actions = [];
     if (project && project.id !== st.selected) actions.push(LR.button({ text: 'View project', size: 'sm', variant: 'ghost', onclick: () => LR.go('#/tasks/' + project.id) }));
     if (!active && loop.stopped_because === 'no_model') actions.push(...modelsButton());
+    if (!active && loop.stopped_because === 'on_battery') actions.push(LR.button({ text: 'Power settings', icon: 'battery', size: 'sm', variant: 'ghost', onclick: () => LR.go('#/settings') }));
     if (active) actions.push(LR.button({ text: loop.stop_requested ? 'Stopping…' : 'Stop loop', icon: 'stop', size: 'sm', variant: 'secondary', disabled: loop.stop_requested, onclick: stopLoop }));
     else actions.push(LR.button({ text: 'Dismiss', size: 'sm', variant: 'ghost', onclick: () => { st.loopDismissed = loopKey(loop); LR.store.set('lowram.loopDismissed', st.loopDismissed); renderLoop(); } }));
     ui.loop.className = 'loop-banner tone-' + tone + (active ? ' is-active' : '');
@@ -235,6 +237,7 @@
       ]),
       bar.el,
       loop.last_message ? h('p', { class: 'loop-msg', text: LR.str(loop.last_message) }) : null,
+      !active && loop.stopped_because === 'on_battery' ? h('p', { class: 'loop-msg loop-hint' }, [LR.icon('bolt'), h('span', { text: 'Plug in your Mac and run the loop again – or lower the battery limit in Models & Settings.' })]) : null,
     );
   }
 
@@ -402,6 +405,7 @@
       else if (data.status === 'failed') showOutcome('error', label + ' failed', LR.str(data.error || data.reason, 'Unknown error.'), task ? [LR.button({ text: 'Retry task', size: 'sm', onclick: (ev) => retryTask(task, ev.currentTarget) })] : []);
       else if (data.status === 'paused') showOutcome('warn', 'Paused – low RAM', LR.str(data.reason, 'Not enough free memory to start a task.'));
       else if (data.status === 'empty') showOutcome('info', 'Nothing to run', LR.str(data.reason, 'This project has no pending tasks.'));
+      else if (data.status === 'on_battery') showOutcome('warn', 'Paused – on battery', LR.str(data.reason, 'Plug in your Mac to run long tasks.'), [LR.button({ text: 'Power settings', icon: 'battery', size: 'sm', onclick: () => LR.go('#/settings') })]);
       else if (data.status === 'no_model') showOutcome('warn', 'No model is running', LR.str(data.reason, 'Start a model first.'), modelsButton());
       else showOutcome('info', 'Run finished', 'Status: ' + LR.str(data.status));
     } catch (err) {
