@@ -480,6 +480,10 @@ def _private_dir(path: Path) -> Path:
     return path
 
 
+MIN_FREE_DISK_IMAGE_BYTES = 1 * 2**30  # never fill the boot disk with generated media
+MIN_FREE_DISK_VIDEO_BYTES = 3 * 2**30
+
+
 def media_dir() -> Path:
     """Generated images/videos: ``<LOWRAM_HOME>/media/<job id>.<ext>``."""
     return _private_dir(config.home_dir() / "media")
@@ -1572,6 +1576,14 @@ def submit_job(data: object) -> dict:
     spec = validate_job_request(data)
     if not find_runtime()["installed"]:
         raise HTTPError(HTTPStatus.CONFLICT, "stable-diffusion.cpp is not installed yet. Install the image runtime first.")
+    free = shutil.disk_usage(media_dir()).free
+    needed = MIN_FREE_DISK_VIDEO_BYTES if spec["kind"] == "video" else MIN_FREE_DISK_IMAGE_BYTES
+    if free < needed:
+        raise HTTPError(
+            HTTPStatus.CONFLICT,
+            f"Not enough free disk space: {free // 2**20} MiB free, at least {needed // 2**30} GiB needed "
+            "for this job. Free some space (or delete old images/videos) and try again.",
+        )
     with db.connect() as conn, db.transaction(conn):
         queued = conn.execute("SELECT COUNT(*) FROM media_jobs WHERE status = 'queued'").fetchone()[0]
         if queued >= MAX_QUEUED_JOBS:

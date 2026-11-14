@@ -7,7 +7,10 @@ from unittest import mock
 
 import psutil
 
+from http import HTTPStatus
+
 from backend import db, media, settings
+from backend.web import HTTPError
 from tests.helpers import wait_until
 from tests.media_helpers import FAKE_FFMPEG, MediaAppTestCase, MediaTestCase, write_script
 
@@ -709,6 +712,19 @@ class SourceSafetyTests(unittest.TestCase):
                 self.assertEqual(media.sniff_media(path)[0], ext)
             path.write_bytes(b"<html>")
             self.assertIsNone(media.sniff_media(path))
+
+
+class DiskSpaceTests(MediaTestCase):
+    def test_job_refused_when_disk_is_nearly_full(self):
+        from collections import namedtuple
+        from unittest import mock
+
+        usage = namedtuple("usage", "total used free")(100 * 2**30, 99.5 * 2**30, 512 * 2**20)
+        with mock.patch.object(media.shutil, "disk_usage", return_value=usage):
+            with self.assertRaises(HTTPError) as ctx:
+                media.submit_job(image_job())
+        self.assertEqual(ctx.exception.status, HTTPStatus.CONFLICT)
+        self.assertIn("disk space", ctx.exception.message)
 
 
 if __name__ == "__main__":
