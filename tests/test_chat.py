@@ -728,5 +728,247 @@ def web_http_error():
     return HTTPError
 
 
+# --------------------------------------------------------------------------- v0.3.2 smart features
+
+
+class StreamStatsTests(StreamLLMTestCase):
+    def test_usage_finish_reason_and_rate(self):
+        stats = {}
+        self.fake.push(Stream(["a", "b", "c", "d", "e"], delay=0.03, usage=42, finish_reason="length"))
+        self.assertEqual("".join(llm.stream_chat(MSGS, max_tokens=8, stats=stats)), "abcde")
+        self.assertEqual((stats["tokens"], stats["finish_reason"]), (42, "length"))
+        self.assertGreater(stats["tokens_per_s"], 0)
+        self.assertEqual(self.fake.requests[0]["json"]["stream_options"], {"include_usage": True})
+
+    def test_without_usage_counts_deltas(self):
+        stats = {}
+        self.fake.push(Stream(["x", "y", "z"], reasoning=["r"]))
+        list(llm.stream_chat(MSGS, max_tokens=8, stats=stats))
+        self.assertEqual((stats["tokens"], stats["finish_reason"]), (4, "stop"))
+        stats = {}
+        self.fake.push(JsonAnswer("whole"))
+        list(llm.stream_chat(MSGS, max_tokens=8, stats=stats))
+        self.assertEqual(stats["tokens"], 1)
+
+
+class RenderAttachmentTests(unittest.TestCase):
+    def test_full_and_fenced(self):
+        files = [{"name": "a.md", "content": "has ``` fence", "chars": 13}]
+        text = chat.render_user_message("Summarize", files, 10_000)
+        self.assertTrue(text.startswith("Summarize\n\nAttached file: a.md\n````\nhas ``` fence\n````"))
+
+    def test_truncated_fairly_with_visible_note(self):
+        files = [{"name": "small.txt", "content": "s" * 100, "chars": 100},
+                 {"name": "big.txt", "content": "b" * 50_000, "chars": 50_000}]
+        text = chat.render_user_message("Question?", files, 3000)
+        self.assertLessEqual(len(text), 3100)
+        self.assertTrue(text.startswith("Question?"))
+        self.assertIn("s" * 100 + "\n```", text)  # the small file fits completely
+        self.assertRegex(text, r"\[…truncated – \d+ characters omitted\]")
+        self.assertNotIn("small.txt\n```\n" + "s" * 100 + "\n```\n[…truncated", text)
+
+    def test_names_and_validation(self):
+        clean = chat.validate_attachments([
+            {"name": "../../etc/pass\x00wd", "content": "x\r\ny"}, {"name": "C:\\dir\\" + "n" * 200 + ".py", "content": ""},
+            {"name": "  ", "content": "z"},
+        ])
+        self.assertEqual(clean[0], {"name": "passwd", "content": "x\ny", "chars": 3})
+        self.assertLessEqual(len(clean[1]["name"]), 120)
+        self.assertTrue(clean[1]["name"].endswith(".py"))
+        self.assertEqual(clean[2]["name"], "attachment-3.txt")
+        bad = [
+            "x", [{"name": "a"}], [{"name": 1, "content": "x"}], [{"name": "a", "content": "x"}] * 6,
+            [{"name": "a", "content": "nul\x00"}], [{"name": "a", "content": "é" * (100 * 1024 + 1)}],
+            [{"name": "a", "content": "\ud800"}],
+        ]
+        for value in bad:
+            with self.subTest(value=str(value)[:40]), self.assertRaises(ValueError):
+                chat.validate_attachments(value)
+        self.assertEqual(len(chat.validate_attachments([{"name": "a", "content": "x" * 200 * 1024}])), 1)
+
+
+class SmartChatApiTests(ChatApiTestCase):
+    def sent(self, index=-1):
+        return self.fake.requests[index]["json"]["messages"]
+
+    def test_custom_instructions(self):
+        status, data = self.api("POST", "/api/chats/instructions", {"instructions": " Always answer\x07 in rhymes.\n "})
+        self.assertEqual((status, data), (200, {"instructions": "Always answer in rhymes."}))
+        self.assertEqual(self.api("POST", "/api/chats/instructions", {"instructions": "x" * 4001})[0], 400)
+        self.assertEqual(self.api("POST", "/api/chats/instructions", {"instructions": 5})[0], 400)
+        for mode in ("chat", "code"):
+            self.send(self.new_chat(mode=mode)).rest()
+            system = self.sent()[0]["content"]
+            self.assertTrue(system.startswith(chat.SYSTEM_PROMPTS[mode]))
+            self.assertTrue(system.endswith("Always answer in rhymes."))
+        from backend import settings
+
+        settings.update("chat", {"instructions": "y" * 5000})  # via the generic settings API
+        with self.assertLogs("lowram.chat", "WARNING"):
+            self.assertEqual(len(chat.current_instructions()), 4000)
+
+    def test_attachments_stored_and_in_prompt(self):
+        files = [{"name": "notes.txt", "content": "remember the milk"}, {"name": "dir/app.py", "content": "print(1)\n"}]
+        events = self.send(self.new_chat(), "What is in these files?", attachments=files).rest()
+        user = events[0]["user_message"]
+        self.assertEqual(user["attachments"], [{"name": "notes.txt", "chars": 17}, {"name": "app.py", "chars": 9}])
+        prompt = self.sent()[-1]["content"]
+        self.assertTrue(prompt.startswith("What is in these files?"))
+        self.assertIn("Attached file: notes.txt\n```\nremember the milk\n```", prompt)
+        self.assertIn("Attached file: app.py\n```\nprint(1)\n\n```", prompt)
+        cid = events[0]["chat"]["id"]
+        self.assertEqual(self.messages(cid)[0]["attachments"], user["attachments"])
+        self.assertEqual(self.messages(cid)[1]["attachments"], [])
+        # a follow-up still sees the earlier file through the history
+        self.send(cid, "And again?").rest()
+        self.assertIn("remember the milk", self.sent()[1]["content"])
+
+    def test_attachment_only_message_large_body_and_errors(self):
+        cid = self.new_chat()
+        big = [{"name": f"f{i}.txt", "content": "z" * (200 * 1024)} for i in range(5)]  # > 1 MiB body
+        client = self.send(cid, "", attachments=big)
+        self.assertEqual(client.status, 200, client.json)
+        events = client.rest()
+        self.assertEqual(events[-1]["type"], "done")
+        self.assertEqual(self.api("GET", f"/api/chats/{cid}")[1]["chat"]["title"], "f0.txt")
+        prompt = self.sent()[-1]["content"]
+        self.assertRegex(prompt, r"\[…truncated – \d+ characters omitted\]")
+        self.assertLess(len(prompt), 60_000)  # within the context budget
+        for files in ([{"name": "a", "content": "x"}] * 6, [{"name": "a", "content": "\x00"}], "nope"):
+            self.assertEqual(self.send(cid, "hi", attachments=files).status, 400)
+        self.assertEqual(self.send(cid, "", attachments=[]).status, 400)
+
+    def test_stats_and_truncated_flag(self):
+        cid = self.new_chat()
+        self.fake.push(Stream(["one ", "two"], delay=0.03, usage=7))
+        done = self.send(cid).rest()[-1]["message"]
+        self.assertEqual((done["tokens"], done["finish_reason"], done["truncated"]), (7, "stop", False))
+        self.assertIsNotNone(done["tokens_per_s"])
+        self.fake.push(Stream(["cut"], finish_reason="length"))
+        done = self.send(cid).rest()[-1]["message"]
+        self.assertEqual((done["finish_reason"], done["truncated"], done["tokens"]), ("length", True, 1))
+        stored = self.messages(cid)[-1]
+        self.assertEqual((stored["finish_reason"], stored["truncated"]), ("length", True))
+
+    def test_continue_appends_to_cut_off_answer(self):
+        cid = self.new_chat()
+        self.assertEqual(SSEClient(self.port, f"/api/chats/{cid}/continue", {}).status, 409)  # empty chat
+        self.fake.push(Stream(["Hello"], finish_reason="length", usage=5))
+        first = self.send(cid, "Write a long text").rest()[-1]["message"]
+        self.fake.push(Stream([" world", "!"], usage=3))
+        client = SSEClient(self.port, f"/api/chats/{cid}/continue", {})
+        self.assertEqual(client.status, 200, client.json)
+        events = client.rest()
+        start, done = events[0], events[-1]
+        self.assertEqual((start["action"], start["assistant_message"]["id"]), ("continue", first["id"]))
+        self.assertEqual(done["message"]["content"], "Hello world!")
+        self.assertEqual((done["message"]["tokens"], done["message"]["truncated"]), (8, False))
+        messages = self.sent()
+        self.assertEqual([m["role"] for m in messages[-3:]], ["user", "assistant", "user"])
+        self.assertEqual(messages[-3]["content"], "Write a long text")
+        self.assertEqual(messages[-2]["content"], "Hello")
+        self.assertEqual(messages[-1]["content"], chat.CONTINUE_NOTE)
+        self.assertEqual(len(self.messages(cid)), 2)
+        self.assertEqual(SSEClient(self.port, f"/api/chats/{cid}/continue", {}).status, 409)  # not cut off now
+
+    def test_failed_continue_keeps_the_answer(self):
+        cid = self.new_chat()
+        self.fake.push(Stream(["Partial"], finish_reason="length"), HttpError(500, "boom"))
+        self.send(cid).rest()
+        events = SSEClient(self.port, f"/api/chats/{cid}/continue", {}).rest()
+        self.assertEqual(events[-1]["type"], "error")
+        stored = self.messages(cid)[1]
+        self.assertEqual((stored["content"], stored["status"], stored["truncated"]), ("Partial", "complete", True))
+        self.assertIsNone(db.busy_reason())
+
+    def test_regenerate_replaces_last_answer(self):
+        cid = self.new_chat()
+        self.assertEqual(SSEClient(self.port, f"/api/chats/{cid}/regenerate", {}).status, 409)
+        self.fake.push(Stream(["first"]), Stream(["second"]), Stream(["third"]))
+        self.send(cid, "q1").rest()
+        old = self.send(cid, "q2", attachments=[{"name": "a.txt", "content": "file text"}]).rest()[-1]["message"]
+        events = SSEClient(self.port, f"/api/chats/{cid}/regenerate", {}).rest()
+        start, done = events[0], events[-1]
+        self.assertEqual((start["action"], start["replaced_message_id"]), ("regenerate", old["id"]))
+        self.assertEqual(start["user_message"]["content"], "q2")
+        self.assertNotEqual(done["message"]["id"], old["id"])
+        self.assertEqual(done["message"]["content"], "third")
+        stored = self.messages(cid)
+        self.assertEqual([m["content"] for m in stored], ["q1", "first", "q2", "third"])
+        messages = self.sent()
+        self.assertEqual([m["content"] for m in messages[1:3]], ["q1", "first"])
+        self.assertTrue(messages[-1]["content"].startswith("q2") and "file text" in messages[-1]["content"])
+        with db.inference_slot("image job"):
+            self.assertEqual(SSEClient(self.port, f"/api/chats/{cid}/regenerate", {}).status, 409)
+
+    def test_search(self):
+        apples = self.new_chat(title="Äpfel und Birnen")
+        rates = self.new_chat(title="Rates")
+        other = self.new_chat(title="Other")
+        self.fake.push(Stream(["It grew by 100% in my_var"]))
+        self.send(rates, "growth?").rest()
+
+        def search(q):
+            from urllib.parse import quote
+
+            status, data = self.api("GET", f"/api/chats?q={quote(q)}")
+            self.assertEqual(status, 200, data)
+            return [c["id"] for c in data["chats"]]
+
+        self.assertEqual(search("äPFEL"), [apples])
+        self.assertEqual(search("100%"), [rates])
+        self.assertEqual(search("my_var"), [rates])
+        self.assertEqual(search("%"), [rates])  # literal, not a wildcard
+        self.assertEqual(search("_"), [rates])
+        self.assertEqual(search("GROWTH"), [rates])
+        self.assertEqual(search("nothing like this"), [])
+        self.assertEqual(set(search("")), {rates, other, apples})
+        self.assertEqual(self.api("GET", "/api/chats?q=" + "x" * 201)[0], 400)
+
+    def test_export_markdown(self):
+        cid = self.new_chat(title="Über Ideen! #1")
+        self.fake.push(Stream(["<think>secret reasoning</think>The **answer**"]))
+        self.send(cid, "My question", attachments=[{"name": "n.txt", "content": "abc"}]).rest()
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=15)
+        conn.request("GET", f"/api/chats/{cid}/export")
+        resp = conn.getresponse()
+        body = resp.read().decode()
+        conn.close()
+        self.assertEqual(resp.status, 200)
+        self.assertTrue(resp.getheader("Content-Type").startswith("text/markdown"))
+        self.assertIn('filename="Uber-Ideen-1.md"', resp.getheader("Content-Disposition"))
+        self.assertTrue(body.startswith("# Über Ideen! #1\n"))
+        self.assertIn("## User\n\nMy question", body)
+        self.assertIn("## Assistant", body)
+        self.assertIn("The **answer**", body)
+        self.assertIn("n.txt (3 characters)", body)
+        self.assertNotIn("secret reasoning", body)
+        self.assertEqual(self.api("GET", "/api/chats/999/export")[0], 404)
+
+
+class MigrationTests(LowRAMTestCase):
+    def test_v03_database_gets_new_columns(self):
+        import sqlite3
+
+        from backend import config
+
+        conn = sqlite3.connect(config.db_path())
+        conn.executescript(
+            "CREATE TABLE conversations (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL DEFAULT '', "
+            "mode TEXT NOT NULL DEFAULT 'chat', created_at TEXT NOT NULL, updated_at TEXT NOT NULL);"
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, conversation_id INTEGER NOT NULL "
+            "REFERENCES conversations(id) ON DELETE CASCADE, role TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', "
+            "status TEXT NOT NULL DEFAULT 'complete', error TEXT, model TEXT, duration_s REAL, created_at TEXT NOT NULL);"
+            "INSERT INTO conversations (title, mode, created_at, updated_at) VALUES ('old', 'chat', 'x', 'x');"
+            "INSERT INTO messages (conversation_id, role, content, created_at) VALUES (1, 'user', 'hi', 'x');"
+        )
+        conn.close()
+        chat._MIGRATED.discard(str(config.db_path()))
+        message = chat.list_messages(1)[0]
+        self.assertEqual((message["content"], message["tokens"], message["truncated"], message["attachments"]),
+                         ("hi", None, False, []))
+        self.assertEqual(chat.list_conversations("HI")[0]["title"], "old")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -3,7 +3,9 @@
 Design notes
 ------------
 * Conversations and messages live in SQLite (``conversations``/``messages``,
-  deleted together via ``ON DELETE CASCADE``).
+  plus ``message_attachments`` for attached text files; everything is deleted
+  together via ``ON DELETE CASCADE``). Columns added after v0.3 are added to
+  older databases with ``ALTER TABLE`` on first use.
 * An answer is one heavy job: the global inference slot is taken *before* the
   stream starts (busy -> normal JSON 409) and released when the stream ends,
   is stopped, the client disconnects, or the stream object is dropped without
@@ -16,11 +18,14 @@ Design notes
   also lets a closed browser tab be noticed), then ``done`` or ``error``.
   Problems found before the stream (busy, invalid input, no model installed,
   engine paused) are plain JSON errors; later ones are ``error`` events.
+  ``POST …/messages``, ``…/continue`` and ``…/regenerate`` all stream this way.
 * With the managed engine the prompt is sized to the real llama-server
   context (``engine.ctx_size()``), not only to the RAM budget.
 * An assistant message is never left ``streaming``: it ends ``complete``,
   ``stopped`` (stop button / disconnect; partial text kept) or ``error`` (with
   the reason). Leftovers from a crash are marked ``stopped`` on startup.
+* Custom instructions (``settings.chat.instructions``) are appended to the
+  system prompt; attachments are put into the prompt as fenced blocks.
 * Model output is untrusted text. It is stored and returned verbatim as JSON
   strings; the UI renders it as text only.
 """
@@ -28,6 +33,7 @@ Design notes
 from __future__ import annotations
 
 import importlib
+import json
 import logging
 import os
 import queue
@@ -37,11 +43,11 @@ import threading
 import time
 import unicodedata
 from collections.abc import Iterator
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from http import HTTPStatus
 
-from . import config, db, llm, memory, settings, web
-from .web import HTTPError, Request, Response, StreamResponse, route
+from . import artifacts, config, db, llm, memory, settings, web
+from .web import FileResponse, HTTPError, Request, Response, StreamResponse, route
 
 log = logging.getLogger("lowram.chat")
 
@@ -49,6 +55,12 @@ MODES = ("chat", "code")
 MAX_CONTENT_CHARS = 20_000
 MAX_TITLE_CHARS = 120
 AUTO_TITLE_CHARS = 60
+MAX_INSTRUCTIONS_CHARS = 4000
+MAX_ATTACHMENTS = 5
+MAX_ATTACHMENT_BYTES = 200 * 1024
+MAX_ATTACHMENT_NAME_CHARS = 120
+MAX_QUERY_CHARS = 200
+MAX_MESSAGE_BODY_BYTES = 4 * 1024 * 1024  # 5 attachments of 200 KB plus JSON escaping
 CONTEXT_FACTOR = 2  # conversations get twice the task-queue carry-over budget
 MIN_MAX_TOKENS = {"chat": 512, "code": 1024}
 TEMPERATURE = {"chat": 0.5, "code": 0.2}
@@ -70,6 +82,11 @@ LOADING_TEXT = "Loading the model… (first answer after a start can take a minu
 NO_MODEL_MESSAGE = "No model is running. Open Models to install and start one."
 OMITTED_NOTE = "[Earlier messages of this conversation were left out to fit the memory budget.]"
 INTERRUPTED_ERROR = "Interrupted: LowRAM AI was closed before this answer finished."
+CONTINUE_NOTE = (
+    "(System note: your previous answer was cut off because it reached the length limit. Continue "
+    "exactly where you stopped – do not repeat anything and do not start over.)"
+)
+INSTRUCTIONS_HEADER = "\n\nThe user's custom instructions (follow them in every answer):\n"
 
 CHAT_SYSTEM_PROMPT = (
     "You are LowRAM AI, a helpful, honest and concise assistant. You run entirely on the user's own "
@@ -108,26 +125,70 @@ CREATE TABLE IF NOT EXISTS messages (
     error TEXT,
     model TEXT,
     duration_s REAL,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    tokens INTEGER,
+    tokens_per_s REAL,
+    finish_reason TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, id);
 CREATE INDEX IF NOT EXISTS idx_messages_status ON messages(status);
+CREATE TABLE IF NOT EXISTS message_attachments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    position INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    content TEXT NOT NULL,
+    chars INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_message_attachments_message ON message_attachments(message_id, position);
 """
 db.register_schema(SCHEMA)
+# Columns added in v0.3.2; databases created by v0.3 get them via ALTER TABLE.
+_ADDED_COLUMNS = (("tokens", "INTEGER"), ("tokens_per_s", "REAL"), ("finish_reason", "TEXT"))
+_MIGRATED: set[str] = set()
+_MIGRATE_LOCK = threading.Lock()
 
 _CONVERSATION_SQL = (
     "SELECT c.id, c.title, c.mode, c.created_at, c.updated_at, "
     "(SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) AS message_count "
     "FROM conversations c"
 )
-_MESSAGE_COLUMNS = "id, conversation_id, role, content, status, error, model, duration_s, created_at"
+_MESSAGE_COLUMNS = (
+    "id, conversation_id, role, content, status, error, model, duration_s, created_at, "
+    "tokens, tokens_per_s, finish_reason"
+)
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    key = str(config.db_path())
+    if key in _MIGRATED:
+        return
+    with _MIGRATE_LOCK:
+        if key in _MIGRATED:
+            return
+        present = {row["name"] for row in conn.execute("PRAGMA table_info(messages)")}
+        for name, kind in _ADDED_COLUMNS:
+            if name not in present:
+                try:
+                    conn.execute(f"ALTER TABLE messages ADD COLUMN {name} {kind}")
+                except sqlite3.OperationalError as exc:  # another process was faster
+                    if "duplicate column" not in str(exc).lower():
+                        raise
+        _MIGRATED.add(key)
+
+
+@contextmanager
+def _connect() -> Iterator[sqlite3.Connection]:
+    with db.connect() as conn:
+        _migrate(conn)
+        yield conn
 
 
 # --------------------------------------------------------------------------- validation
 
 
-def _strip_controls(text: str) -> str:
-    return "".join(ch for ch in text if unicodedata.category(ch) not in ("Cc", "Cf", "Zl", "Zp"))
+def _strip_controls(text: str, keep: str = "") -> str:
+    return "".join(ch for ch in text if ch in keep or unicodedata.category(ch) not in ("Cc", "Cf", "Zl", "Zp"))
 
 
 def clean_title(value: object, *, required: bool = False) -> str:
@@ -144,9 +205,11 @@ def clean_title(value: object, *, required: bool = False) -> str:
     return title
 
 
-def auto_title(content: str) -> str:
-    """Title from the first user message: whitespace collapsed, at most 60 characters."""
+def auto_title(content: str, attachments: list[dict] | None = None) -> str:
+    """Title from the first user message (or its first file name): at most 60 characters."""
     title = " ".join(_strip_controls(" ".join(content.split())).split())
+    if not title and attachments:
+        title = attachments[0]["name"]
     if len(title) > AUTO_TITLE_CHARS:
         title = title[: AUTO_TITLE_CHARS - 1].rstrip() + "…"
     return title or "New chat"
@@ -160,14 +223,84 @@ def validate_mode(value: object) -> str:
     return str(value)
 
 
-def validate_content(value: object) -> str:
-    if not isinstance(value, str) or not value.strip():
+def validate_content(value: object, *, allow_empty: bool = False) -> str:
+    if not isinstance(value, str) or (not value.strip() and not allow_empty):
         raise ValueError("Write a message first (content must not be empty)")
     if len(value) > MAX_CONTENT_CHARS:
         raise ValueError(f"The message is too long: at most {MAX_CONTENT_CHARS} characters, got {len(value)}")
     if "\x00" in value:
         raise ValueError("The message contains a NUL character")
     return value
+
+
+def clean_attachment_name(name: str, position: int) -> str:
+    """File name only (no folders), no control characters or backticks, at most 120 characters."""
+    base = re.split(r"[\\/]", name)[-1]
+    base = " ".join(_strip_controls(base).replace("`", "'").split())
+    if len(base) > MAX_ATTACHMENT_NAME_CHARS:
+        stem, dot, ext = base.rpartition(".")
+        if dot and 0 < len(ext) <= 10:
+            base = stem[: MAX_ATTACHMENT_NAME_CHARS - len(ext) - 2] + "…." + ext
+        else:
+            base = base[: MAX_ATTACHMENT_NAME_CHARS - 1] + "…"
+    return base or f"attachment-{position}.txt"
+
+
+def validate_attachments(value: object) -> list[dict]:
+    """``[{name, content}]`` -> cleaned ``[{name, content, chars}]`` (text files only)."""
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError("'attachments' must be a list of {name, content}")
+    if len(value) > MAX_ATTACHMENTS:
+        raise ValueError(f"At most {MAX_ATTACHMENTS} files can be attached to one message")
+    clean: list[dict] = []
+    for position, item in enumerate(value, start=1):
+        if not isinstance(item, dict) or not isinstance(item.get("name"), str) or not isinstance(item.get("content"), str):
+            raise ValueError(f"Attachment {position} must be an object with text 'name' and 'content'")
+        name = clean_attachment_name(item["name"], position)
+        content = item["content"]
+        if "\x00" in content:
+            raise ValueError(f"{name} contains NUL bytes; only text files can be attached")
+        try:
+            size = len(content.encode("utf-8"))
+        except UnicodeEncodeError:
+            raise ValueError(f"{name} is not valid UTF-8 text; only text files can be attached") from None
+        if size > MAX_ATTACHMENT_BYTES:
+            raise ValueError(f"{name} is larger than {MAX_ATTACHMENT_BYTES // 1024} KB ({size // 1024} KB)")
+        content = content.replace("\r\n", "\n")
+        clean.append({"name": name, "content": content, "chars": len(content)})
+    return clean
+
+
+def clean_instructions(value: object) -> str:
+    """Validated custom instructions for ``POST /api/chats/instructions``."""
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise ValueError("Custom instructions must be text")
+    text = _strip_controls(value.replace("\r\n", "\n"), keep="\n\t").strip()
+    if len(text) > MAX_INSTRUCTIONS_CHARS:
+        raise ValueError(
+            f"Custom instructions must be at most {MAX_INSTRUCTIONS_CHARS} characters, got {len(text)}"
+        )
+    return text
+
+
+def current_instructions() -> str:
+    """``settings.chat.instructions`` cleaned; an over-long value (generic settings API) is truncated."""
+    try:
+        value = settings.get("chat", "instructions")
+    except Exception:  # unreadable settings must not block chatting
+        log.exception("Could not read the custom instructions; continuing without them")
+        return ""
+    if not isinstance(value, str):
+        return ""
+    text = _strip_controls(value.replace("\r\n", "\n"), keep="\n\t").strip()
+    if len(text) > MAX_INSTRUCTIONS_CHARS:
+        log.warning("Custom instructions are %s characters; using the first %s", len(text), MAX_INSTRUCTIONS_CHARS)
+        text = text[:MAX_INSTRUCTIONS_CHARS].rstrip()
+    return text
 
 
 def default_percent() -> object:
@@ -178,40 +311,97 @@ def default_percent() -> object:
         return memory.DEFAULT_PERCENT
 
 
+def clean_query(value: object) -> str:
+    if value is None:
+        return ""
+    query = " ".join(str(value).split())
+    if len(query) > MAX_QUERY_CHARS:
+        raise ValueError(f"The search text must be at most {MAX_QUERY_CHARS} characters")
+    return query
+
+
 # --------------------------------------------------------------------------- storage
 
 
-def _conversation_dict(row: sqlite3.Row) -> dict:
-    return dict(row)
+def _message_dict(row: sqlite3.Row, attachments: list[dict] | None = None) -> dict:
+    data = dict(row)
+    data["truncated"] = data.get("finish_reason") == "length"
+    data["attachments"] = attachments or []
+    return data
 
 
-def _message_dict(row: sqlite3.Row) -> dict:
-    return dict(row)
+def _attachment_summaries(conn: sqlite3.Connection, message_ids: list[int]) -> dict[int, list[dict]]:
+    found: dict[int, list[dict]] = {}
+    for start in range(0, len(message_ids), 500):
+        chunk = message_ids[start : start + 500]
+        marks = ",".join("?" for _ in chunk)
+        for row in conn.execute(
+            f"SELECT message_id, name, chars FROM message_attachments WHERE message_id IN ({marks}) "
+            "ORDER BY message_id, position",
+            chunk,
+        ):
+            found.setdefault(row["message_id"], []).append({"name": row["name"], "chars": row["chars"]})
+    return found
+
+
+def _messages_with_attachments(conn: sqlite3.Connection, rows: list[sqlite3.Row]) -> list[dict]:
+    summaries = _attachment_summaries(conn, [row["id"] for row in rows if row["role"] == "user"])
+    return [_message_dict(row, summaries.get(row["id"])) for row in rows]
+
+
+def _get_message(conn: sqlite3.Connection, message_id: int) -> dict:
+    row = conn.execute(f"SELECT {_MESSAGE_COLUMNS} FROM messages WHERE id = ?", (message_id,)).fetchone()
+    if row is None:
+        raise db.NotFound(f"Message #{message_id} not found")
+    return _messages_with_attachments(conn, [row])[0]
 
 
 def _get_conversation(conn: sqlite3.Connection, chat_id: int) -> dict:
     row = conn.execute(f"{_CONVERSATION_SQL} WHERE c.id = ?", (chat_id,)).fetchone()
     if row is None:
         raise db.NotFound(f"Chat #{chat_id} not found")
-    return _conversation_dict(row)
+    return dict(row)
 
 
 def get_conversation(chat_id: int) -> dict:
-    with db.connect() as conn:
+    with _connect() as conn:
         return _get_conversation(conn, chat_id)
 
 
-def list_conversations() -> list[dict]:
-    with db.connect() as conn:
-        rows = conn.execute(f"{_CONVERSATION_SQL} ORDER BY c.updated_at DESC, c.id DESC").fetchall()
-        return [_conversation_dict(row) for row in rows]
+def _like_pattern(query: str) -> str:
+    escaped = query.casefold().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
+def _casefold(value: object) -> str | None:
+    return value.casefold() if isinstance(value, str) else None
+
+
+def list_conversations(query: object = None) -> list[dict]:
+    """All chats, newest first; with ``query`` only those whose title or a message contains it."""
+    text = clean_query(query)
+    with _connect() as conn:
+        if not text:
+            rows = conn.execute(f"{_CONVERSATION_SQL} ORDER BY c.updated_at DESC, c.id DESC").fetchall()
+        else:
+            # Unicode-aware case folding (SQLite's LIKE only folds ASCII); wildcards are escaped.
+            conn.create_function("lowram_fold", 1, _casefold, deterministic=True)
+            pattern = _like_pattern(text)
+            rows = conn.execute(
+                f"{_CONVERSATION_SQL} WHERE lowram_fold(c.title) LIKE ? ESCAPE '\\' OR EXISTS ("
+                "SELECT 1 FROM messages m WHERE m.conversation_id = c.id "
+                "AND lowram_fold(m.content) LIKE ? ESCAPE '\\') "
+                "ORDER BY c.updated_at DESC, c.id DESC",
+                (pattern, pattern),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
 
 def create_conversation(title: object = None, mode: object = None) -> dict:
     clean = clean_title(title)
     clean_mode = validate_mode(mode)
     now = db.utcnow()
-    with db.connect() as conn:
+    with _connect() as conn:
         with db.transaction(conn):
             cur = conn.execute(
                 "INSERT INTO conversations (title, mode, created_at, updated_at) VALUES (?, ?, ?, ?)",
@@ -222,7 +412,7 @@ def create_conversation(title: object = None, mode: object = None) -> dict:
 
 def rename_conversation(chat_id: int, title: object) -> dict:
     clean = clean_title(title, required=True)
-    with db.connect() as conn:
+    with _connect() as conn:
         with db.transaction(conn):
             cur = conn.execute(
                 "UPDATE conversations SET title = ?, updated_at = ? WHERE id = ?", (clean, db.utcnow(), chat_id)
@@ -234,35 +424,53 @@ def rename_conversation(chat_id: int, title: object) -> dict:
 
 def delete_conversation(chat_id: int) -> None:
     request_stop(chat_id)  # a running answer ends as "stopped"; its rows go away with the chat
-    with db.connect() as conn, db.transaction(conn):
+    with _connect() as conn, db.transaction(conn):
         cur = conn.execute("DELETE FROM conversations WHERE id = ?", (chat_id,))
         if cur.rowcount != 1:
             raise db.NotFound(f"Chat #{chat_id} not found")
 
 
 def list_messages(chat_id: int) -> list[dict]:
-    with db.connect() as conn:
+    with _connect() as conn:
         _get_conversation(conn, chat_id)
         rows = conn.execute(
             f"SELECT {_MESSAGE_COLUMNS} FROM messages WHERE conversation_id = ? ORDER BY id", (chat_id,)
         ).fetchall()
-        return [_message_dict(row) for row in rows]
+        return _messages_with_attachments(conn, rows)
 
 
-def _recent_messages(chat_id: int, limit: int = HISTORY_LIMIT) -> list[dict]:
-    """The newest ``limit`` messages of a chat in chronological order."""
-    with db.connect() as conn:
+def _recent_messages(chat_id: int, char_limit: int, before_id: int | None = None,
+                     limit: int = HISTORY_LIMIT) -> list[dict]:
+    """The newest ``limit`` messages (before ``before_id``) in chronological order, with
+    attachment contents loaded up to ``char_limit`` characters each (``chars`` is the full size)."""
+    with _connect() as conn:
         rows = conn.execute(
-            f"SELECT {_MESSAGE_COLUMNS} FROM messages WHERE conversation_id = ? ORDER BY id DESC LIMIT ?",
-            (chat_id, limit),
+            f"SELECT {_MESSAGE_COLUMNS} FROM messages WHERE conversation_id = ? AND id < ? ORDER BY id DESC LIMIT ?",
+            (chat_id, before_id if before_id is not None else 2**62, limit),
         ).fetchall()
-    return [_message_dict(row) for row in reversed(rows)]
+        messages = [_message_dict(row) for row in reversed(rows)]
+        user_ids = [m["id"] for m in messages if m["role"] == "user"]
+        files: dict[int, list[dict]] = {}
+        for start in range(0, len(user_ids), 500):
+            chunk = user_ids[start : start + 500]
+            marks = ",".join("?" for _ in chunk)
+            for row in conn.execute(
+                f"SELECT message_id, name, chars, substr(content, 1, ?) AS content FROM message_attachments "
+                f"WHERE message_id IN ({marks}) ORDER BY message_id, position",
+                (max(char_limit, 0) + 1, *chunk),
+            ):
+                files.setdefault(row["message_id"], []).append(
+                    {"name": row["name"], "chars": row["chars"], "content": row["content"]}
+                )
+    for message in messages:
+        message["attachments"] = files.get(message["id"], [])
+    return messages
 
 
-def _insert_turn(chat_id: int, content: str, model: str | None) -> tuple[dict, dict, dict]:
-    """Store the user message and an empty ``streaming`` assistant message atomically."""
+def _insert_turn(chat_id: int, content: str, attachments: list[dict], model: str | None) -> tuple[dict, dict, dict]:
+    """Store the user message (with its files) and an empty ``streaming`` assistant message atomically."""
     now = db.utcnow()
-    with db.connect() as conn:
+    with _connect() as conn:
         with db.transaction(conn):
             _get_conversation(conn, chat_id)
             user_id = conn.execute(
@@ -270,6 +478,11 @@ def _insert_turn(chat_id: int, content: str, model: str | None) -> tuple[dict, d
                 "VALUES (?, 'user', ?, 'complete', ?)",
                 (chat_id, content, now),
             ).lastrowid
+            for position, item in enumerate(attachments):
+                conn.execute(
+                    "INSERT INTO message_attachments (message_id, position, name, content, chars) VALUES (?, ?, ?, ?, ?)",
+                    (user_id, position, item["name"], item["content"], item["chars"]),
+                )
             assistant_id = conn.execute(
                 "INSERT INTO messages (conversation_id, role, content, status, model, created_at) "
                 "VALUES (?, 'assistant', '', 'streaming', ?, ?)",
@@ -278,12 +491,23 @@ def _insert_turn(chat_id: int, content: str, model: str | None) -> tuple[dict, d
             conn.execute(
                 "UPDATE conversations SET updated_at = ?, title = CASE WHEN title = '' THEN ? ELSE title END "
                 "WHERE id = ?",
-                (now, auto_title(content), chat_id),
+                (now, auto_title(content, attachments), chat_id),
             )
-        rows = conn.execute(
-            f"SELECT {_MESSAGE_COLUMNS} FROM messages WHERE id IN (?, ?) ORDER BY id", (user_id, assistant_id)
-        ).fetchall()
-        return _message_dict(rows[0]), _message_dict(rows[1]), _get_conversation(conn, chat_id)
+        return _get_message(conn, user_id), _get_message(conn, assistant_id), _get_conversation(conn, chat_id)
+
+
+def _last_turn(conn: sqlite3.Connection, chat_id: int) -> tuple[dict | None, dict | None]:
+    """``(user_message, assistant_message)`` of the newest turn (either may be ``None``)."""
+    rows = conn.execute(
+        f"SELECT {_MESSAGE_COLUMNS} FROM messages WHERE conversation_id = ? ORDER BY id DESC LIMIT 2", (chat_id,)
+    ).fetchall()
+    if not rows:
+        return None, None
+    last = _messages_with_attachments(conn, rows)
+    if last[0]["role"] == "user":
+        return last[0], None
+    user = last[1] if len(last) > 1 and last[1]["role"] == "user" else None
+    return user, last[0]
 
 
 @web.on_startup
@@ -293,7 +517,7 @@ def recover_interrupted(server: object = None) -> int:
         active = [answer.assistant_id for answer in _ACTIVE.values()]
     marks = ",".join("?" for _ in active)
     extra = f" AND id NOT IN ({marks})" if active else ""
-    with db.connect() as conn, db.transaction(conn):
+    with _connect() as conn, db.transaction(conn):
         cur = conn.execute(
             "UPDATE messages SET status = 'stopped', error = COALESCE(error, ?) WHERE status = 'streaming'" + extra,
             (INTERRUPTED_ERROR, *active),
@@ -301,6 +525,44 @@ def recover_interrupted(server: object = None) -> int:
     if cur.rowcount:
         log.warning("Marked %s interrupted chat answer(s) as stopped", cur.rowcount)
     return cur.rowcount
+
+
+# --------------------------------------------------------------------------- export
+
+
+def _export_filename(title: str, chat_id: int) -> str:
+    ascii_title = unicodedata.normalize("NFKD", title).encode("ascii", "ignore").decode("ascii")
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", ascii_title).strip("-._")[:80]
+    return f"{slug or f'chat-{chat_id}'}.md"
+
+
+def export_markdown(chat_id: int) -> tuple[str, str]:
+    """``(markdown, download_name)`` of a conversation; reasoning is never stored, so never exported."""
+    chat = get_conversation(chat_id)
+    messages = list_messages(chat_id)
+    title = chat["title"] or "Untitled chat"
+    lines = [
+        f"# {title}",
+        "",
+        f"*{'Code' if chat['mode'] == 'code' else 'Chat'} conversation from LowRAM AI · started "
+        f"{chat['created_at']} · exported {db.utcnow()} · {len(messages)} messages*",
+    ]
+    for message in messages:
+        if message["role"] == "user":
+            heading = "## User"
+        else:
+            details = [message["model"]] if message["model"] else []
+            if message["status"] != "complete":
+                details.append(message["status"])
+            if message["truncated"]:
+                details.append("cut off at the length limit")
+            heading = "## Assistant" + (f" ({', '.join(details)})" if details else "")
+        lines += ["", heading, "", message["content"].rstrip() or "*(no text)*"]
+        for item in message["attachments"]:
+            lines += ["", f"*Attached file: {item['name']} ({item['chars']} characters)*"]
+        if message["role"] == "assistant" and message["error"]:
+            lines += ["", f"*Error: {message['error']}*"]
+    return "\n".join(lines) + "\n", _export_filename(title, chat_id)
 
 
 # --------------------------------------------------------------------------- context
@@ -316,6 +578,45 @@ def truncate_middle(text: str, limit: int) -> str:
     tail = keep - head
     omitted = len(text) - head - tail
     return text[:head] + marker.format(n=omitted) + (text[-tail:] if tail else "")
+
+
+def _fence(text: str) -> str:
+    longest = max((len(run) for run in re.findall(r"`+", text)), default=0)
+    return "`" * max(3, longest + 1)
+
+
+def _attachment_block(name: str, body: str, chars: int) -> str:
+    fence = _fence(body)
+    note = f"\n[…truncated – {chars - len(body)} characters omitted]" if chars > len(body) else ""
+    return f"\n\nAttached file: {name}\n{fence}\n{body}\n{fence}{note}"
+
+
+def render_user_message(content: str, attachments: list[dict], limit: int) -> str:
+    """The user's text followed by fenced attachment blocks, within about ``limit`` characters.
+
+    The typed text has priority (it keeps at least half the room); attachments
+    share the rest fairly and are cut at the end with a visible note.
+    """
+    files = [(a["name"], a.get("content") or "", int(a.get("chars") or len(a.get("content") or ""))) for a in attachments]
+    full = content + "".join(_attachment_block(n, b, c) for n, b, c in files)
+    if len(full) <= limit:
+        return full.lstrip("\n")
+    if not files:
+        return truncate_middle(content, limit)
+    files_size = len(full) - len(content)
+    room_for_text = max(limit - files_size, limit // 2)
+    text = truncate_middle(content, room_for_text) if len(content) > room_for_text else content
+    left = max(limit - len(text), 0)
+    keep: dict[int, int] = {}
+    order = sorted(range(len(files)), key=lambda i: len(files[i][1]))
+    for position, index in enumerate(order):
+        name, body, chars = files[index]
+        overhead = len(_attachment_block(name, "", chars)) + len(_fence(body))
+        share = left // (len(order) - position)
+        keep[index] = max(0, min(len(body), share - overhead))
+        left -= min(share, keep[index] + overhead)
+    blocks = "".join(_attachment_block(n, b[: keep[i]], c) for i, (n, b, c) in enumerate(files))
+    return (text + blocks).lstrip("\n")
 
 
 def _answered_turns(history: list[dict]) -> list[dict]:
@@ -334,21 +635,50 @@ def _answered_turns(history: list[dict]) -> list[dict]:
             and answer["status"] in ("complete", "stopped")
             and (answer["content"] or "").strip()
         ):
-            turns.append({"role": "user", "content": message["content"]})
+            files = message.get("attachments") or []
+            turns.append({
+                "role": "user", "content": render_user_message(message["content"], files, 2**62),
+                "_text": message["content"], "_files": files,
+            })
             turns.append({"role": "assistant", "content": answer["content"]})
     return turns
 
 
-def build_messages(mode: str, history: list[dict], new_content: str, char_budget: int) -> list[dict]:
+def system_prompt(mode: str, instructions: str = "") -> str:
+    base = SYSTEM_PROMPTS[mode]
+    return base + INSTRUCTIONS_HEADER + instructions if instructions else base
+
+
+def build_messages(
+    mode: str,
+    history: list[dict],
+    new_content: str,
+    char_budget: int,
+    *,
+    attachments: list[dict] | None = None,
+    instructions: str = "",
+    partial: str | None = None,
+) -> list[dict]:
     """System prompt + the newest turns that fit ``char_budget`` + the new user message.
 
-    The oldest messages are dropped first and messages are never split, except
-    that the newest earlier message and the new message itself are shortened
-    in the middle (with a marker) when one alone is larger than the budget.
+    The new message and its attachments have priority; the oldest messages
+    are dropped first and messages are never split, except that the newest
+    earlier message (or an older one's attachments) and the new message are
+    shortened with a visible marker when they alone are larger than the
+    budget. With ``partial`` (continue), the cut-off answer and a note asking
+    to continue follow the new message.
     """
-    system = SYSTEM_PROMPTS[mode]
+    system = system_prompt(mode, instructions)
     remaining = char_budget - len(system) - MESSAGE_OVERHEAD_CHARS
-    user_text = truncate_middle(new_content, max(remaining - MESSAGE_OVERHEAD_CHARS, MIN_TRUNCATED_CHARS))
+    tail: list[dict] = []
+    if partial is not None:
+        remaining -= len(CONTINUE_NOTE) + MESSAGE_OVERHEAD_CHARS
+        partial_text = truncate_middle(partial, max(remaining // 2 - MESSAGE_OVERHEAD_CHARS, MIN_TRUNCATED_CHARS))
+        remaining -= len(partial_text) + MESSAGE_OVERHEAD_CHARS
+        tail = [{"role": "assistant", "content": partial_text}, {"role": "user", "content": CONTINUE_NOTE}]
+    user_text = render_user_message(
+        new_content, attachments or [], max(remaining - MESSAGE_OVERHEAD_CHARS, MIN_TRUNCATED_CHARS)
+    )
     remaining -= len(user_text) + MESSAGE_OVERHEAD_CHARS
     remaining -= len(OMITTED_NOTE) + MESSAGE_OVERHEAD_CHARS  # reserved in case the note is needed
     picked: list[dict] = []
@@ -359,13 +689,18 @@ def build_messages(mode: str, history: list[dict], new_content: str, char_budget
             remaining -= cost
             continue
         room = remaining - MESSAGE_OVERHEAD_CHARS
-        if not picked and room >= MIN_TRUNCATED_CHARS:
+        if message.get("_files") and room - len(message["_text"]) >= MIN_TRUNCATED_CHARS:
+            picked.append({**message, "content": render_user_message(message["_text"], message["_files"], room)})
+        elif not picked and room >= MIN_TRUNCATED_CHARS:
             picked.append({**message, "content": truncate_middle(message["content"], room)})
         break
     picked.reverse()
     if picked and picked[0]["role"] == "assistant":
         picked.insert(0, {"role": "user", "content": OMITTED_NOTE})
-    return [{"role": "system", "content": system}, *picked, {"role": "user", "content": user_text}]
+    history_messages = [{"role": m["role"], "content": m["content"]} for m in picked]
+    return [
+        {"role": "system", "content": system}, *history_messages, {"role": "user", "content": user_text}, *tail,
+    ]
 
 
 # --------------------------------------------------------------------------- reasoning
@@ -571,11 +906,13 @@ class _Answer:
 
     Holds no reference to its :class:`ChatStream`, so dropping the stream
     object triggers ``ChatStream.__del__`` (which releases the slot) at once.
+    For ``continue`` the answer starts with the stored text and ``restore``
+    holds the previous state, written back if nothing new arrives.
     """
 
-    def __init__(self, *, chat: dict, user_message: dict, assistant_message: dict, messages: list[dict],
+    def __init__(self, *, chat: dict, user_message: dict | None, assistant_message: dict, messages: list[dict],
                  max_tokens: int, temperature: float, url: str | None, slot: ExitStack,
-                 wait=None) -> None:
+                 wait=None, action: str = "message", extra: dict | None = None, restore: dict | None = None) -> None:
         self.chat_id = int(chat["id"])
         self.chat = chat
         self.user_message = user_message
@@ -586,7 +923,11 @@ class _Answer:
         self.temperature = temperature
         self.url = url
         self.wait = wait  # waits for the managed model to finish loading (worker thread)
+        self.action = action
+        self.extra = extra or {}
+        self.restore = restore
         self.loading = False
+        self.stats: dict = {}
         self.stop_event = threading.Event()
         self.queue: queue.Queue = queue.Queue()
         self.worker: threading.Thread | None = None
@@ -594,7 +935,8 @@ class _Answer:
         self._slot = slot
         self._released = False
         self._lock = threading.RLock()
-        self._parts: list[str] = []
+        self._initial = assistant_message["content"] if restore is not None else ""
+        self._parts: list[str] = [self._initial] if self._initial else []
         self._started = time.monotonic()
         self._last_save = self._started
 
@@ -616,7 +958,7 @@ class _Answer:
                     self.loading = False
             for piece in llm.stream_chat(
                 self.messages, max_tokens=self.max_tokens, temperature=self.temperature,
-                url=self.url, stop_event=self.stop_event,
+                url=self.url, stop_event=self.stop_event, stats=self.stats,
             ):
                 self.queue.put(("text", piece))
             self.queue.put(("end", None))
@@ -631,6 +973,12 @@ class _Answer:
 
     # ---- HTTP side
 
+    def start_event(self) -> dict:
+        return {
+            "type": "start", "action": self.action, "chat": self.chat,
+            "user_message": self.user_message, "assistant_message": self.assistant, **self.extra,
+        }
+
     def take(self, kind: str, text: str) -> dict | None:
         """Turn a split piece into an SSE event (leading blank space of the answer is dropped)."""
         if kind == "reasoning":
@@ -642,8 +990,11 @@ class _Answer:
         self._parts.append(text)
         return {"type": "token", "text": text}
 
+    def new_text(self) -> str:
+        return "".join(self._parts)[len(self._initial):]
+
     def has_content(self) -> bool:
-        return bool("".join(self._parts).strip())
+        return bool(self.new_text().strip())
 
     def save_progress(self) -> None:
         now = time.monotonic()
@@ -651,7 +1002,7 @@ class _Answer:
             return
         self._last_save = now
         try:
-            with db.connect() as conn:
+            with _connect() as conn:
                 conn.execute(
                     "UPDATE messages SET content = ? WHERE id = ? AND status = 'streaming'",
                     ("".join(self._parts), self.assistant_id),
@@ -659,21 +1010,38 @@ class _Answer:
         except sqlite3.Error:  # the final save still records everything
             log.warning("Could not save the partial answer of chat #%s", self.chat_id, exc_info=True)
 
+    def _final_values(self, status: str, error: str | None) -> dict:
+        if self.restore is not None and not self.has_content():  # continue produced nothing: keep the old answer
+            return {**self.restore, "error": None}
+        finish = self.stats.get("finish_reason") if status == "complete" else None
+        before = self.restore or {}  # continue: add to the stored answer's numbers
+        tokens = int(before.get("tokens") or 0) + int(self.stats.get("tokens") or 0)
+        duration = round(time.monotonic() - self._started + float(before.get("duration_s") or 0), 2)
+        return {
+            "content": "".join(self._parts).rstrip(),
+            "status": status,
+            "error": error[: db.MAX_ERROR_CHARS] if error else None,
+            "duration_s": duration,
+            "tokens": tokens or None,
+            "tokens_per_s": self.stats.get("tokens_per_s"),
+            "finish_reason": None if not finish else ("length" if finish == "length" else "stop"),
+        }
+
     def finalize(self, status: str, error: str | None) -> dict:
         """Persist the final state once; later calls return the first result."""
         with self._lock:
             if self.final is not None:
                 return self.final
-            content = "".join(self._parts).rstrip()
-            error = error[: db.MAX_ERROR_CHARS] if error else None
-            duration = round(time.monotonic() - self._started, 2)
+            values = self._final_values(status, error)
             now = db.utcnow()
             for attempt in range(3):
                 try:
-                    with db.connect() as conn, db.transaction(conn):
+                    with _connect() as conn, db.transaction(conn):
                         conn.execute(
-                            "UPDATE messages SET content = ?, status = ?, error = ?, duration_s = ? WHERE id = ?",
-                            (content, status, error, duration, self.assistant_id),
+                            "UPDATE messages SET content = ?, status = ?, error = ?, duration_s = ?, tokens = ?, "
+                            "tokens_per_s = ?, finish_reason = ? WHERE id = ?",
+                            (values["content"], values["status"], values["error"], values["duration_s"],
+                             values["tokens"], values["tokens_per_s"], values["finish_reason"], self.assistant_id),
                         )
                         conn.execute("UPDATE conversations SET updated_at = ? WHERE id = ?", (now, self.chat_id))
                     break
@@ -681,7 +1049,7 @@ class _Answer:
                     if attempt == 2:
                         raise
                     time.sleep(0.5 * (attempt + 1))
-            self.final = {**self.assistant, "content": content, "status": status, "error": error, "duration_s": duration}
+            self.final = {**self.assistant, **values, "truncated": values["finish_reason"] == "length"}
             self._unregister()
             return self.final
 
@@ -759,12 +1127,7 @@ def _pump(answer: _Answer) -> Iterator[dict]:
 
 def _events(answer: _Answer) -> Iterator[dict]:
     try:
-        yield {
-            "type": "start",
-            "chat": answer.chat,
-            "user_message": answer.user_message,
-            "assistant_message": answer.assistant,
-        }
+        yield answer.start_event()
         try:
             status, error = yield from _pump(answer)
         except llm.LLMError as exc:
@@ -774,7 +1137,7 @@ def _events(answer: _Answer) -> Iterator[dict]:
             status, error = "error", f"Unexpected error while answering: {type(exc).__name__}: {exc}"
         message = answer.finalize(status, error)
         if status == "error":
-            yield {"type": "error", "error": message["error"], "message": message}
+            yield {"type": "error", "error": error, "message": message}
         else:
             yield {"type": "done", "message": message}
     finally:  # also on GeneratorExit (client gone) and errors in finalize
@@ -816,13 +1179,12 @@ class ChatStream:
             pass
 
 
-def start_answer(chat_id: int, content: object, percent: object = None) -> ChatStream:
-    """Validate, take the inference slot, store the turn and return the event stream.
+def _open_stream(chat_id: int, percent: object, prepare) -> ChatStream:
+    """Shared frame of all answer streams: RAM plan, slot, model, context limits.
 
-    Raises ``ValueError`` (400), ``db.NotFound`` (404), ``db.Busy`` or
-    ``HTTPError(409)`` (no model) before anything is streamed.
+    ``prepare(chat, mode, budget, endpoint)`` runs while the slot is held and
+    returns the keyword arguments for :class:`_Answer` (it stores the rows).
     """
-    text = validate_content(content)
     plan = memory.plan(default_percent() if percent is None else percent)
     chat = get_conversation(chat_id)
     mode = chat["mode"] if chat["mode"] in MODES else "chat"
@@ -831,12 +1193,10 @@ def start_answer(chat_id: int, content: object, percent: object = None) -> ChatS
     try:
         endpoint = prepare_model()
         budget, max_tokens = context_limits(plan.context_chars, plan.max_tokens, mode, endpoint["ctx_size"])
-        messages = build_messages(mode, _recent_messages(chat_id), text, budget)
-        user_message, assistant_message, chat = _insert_turn(chat_id, text, endpoint["model"])
+        fields = prepare(mode, budget, endpoint)
         answer = _Answer(
-            chat=chat, user_message=user_message, assistant_message=assistant_message, messages=messages,
-            max_tokens=max_tokens, temperature=TEMPERATURE[mode],
-            url=endpoint["url"], slot=slot, wait=endpoint["wait"],
+            max_tokens=max_tokens, temperature=TEMPERATURE[mode], url=endpoint["url"], slot=slot,
+            wait=endpoint["wait"], **fields,
         )
         with _ACTIVE_LOCK:
             _ACTIVE[chat_id] = answer
@@ -846,12 +1206,98 @@ def start_answer(chat_id: int, content: object, percent: object = None) -> ChatS
         raise
 
 
+def start_answer(chat_id: int, content: object, percent: object = None, attachments: object = None) -> ChatStream:
+    """Validate, take the inference slot, store the turn and return the event stream.
+
+    Raises ``ValueError`` (400), ``db.NotFound`` (404), ``db.Busy`` or
+    ``HTTPError(409)`` (no model) before anything is streamed.
+    """
+    files = validate_attachments(attachments)
+    text = validate_content(content, allow_empty=bool(files))
+
+    def prepare(mode: str, budget: int, endpoint: dict) -> dict:
+        history = _recent_messages(chat_id, budget)
+        messages = build_messages(mode, history, text, budget, attachments=files, instructions=current_instructions())
+        user, assistant, chat = _insert_turn(chat_id, text, files, endpoint["model"])
+        return {"chat": chat, "user_message": user, "assistant_message": assistant, "messages": messages}
+
+    return _open_stream(chat_id, percent, prepare)
+
+
+def regenerate_answer(chat_id: int, percent: object = None) -> ChatStream:
+    """Replace the last assistant answer with a new one for the same user message."""
+
+    def prepare(mode: str, budget: int, endpoint: dict) -> dict:
+        with _connect() as conn:
+            user, old = _last_turn(conn, chat_id)
+            if user is None or old is None:
+                raise HTTPError(HTTPStatus.CONFLICT, "There is no answer to regenerate in this chat")
+            history = _recent_messages(chat_id, budget, before_id=user["id"])
+            files = _recent_messages(chat_id, budget, before_id=old["id"], limit=1)[0]["attachments"]
+            messages = build_messages(
+                mode, history, user["content"], budget, attachments=files, instructions=current_instructions()
+            )
+            now = db.utcnow()
+            with db.transaction(conn):
+                cur = conn.execute(
+                    "DELETE FROM messages WHERE id = ? AND id = (SELECT MAX(id) FROM messages WHERE conversation_id = ?)",
+                    (old["id"], chat_id),
+                )
+                if cur.rowcount != 1:
+                    raise HTTPError(HTTPStatus.CONFLICT, "The chat changed meanwhile; reload it and try again")
+                new_id = conn.execute(
+                    "INSERT INTO messages (conversation_id, role, content, status, model, created_at) "
+                    "VALUES (?, 'assistant', '', 'streaming', ?, ?)",
+                    (chat_id, endpoint["model"], now),
+                ).lastrowid
+                conn.execute("UPDATE conversations SET updated_at = ? WHERE id = ?", (now, chat_id))
+            return {
+                "chat": _get_conversation(conn, chat_id), "user_message": user,
+                "assistant_message": _get_message(conn, new_id), "messages": messages,
+                "action": "regenerate", "extra": {"replaced_message_id": old["id"]},
+            }
+
+    return _open_stream(chat_id, percent, prepare)
+
+
+def continue_answer(chat_id: int, percent: object = None) -> ChatStream:
+    """Append to the last assistant answer when it was cut off at the length limit."""
+
+    def prepare(mode: str, budget: int, endpoint: dict) -> dict:
+        with _connect() as conn:
+            user, old = _last_turn(conn, chat_id)
+            if user is None or old is None or not old["truncated"] or old["status"] != "complete":
+                raise HTTPError(HTTPStatus.CONFLICT, "Only an answer that was cut off at the length limit can be continued")
+            history = _recent_messages(chat_id, budget, before_id=user["id"])
+            files = _recent_messages(chat_id, budget, before_id=old["id"], limit=1)[0]["attachments"]
+            messages = build_messages(
+                mode, history, user["content"], budget, attachments=files,
+                instructions=current_instructions(), partial=old["content"],
+            )
+            with db.transaction(conn):
+                cur = conn.execute(
+                    "UPDATE messages SET status = 'streaming', finish_reason = NULL, error = NULL "
+                    "WHERE id = ? AND status = 'complete' AND finish_reason = 'length'",
+                    (old["id"],),
+                )
+                if cur.rowcount != 1:
+                    raise HTTPError(HTTPStatus.CONFLICT, "The chat changed meanwhile; reload it and try again")
+            restore = {key: old[key] for key in ("content", "status", "duration_s", "tokens", "tokens_per_s", "finish_reason")}
+            return {
+                "chat": _get_conversation(conn, chat_id), "user_message": user,
+                "assistant_message": {**old, "status": "streaming", "finish_reason": None, "truncated": False},
+                "messages": messages, "action": "continue", "restore": restore,
+            }
+
+    return _open_stream(chat_id, percent, prepare)
+
+
 # --------------------------------------------------------------------------- routes
 
 
 @route("GET", r"/api/chats")
 def get_chats(req: Request) -> Response:
-    return Response({"chats": list_conversations()})
+    return Response({"chats": list_conversations(req.arg("q"))})
 
 
 @route("POST", r"/api/chats")
@@ -860,10 +1306,27 @@ def post_chat(req: Request) -> Response:
     return Response({"chat": create_conversation(data.get("title"), data.get("mode"))}, HTTPStatus.CREATED)
 
 
+@route("POST", r"/api/chats/instructions")
+def post_instructions(req: Request) -> Response:
+    data = req.json()
+    text = clean_instructions(data.get("instructions"))
+    settings.update("chat", {"instructions": text})
+    return Response({"instructions": text})
+
+
 @route("GET", r"/api/chats/(\d+)")
 def get_chat(req: Request, chat_id: int) -> Response:
     messages = list_messages(chat_id)
     return Response({"chat": get_conversation(chat_id), "messages": messages})
+
+
+@route("GET", r"/api/chats/(\d+)/export")
+def get_export(req: Request, chat_id: int) -> FileResponse:
+    text, download_name = export_markdown(chat_id)
+    folder = config.home_dir() / "exports"
+    folder.mkdir(mode=0o700, exist_ok=True)
+    path = artifacts.write_text_atomic(folder / f"chat_{chat_id}.md", text)
+    return FileResponse(path, "text/markdown; charset=utf-8", download_name)
 
 
 @route("POST", r"/api/chats/(\d+)/rename")
@@ -881,8 +1344,20 @@ def post_delete(req: Request, chat_id: int) -> Response:
 
 @route("POST", r"/api/chats/(\d+)/messages")
 def post_message(req: Request, chat_id: int) -> StreamResponse:
+    data = req.json(max_bytes=MAX_MESSAGE_BODY_BYTES)
+    return StreamResponse(start_answer(chat_id, data.get("content"), data.get("percent"), data.get("attachments")))
+
+
+@route("POST", r"/api/chats/(\d+)/continue")
+def post_continue(req: Request, chat_id: int) -> StreamResponse:
     data = req.json()
-    return StreamResponse(start_answer(chat_id, data.get("content"), data.get("percent")))
+    return StreamResponse(continue_answer(chat_id, data.get("percent")))
+
+
+@route("POST", r"/api/chats/(\d+)/regenerate")
+def post_regenerate(req: Request, chat_id: int) -> StreamResponse:
+    data = req.json()
+    return StreamResponse(regenerate_answer(chat_id, data.get("percent")))
 
 
 @route("POST", r"/api/chats/(\d+)/stop")

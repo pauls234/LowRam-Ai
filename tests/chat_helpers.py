@@ -13,9 +13,10 @@ class Stream:
     """SSE answer: optional ``reasoning_content`` deltas, then content deltas, finish + [DONE]."""
 
     def __init__(self, chunks=(), *, reasoning=(), delay=0.0, finish=True, done=True, chunked=True,
-                 crlf=False, comments=False):
+                 crlf=False, comments=False, finish_reason="stop", usage=None):
         self.chunks, self.reasoning, self.delay = list(chunks), list(reasoning), delay
         self.finish, self.done, self.chunked, self.crlf, self.comments = finish, done, chunked, crlf, comments
+        self.finish_reason, self.usage = finish_reason, usage  # usage: completion_tokens to report
 
 
 class Disconnect(Stream):
@@ -148,7 +149,9 @@ class _Handler(BaseHTTPRequestHandler):
         pieces = [sse_chunk({"reasoning_content": r}) for r in item.reasoning]
         pieces += [sse_chunk({"content": c}) for c in item.chunks]
         if item.finish:
-            pieces.append(sse_chunk({}, "stop"))
+            pieces.append(sse_chunk({}, item.finish_reason))
+        if item.usage is not None:  # like stream_options.include_usage: a final chunk without choices
+            pieces.append(b"data: " + json.dumps({"choices": [], "usage": {"completion_tokens": item.usage}}).encode() + b"\n\n")
         if item.done:
             pieces.append(b"data: [DONE]\n\n")
         for piece in pieces:
