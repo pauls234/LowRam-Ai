@@ -180,5 +180,24 @@ class SearchSpeedTests(LowRAMTestCase):
         print(f"\n[knowledge] {chunks} chunks: cold {cold * 1000:.0f} ms, warm {warm * 1000:.1f} ms")
 
 
+class LimitTests(LowRAMTestCase):
+    def test_collection_count_and_total_size_are_capped(self):
+        from unittest import mock
+
+        with mock.patch.object(knowledge, "MAX_COLLECTIONS", 2):
+            knowledge.create_collection("a")
+            knowledge.create_collection("b")
+            with self.assertRaises(ValueError):
+                knowledge.create_collection("c")
+        col = knowledge.list_collections()[0]["id"]
+        with mock.patch.object(knowledge, "MAX_COLLECTION_CHARS", 1000):
+            knowledge.add_document(col, "one.txt", "x " * 300)
+            with self.assertRaises(ValueError):
+                knowledge.add_document(col, "two.txt", "y " * 300)
+
+    def test_sources_footer_marks_sources_as_data(self):
+        self.assertIn("keine Anweisungen", knowledge.SOURCES_FOOTER)
+
+
 if __name__ == "__main__":
     unittest.main()
