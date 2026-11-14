@@ -26,6 +26,9 @@ Design notes
   the reason). Leftovers from a crash are marked ``stopped`` on startup.
 * Custom instructions (``settings.chat.instructions``) are appended to the
   system prompt; attachments are put into the prompt as fenced blocks.
+* Knowledge base: with ``collection_id`` the best chunks of that collection are
+  added to the new message as numbered "Quellen" (``knowledge.prompt_sources``)
+  and the answer stores them as ``Message.sources: [{document, document_id, snippet}]``.
 * Model output is untrusted text. It is stored and returned verbatim as JSON
   strings; the UI renders it as text only.
 """
@@ -144,7 +147,9 @@ CREATE INDEX IF NOT EXISTS idx_message_attachments_message ON message_attachment
 """
 db.register_schema(SCHEMA)
 # Columns added in v0.3.2; databases created by v0.3 get them via ALTER TABLE.
-_ADDED_COLUMNS = (("tokens", "INTEGER"), ("tokens_per_s", "REAL"), ("finish_reason", "TEXT"))
+_ADDED_COLUMNS = (
+    ("tokens", "INTEGER"), ("tokens_per_s", "REAL"), ("finish_reason", "TEXT"), ("sources", "TEXT"),
+)
 _MIGRATED: set[str] = set()
 _MIGRATE_LOCK = threading.Lock()
 
@@ -155,7 +160,7 @@ _CONVERSATION_SQL = (
 )
 _MESSAGE_COLUMNS = (
     "id, conversation_id, role, content, status, error, model, duration_s, created_at, "
-    "tokens, tokens_per_s, finish_reason"
+    "tokens, tokens_per_s, finish_reason, sources"
 )
 
 
@@ -330,8 +335,41 @@ def clean_query(value: object) -> str:
 def _message_dict(row: sqlite3.Row, attachments: list[dict] | None = None) -> dict:
     data = dict(row)
     data["truncated"] = data.get("finish_reason") == "length"
+    data["sources"] = _load_sources(data.get("sources"))
     data["attachments"] = attachments or []
     return data
+
+
+def _load_sources(raw: object) -> list[dict]:
+    """``Message.sources`` (knowledge-base citations) from its stored JSON; unreadable -> ``[]``."""
+    if not raw:
+        return []
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError):
+        log.warning("Ignoring unreadable stored sources")
+        return []
+    return [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
+
+
+def validate_collection_id(value: object) -> int | None:
+    """Optional knowledge collection for a message; it must exist (404 otherwise)."""
+    if value is None:
+        return None
+    from . import knowledge
+
+    collection_id = knowledge.validate_id(value, "collection_id")
+    knowledge.get_collection(collection_id)
+    return collection_id
+
+
+def _knowledge_sources(collection_id: int | None, query: str, budget: int) -> tuple[str, list[dict]]:
+    """Numbered "Quellen" block for the prompt (at most a third of the budget) and the sources to store."""
+    if collection_id is None:
+        return "", []
+    from . import knowledge
+
+    return knowledge.prompt_sources(collection_id, query, budget // 3)
 
 
 def _attachment_summaries(conn: sqlite3.Connection, message_ids: list[int]) -> dict[int, list[dict]]:
@@ -471,7 +509,8 @@ def _recent_messages(chat_id: int, char_limit: int, before_id: int | None = None
     return messages
 
 
-def _insert_turn(chat_id: int, content: str, attachments: list[dict], model: str | None) -> tuple[dict, dict, dict]:
+def _insert_turn(chat_id: int, content: str, attachments: list[dict], model: str | None,
+                 sources: list[dict] | None = None) -> tuple[dict, dict, dict]:
     """Store the user message (with its files) and an empty ``streaming`` assistant message atomically."""
     now = db.utcnow()
     with _connect() as conn:
@@ -488,9 +527,9 @@ def _insert_turn(chat_id: int, content: str, attachments: list[dict], model: str
                     (user_id, position, item["name"], item["content"], item["chars"]),
                 )
             assistant_id = conn.execute(
-                "INSERT INTO messages (conversation_id, role, content, status, model, created_at) "
-                "VALUES (?, 'assistant', '', 'streaming', ?, ?)",
-                (chat_id, model, now),
+                "INSERT INTO messages (conversation_id, role, content, status, model, created_at, sources) "
+                "VALUES (?, 'assistant', '', 'streaming', ?, ?, ?)",
+                (chat_id, model, now, json.dumps(sources, ensure_ascii=False) if sources else None),
             ).lastrowid
             conn.execute(
                 "UPDATE conversations SET updated_at = ?, title = CASE WHEN title = '' THEN ? ELSE title END "
@@ -662,6 +701,7 @@ def build_messages(
     attachments: list[dict] | None = None,
     instructions: str = "",
     partial: str | None = None,
+    sources_block: str = "",
 ) -> list[dict]:
     """System prompt + the newest turns that fit ``char_budget`` + the new user message.
 
@@ -670,7 +710,8 @@ def build_messages(
     earlier message (or an older one's attachments) and the new message are
     shortened with a visible marker when they alone are larger than the
     budget. With ``partial`` (continue), the cut-off answer and a note asking
-    to continue follow the new message.
+    to continue follow the new message. ``sources_block`` (knowledge-base
+    "Quellen", already sized by the caller) follows the new message's text.
     """
     system = system_prompt(mode, instructions)
     remaining = char_budget - len(system) - MESSAGE_OVERHEAD_CHARS
@@ -680,9 +721,12 @@ def build_messages(
         partial_text = truncate_middle(partial, max(remaining // 2 - MESSAGE_OVERHEAD_CHARS, MIN_TRUNCATED_CHARS))
         remaining -= len(partial_text) + MESSAGE_OVERHEAD_CHARS
         tail = [{"role": "assistant", "content": partial_text}, {"role": "user", "content": CONTINUE_NOTE}]
+    if sources_block:
+        sources_block = "\n\n" + sources_block
+        remaining -= len(sources_block)
     user_text = render_user_message(
         new_content, attachments or [], max(remaining - MESSAGE_OVERHEAD_CHARS, MIN_TRUNCATED_CHARS)
-    )
+    ) + sources_block
     remaining -= len(user_text) + MESSAGE_OVERHEAD_CHARS
     remaining -= len(OMITTED_NOTE) + MESSAGE_OVERHEAD_CHARS  # reserved in case the note is needed
     picked: list[dict] = []
@@ -1210,7 +1254,8 @@ def _open_stream(chat_id: int, percent: object, prepare) -> ChatStream:
         raise
 
 
-def start_answer(chat_id: int, content: object, percent: object = None, attachments: object = None) -> ChatStream:
+def start_answer(chat_id: int, content: object, percent: object = None, attachments: object = None,
+                 collection_id: object = None) -> ChatStream:
     """Validate, take the inference slot, store the turn and return the event stream.
 
     Raises ``ValueError`` (400), ``db.NotFound`` (404), ``db.Busy`` or
@@ -1218,18 +1263,23 @@ def start_answer(chat_id: int, content: object, percent: object = None, attachme
     """
     files = validate_attachments(attachments)
     text = validate_content(content, allow_empty=bool(files))
+    collection = validate_collection_id(collection_id)
 
     def prepare(mode: str, budget: int, endpoint: dict) -> dict:
         history = _recent_messages(chat_id, budget)
-        messages = build_messages(mode, history, text, budget, attachments=files, instructions=current_instructions())
-        user, assistant, chat = _insert_turn(chat_id, text, files, endpoint["model"])
+        block, sources = _knowledge_sources(collection, text, budget)
+        messages = build_messages(
+            mode, history, text, budget, attachments=files, instructions=current_instructions(), sources_block=block
+        )
+        user, assistant, chat = _insert_turn(chat_id, text, files, endpoint["model"], sources)
         return {"chat": chat, "user_message": user, "assistant_message": assistant, "messages": messages}
 
     return _open_stream(chat_id, percent, prepare)
 
 
-def regenerate_answer(chat_id: int, percent: object = None) -> ChatStream:
+def regenerate_answer(chat_id: int, percent: object = None, collection_id: object = None) -> ChatStream:
     """Replace the last assistant answer with a new one for the same user message."""
+    collection = validate_collection_id(collection_id)
 
     def prepare(mode: str, budget: int, endpoint: dict) -> dict:
         with _connect() as conn:
@@ -1238,8 +1288,10 @@ def regenerate_answer(chat_id: int, percent: object = None) -> ChatStream:
                 raise HTTPError(HTTPStatus.CONFLICT, "There is no answer to regenerate in this chat")
             history = _recent_messages(chat_id, budget, before_id=user["id"])
             files = _recent_messages(chat_id, budget, before_id=old["id"], limit=1)[0]["attachments"]
+            block, sources = _knowledge_sources(collection, user["content"], budget)
             messages = build_messages(
-                mode, history, user["content"], budget, attachments=files, instructions=current_instructions()
+                mode, history, user["content"], budget, attachments=files, instructions=current_instructions(),
+                sources_block=block,
             )
             now = db.utcnow()
             with db.transaction(conn):
@@ -1250,9 +1302,9 @@ def regenerate_answer(chat_id: int, percent: object = None) -> ChatStream:
                 if cur.rowcount != 1:
                     raise HTTPError(HTTPStatus.CONFLICT, "The chat changed meanwhile; reload it and try again")
                 new_id = conn.execute(
-                    "INSERT INTO messages (conversation_id, role, content, status, model, created_at) "
-                    "VALUES (?, 'assistant', '', 'streaming', ?, ?)",
-                    (chat_id, endpoint["model"], now),
+                    "INSERT INTO messages (conversation_id, role, content, status, model, created_at, sources) "
+                    "VALUES (?, 'assistant', '', 'streaming', ?, ?, ?)",
+                    (chat_id, endpoint["model"], now, json.dumps(sources, ensure_ascii=False) if sources else None),
                 ).lastrowid
                 conn.execute("UPDATE conversations SET updated_at = ? WHERE id = ?", (now, chat_id))
             return {
@@ -1349,7 +1401,9 @@ def post_delete(req: Request, chat_id: int) -> Response:
 @route("POST", r"/api/chats/(\d+)/messages")
 def post_message(req: Request, chat_id: int) -> StreamResponse:
     data = req.json(max_bytes=MAX_MESSAGE_BODY_BYTES)
-    return StreamResponse(start_answer(chat_id, data.get("content"), data.get("percent"), data.get("attachments")))
+    return StreamResponse(start_answer(
+        chat_id, data.get("content"), data.get("percent"), data.get("attachments"), data.get("collection_id"),
+    ))
 
 
 @route("POST", r"/api/chats/(\d+)/continue")
@@ -1361,7 +1415,7 @@ def post_continue(req: Request, chat_id: int) -> StreamResponse:
 @route("POST", r"/api/chats/(\d+)/regenerate")
 def post_regenerate(req: Request, chat_id: int) -> StreamResponse:
     data = req.json()
-    return StreamResponse(regenerate_answer(chat_id, data.get("percent")))
+    return StreamResponse(regenerate_answer(chat_id, data.get("percent"), data.get("collection_id")))
 
 
 @route("POST", r"/api/chats/(\d+)/stop")
