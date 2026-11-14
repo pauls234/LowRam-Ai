@@ -124,7 +124,7 @@ def ensure_static_dir(app_module: ModuleType) -> Path:
         }
         return fallback
     raise LauncherError(
-        f"The dashboard files are missing (looked in {current} and {fallback}). Please reinstall LowRAM AI."
+        f"Die Oberfläche von LowRAM AI fehlt (gesucht in {current} und {fallback}). Bitte installiere LowRAM AI neu."
     )
 
 
@@ -344,7 +344,7 @@ def wait_until_ready(port: int, timeout: float = READY_TIMEOUT_S) -> dict:
         if status is not None:
             return status
         if time.monotonic() >= deadline:
-            raise LauncherError(f"The local server did not answer within {timeout:g} seconds.")
+            raise LauncherError(f"Der lokale Server hat nicht innerhalb von {timeout:g} Sekunden geantwortet.")
         time.sleep(0.1)
 
 
@@ -368,9 +368,12 @@ def start_server(app_module: ModuleType, ports: Sequence[int]) -> Any:
     else:
         os.environ["LOWRAM_PORT"] = previous
     if len(ports) == 1:
-        raise LauncherError(f"Port {ports[0]} on {LOOPBACK} is used by another program. Choose another port.")
+        raise LauncherError(
+            f"Port {ports[0]} auf {LOOPBACK} wird von einem anderen Programm verwendet. Wähle einen anderen Port."
+        )
     raise LauncherError(
-        f"No free port between {ports[0]} and {ports[-1]} on {LOOPBACK}. Close other programs and try again."
+        f"Kein freier Port zwischen {ports[0]} und {ports[-1]} auf {LOOPBACK}. "
+        "Schließe andere Programme und versuche es erneut."
     )
 
 
@@ -421,7 +424,7 @@ def start_or_reuse(ports: Sequence[int], home: Path, ready_timeout: float = READ
     from backend import __version__, app, config  # imported late: logging is set up by now
 
     if config.HOST not in LOOPBACK_NAMES:
-        raise LauncherError(f"Refusing to serve on non-loopback address {config.HOST!r}.")
+        raise LauncherError(f"LowRAM AI läuft nur lokal; die Adresse {config.HOST!r} wird abgelehnt.")
     ensure_static_dir(app)
     server = start_server(app, ports)
     backend = Backend(server.server_address[1], server, app)
@@ -457,7 +460,7 @@ class Starter:
             if self.backend is not None:
                 return self.backend
             if self._closed:
-                raise LauncherError("LowRAM AI is shutting down.")
+                raise LauncherError("LowRAM AI wird beendet.")
             try:
                 self.backend = start_or_reuse(self.ports, self.home, self.ready_timeout)
             except Exception as exc:
@@ -478,7 +481,7 @@ def describe(exc: BaseException) -> str:
     if isinstance(exc, LauncherError):
         return str(exc)
     if isinstance(exc, OSError):
-        return f"System error: {exc.strerror or exc}"
+        return f"Systemfehler: {exc.strerror or exc}"
     return f"{type(exc).__name__}: {exc}"
 
 
@@ -576,12 +579,12 @@ def alert(message: str) -> None:
     """Native error dialog for a frozen app that has neither console nor window."""
     try:
         if sys.platform == "darwin":
-            script = 'on run argv\ndisplay alert "LowRAM AI could not start" message (item 1 of argv) as critical\nend run'
+            script = 'on run argv\ndisplay alert "LowRAM AI konnte nicht starten" message (item 1 of argv) as critical\nend run'
             subprocess.run(["osascript", "-e", script, message], timeout=600, check=False)
         elif os.name == "nt":
             import ctypes
 
-            ctypes.windll.user32.MessageBoxW(None, message, "LowRAM AI could not start", 0x10)
+            ctypes.windll.user32.MessageBoxW(None, message, "LowRAM AI konnte nicht starten", 0x10)
     except Exception:
         log.exception("Could not show the error dialog")
 
@@ -599,7 +602,7 @@ def _icon_data_uri() -> str:
 
 
 _PAGE = """<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><title>LowRAM AI</title>
+<html lang="de"><head><meta charset="utf-8"><title>LowRAM AI</title>
 <style>
 :root {{ color-scheme: light dark; --bg: #f5f5f4; --text: #1c1c1e; --muted: #6b6b70; --track: #e2e2e0; --bar: #6b6b70; }}
 @media (prefers-color-scheme: dark) {{
@@ -629,18 +632,19 @@ def splash_html() -> str:
     icon = _icon_data_uri()
     return _PAGE.format(
         icon=f'<img src="{icon}" alt="">' if icon else "",
-        body='<h1>LowRAM AI</h1><p>Starting your private AI studio&hellip;</p>'
-        '<div class="bar" role="progressbar" aria-label="Starting"></div>',
+        body='<h1>LowRAM AI</h1><p>Dein privates KI-Studio startet&hellip;</p>'
+        '<div class="bar" role="progressbar" aria-label="Startet"></div>',
     )
 
 
 def error_html(message: str, log_path: Path | None) -> str:
     icon = _icon_data_uri()
-    where = f'<p>Details are in the log file:<br><span class="detail">{escape(str(log_path))}</span></p>' if log_path else ""
+    where = (f'<p>Details stehen in der Protokolldatei:<br><span class="detail">{escape(str(log_path))}</span></p>'
+             if log_path else "")
     return _PAGE.format(
         icon=f'<img src="{icon}" alt="">' if icon else "",
-        body=f'<h1>LowRAM AI could not start</h1><p class="detail">{escape(message)}</p>{where}'
-        "<p>Close this window and open LowRAM AI again.</p>",
+        body=f'<h1>LowRAM AI konnte nicht starten</h1><p class="detail">{escape(message)}</p>{where}'
+        "<p>Schließe dieses Fenster und öffne LowRAM AI erneut.</p>",
     )
 
 
@@ -675,7 +679,7 @@ class DesktopApi:
         """Native open dialog -> absolute path or None; ``patterns`` like ``["*.gguf"]``."""
         allowed = [p for p in (patterns if isinstance(patterns, list) else []) if isinstance(p, str)
                    and _FILE_PATTERN.fullmatch(p)][:8] or ["*.gguf"]
-        return self._pick(self._open, (f"Supported files ({';'.join(allowed)})",))
+        return self._pick(self._open, (f"Unterstützte Dateien ({';'.join(allowed)})",))
 
     def _pick(self, dialog_type: Any, file_types: tuple) -> str | None:
         if self._window is None:
@@ -762,7 +766,111 @@ class SignalWatcher:
         self._writer.close()
 
 
-def run_window(starter: Starter, storage_dir: Path, log_path: Path | None) -> int | None:
+def keep_running_in_menu_bar() -> bool:
+    """``settings.desktop.keep_running_in_menu_bar`` (default true; any problem -> true)."""
+    try:
+        from backend import settings
+
+        value = settings.load().get("desktop", {}).get("keep_running_in_menu_bar", True)
+    except Exception:
+        log.debug("Could not read the desktop settings", exc_info=True)
+        return True
+    return value is not False
+
+
+def default_tray_factory(**kwargs: Any) -> Any:
+    """``desktop.tray.create`` or None; an import problem never stops the app."""
+    try:
+        from desktop import tray
+    except Exception as exc:
+        log.info("No menu-bar icon (%s)", exc)
+        return None
+    return tray.create(**kwargs)
+
+
+def _status_for(backend: Backend) -> Callable[[], str]:
+    def status() -> str:
+        from desktop import tray
+
+        return tray.status_line(backend.server)
+
+    return status
+
+
+class WindowController:
+    """Window + optional menu-bar icon: close-to-menu-bar, reopen, quit (thread-safe)."""
+
+    def __init__(self, window: Any, starter: Starter, tray_factory: Callable[..., Any] | None):
+        self.window = window
+        self.starter = starter
+        self.tray_factory = tray_factory
+        self.tray: Any = None
+        self.quitting = False
+        self._lock = threading.Lock()
+
+    def attach_tray(self, backend: Backend) -> None:
+        """Create the icon once the server runs in this process (never raises)."""
+        if self.tray_factory is None or not backend.owned:
+            return
+        try:
+            tray = self.tray_factory(on_open=self.show, on_quit=self.quit, status=_status_for(backend))
+        except Exception:
+            log.exception("Could not create the menu-bar icon; continuing without it")
+            return
+        with self._lock:
+            if self.quitting:
+                closing = tray
+            else:
+                self.tray, closing = tray, None
+        if closing is not None:
+            closing.close()
+        elif tray is not None:
+            log.info("Menu-bar icon active")
+            events = getattr(self.window, "events", None)
+            try:
+                events.closing += self.on_closing
+            except Exception:
+                log.info("Window close events unavailable; closing the window quits LowRAM AI")
+
+    def on_closing(self, *args: Any) -> bool:
+        """pywebview ``closing`` handler: False keeps the app running in the menu bar."""
+        with self._lock:
+            keep = self.tray is not None and not self.quitting
+        if not keep or not keep_running_in_menu_bar():
+            return True
+        log.info("Window hidden; LowRAM AI keeps running in the menu bar")
+        threading.Thread(target=self._call, args=("hide",), name="lowram-hide", daemon=True).start()
+        return False
+
+    def _call(self, name: str) -> None:
+        try:
+            getattr(self.window, name)()
+        except Exception:
+            log.exception("Window %s failed", name)
+
+    def show(self) -> None:
+        self._call("show")
+        with contextlib.suppress(Exception):
+            self.window.restore()
+
+    def close_tray(self) -> None:
+        with self._lock:
+            tray, self.tray = self.tray, None
+        if tray is not None:
+            tray.close()
+
+    def quit(self) -> None:
+        """Menu bar "Beenden": stop the server (and llama-server), then close the window."""
+        with self._lock:
+            self.quitting = True
+        log.info("Quit from the menu bar")
+        self.starter.close()
+        self.close_tray()
+        self._call("destroy")
+
+
+def run_window(starter: Starter, storage_dir: Path, log_path: Path | None,
+               tray_factory: Callable[..., Any] | None = default_tray_factory) -> int | None:
     """Show the native window until it is closed. None = no native web view (use the browser)."""
     try:
         import webview
@@ -792,6 +900,7 @@ def run_window(starter: Starter, storage_dir: Path, log_path: Path | None) -> in
     except Exception as exc:
         log.warning("Could not create the window (%s); using the browser", exc, exc_info=True)
         return None
+    controller = WindowController(window, starter, tray_factory)
 
     def boot() -> None:
         try:
@@ -801,11 +910,15 @@ def run_window(starter: Starter, storage_dir: Path, log_path: Path | None) -> in
             _call_window(window.load_html, error_html(describe(exc), log_path))
             return
         _call_window(window.load_url, backend.url)
+        controller.attach_tray(backend)
 
     gui_done = threading.Event()
 
     def on_signal(signum: int) -> None:
+        with controller._lock:
+            controller.quitting = True  # the closing handler must not hide the window now
         starter.close()  # stop the server and llama-server first, whatever the GUI does
+        controller.close_tray()
         try:
             window.destroy()
         except Exception:
@@ -826,6 +939,7 @@ def run_window(starter: Starter, storage_dir: Path, log_path: Path | None) -> in
     finally:
         gui_done.set()
         watcher.close()
+        controller.close_tray()
     log.info("Window closed")
     return EXIT_FAILED if starter.error else EXIT_OK
 
@@ -949,7 +1063,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             log.exception("LowRAM AI could not start")
         message = describe(exc)
-        say(f"LowRAM AI could not start: {message}\nDetails: {log_path}", err=True)
+        say(f"LowRAM AI konnte nicht starten: {message}\nDetails: {log_path}", err=True)
         if is_frozen():
             alert(f"{message}\n\nDetails: {log_path}")
         return EXIT_FAILED
