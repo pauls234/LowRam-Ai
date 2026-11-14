@@ -1264,6 +1264,23 @@ class SupervisorAndIdleTests(EngineTestCase):
             time.sleep(1.2)  # the late monitor must not restart the new server
             self.assertEqual(engine._manager.snapshot()["pid"], server["pid"])
 
+    def test_process_ended_while_another_thread_reaps(self):
+        """poll() says None while another thread holds Popen's waitpid lock – the process is still seen as dead."""
+        import sys
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        self.assertTrue(wait_until(lambda: gone(dead.pid), 10))
+        with mock.patch.object(dead, "poll", return_value=None):
+            self.assertTrue(engine._process_ended(dead))
+        dead.wait()
+        with mock.patch.object(dead, "poll", return_value=None):  # reaped already: the pid is gone
+            self.assertTrue(engine._process_ended(dead))
+        alive = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            self.assertFalse(engine._process_ended(alive))
+        finally:
+            alive.kill()
+            alive.wait()
+
     def test_no_restart_while_shutting_down_or_paused(self):
         mgr, proc = engine._manager, mock.Mock(returncode=-9)
         for case in ("shutdown", "pause", "normal"):

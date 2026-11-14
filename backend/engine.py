@@ -1919,6 +1919,23 @@ def _terminate(proc: subprocess.Popen) -> None:
             log.error("llama-server (pid %s) did not exit after SIGKILL", proc.pid)
 
 
+def _process_ended(proc: subprocess.Popen) -> bool:
+    """True once ``proc`` exited – also while another thread is just reaping it.
+
+    ``Popen.poll()`` answers ``None`` whenever a second thread holds Popen's internal waitpid lock (the
+    watch thread's ``wait`` loop), so a killed server could look alive for a moment and its dead URL
+    would be handed out. psutil sees the zombie, or the pid that is already gone.
+    """
+    if proc.poll() is not None:
+        return True
+    try:
+        return psutil.Process(proc.pid).status() == psutil.STATUS_ZOMBIE
+    except psutil.NoSuchProcess:  # includes ZombieProcess
+        return True
+    except psutil.Error:
+        return False
+
+
 def _exit_reason(code: int | None) -> str:
     if code is None:
         return "stopped"
@@ -1999,7 +2016,7 @@ class EngineManager:
         """
         with self._lock:
             proc, gen = self._proc, self._gen
-            dead = proc is not None and self._info["state"] == "ready" and proc.poll() is not None
+            dead = proc is not None and self._info["state"] == "ready" and _process_ended(proc)
         if dead:
             self._on_exit(proc, gen, log_path(), was_ready=True)
 
@@ -2172,6 +2189,11 @@ class EngineManager:
     def _on_exit(self, proc: subprocess.Popen, gen: int, path: Path, *, was_ready: bool = False) -> None:
         """The process ended without being stopped: restart it after a crash of a ready server, else error."""
         restart: tuple | None = None
+        if proc.returncode is None:  # seen dead by psutil; the exit code arrives once it is reaped
+            try:
+                proc.wait(1.0)
+            except subprocess.TimeoutExpired:
+                pass
         reason = _exit_reason(proc.returncode)
         with self._lock:
             if gen != self._gen:
@@ -2321,7 +2343,7 @@ class EngineManager:
                 state = self._info["state"]
                 if state == "ready" and self._url:
                     proc = self._proc
-                    if proc is not None and proc.poll() is not None:  # died a moment ago: wait for the restart
+                    if proc is not None and _process_ended(proc):  # died a moment ago: wait for the restart
                         self._on_exit(proc, self._gen, log_path(), was_ready=True)
                         continue
                     self._last_use = time.monotonic()

@@ -184,6 +184,18 @@ def _limit_error() -> LLMError:
     return LLMError(REQUEST_LIMIT_MESSAGE, transient=False)
 
 
+def _past_limit(state: dict) -> bool:
+    """The request reached ``MAX_REQUEST_S``: flagged by the watchdog, or measured from ``state["started"]``.
+
+    The socket timeout (at most ``MAX_REQUEST_S``) and the watchdog can fire at the same moment. When the
+    read fails first, the watchdog has not set its flag yet – the elapsed time still tells the truth.
+    """
+    if state.get("over_limit"):
+        return True
+    started = state.get("started")
+    return started is not None and time.monotonic() - started >= MAX_REQUEST_S
+
+
 def _start_watchdog(response, deadline: float, state: dict, lock: threading.Lock | None = None,
                     finished: threading.Event | None = None) -> threading.Timer:
     """Close ``response`` at ``deadline`` (``MAX_REQUEST_S`` after the request started) and mark ``state``."""
@@ -397,7 +409,8 @@ def _chat_plain(messages: list[dict], *, max_tokens: int, temperature: float, ur
         url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST"
     )
     _touch_engine(force=True)
-    started, state = time.monotonic(), {}
+    started = time.monotonic()
+    state: dict = {"started": started}
     try:
         with _opener(parsed.hostname).open(request, timeout=min(timeout, MAX_REQUEST_S)) as response:
             watchdog = _start_watchdog(response, started + MAX_REQUEST_S, state)
@@ -406,7 +419,7 @@ def _chat_plain(messages: list[dict], *, max_tokens: int, temperature: float, ur
             finally:
                 watchdog.cancel()
     except (OSError, http.client.HTTPException, ValueError) as exc:
-        if state.get("over_limit") or time.monotonic() - started >= MAX_REQUEST_S:
+        if _past_limit(state):
             raise _limit_error() from exc
         raise _request_error(exc, shown_url, timeout, api_key) from exc
     finally:
@@ -540,7 +553,7 @@ def _sse_fields(response, stop_event: threading.Event | None, outcome: dict) -> 
         try:
             line = response.readline(MAX_STREAM_LINE_BYTES + 1)
         except (OSError, http.client.HTTPException, ValueError) as exc:
-            if outcome.get("over_limit"):
+            if _past_limit(outcome):
                 raise _limit_error() from exc
             if stop_event is not None and stop_event.is_set():
                 return
@@ -582,7 +595,7 @@ def _read_json_answer(response, outcome: dict) -> str:
     try:
         raw = response.read(MAX_RESPONSE_BYTES + 1)
     except (OSError, http.client.HTTPException, ValueError) as exc:
-        if outcome.get("over_limit"):
+        if _past_limit(outcome):
             raise _limit_error() from exc
         if isinstance(exc, (TimeoutError, socket.timeout)):
             raise LLMError(f"The model endpoint did not answer within {outcome['timeout']:g} s",
@@ -724,7 +737,7 @@ def stream_chat(
         threading.Thread(
             target=_watch_stop, args=(stop_event, finished, lock, response), name="lowram-llm-stop", daemon=True
         ).start()
-    outcome: dict = {"complete": False, "timeout": timeout, "idle_timeout": idle_timeout}
+    outcome: dict = {"complete": False, "timeout": timeout, "idle_timeout": idle_timeout, "started": started}
     watchdog = _start_watchdog(response, started + MAX_REQUEST_S, outcome, lock, finished)
     try:
         content_type = (response.headers.get("Content-Type") or "").split(";")[0].strip().lower()
@@ -741,7 +754,7 @@ def stream_chat(
             for piece in _stream_deltas(response, stop_event, api_key, outcome):
                 visible.append(piece)
                 yield piece
-        if not outcome["complete"] and outcome.get("over_limit"):
+        if not outcome["complete"] and _past_limit(outcome):
             raise _limit_error()
         if stop_event is not None and stop_event.is_set():
             return

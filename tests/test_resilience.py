@@ -213,6 +213,23 @@ class TokenTimeoutTests(StreamCase):
         self.assertLess(time.monotonic() - started, 3)
         self.assertFalse(ctx.exception.transient)
 
+    def test_limit_is_reported_when_the_read_times_out_before_the_watchdog(self):
+        """macOS: the socket timeout can beat the watchdog thread – the elapsed time decides, not the order."""
+        self.timeouts(5, 5)
+        self.fake.push(Stream(["zu spät"], first_delay=8))
+        with mock.patch.object(llm, "MAX_REQUEST_S", 0.5), mock.patch.object(llm, "_start_watchdog") as watchdog:
+            with self.assertRaisesRegex(llm.LLMError, "Zeitlimit") as ctx:
+                llm.chat(MSGS)
+        self.assertTrue(watchdog.called)  # it never fired: only the read timeout ended the request
+        self.assertFalse(ctx.exception.transient)
+
+    def test_past_limit(self):
+        with mock.patch.object(llm, "MAX_REQUEST_S", 5.0):
+            self.assertTrue(llm._past_limit({"over_limit": True}))
+            self.assertTrue(llm._past_limit({"started": time.monotonic() - 6}))
+            self.assertFalse(llm._past_limit({"started": time.monotonic()}))
+            self.assertFalse(llm._past_limit({}))
+
     def test_connection_drop_is_transient(self):
         self.fake.push(Stream(["abc "], end=False))
         with self.assertRaisesRegex(llm.LLMError, "closed the connection") as ctx:

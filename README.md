@@ -176,7 +176,7 @@ What LowRAM AI does – and does not do – on your Mac:
 python3 -m unittest discover -s tests
 ```
 
-About 560 tests with fake model/image servers – no model or network needed.
+About 760 tests with fake model/image servers – no model or network needed.
 CI runs them on Ubuntu and macOS with Python 3.10–3.13; the release workflow
 builds the macOS and Windows apps on every `v*` tag.
 
