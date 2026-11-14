@@ -12,6 +12,11 @@ managed model was paused/stopped (image or video job) during the call -> 409.
 
 Repositories must be a folder inside the user's home directory, not in a
 hidden folder or ``~/Library``, and not the LowRAM AI data folder.
+
+Test & fix loop: the user saves a test command (``test-command``) and starts
+it explicitly (``run-tests``, 202, runs in the background, poll
+``test-runs/<rid>``); ``fix-tests`` turns a failed run into a step. Commands
+are only ever started by these user requests, never from model output.
 """
 
 from __future__ import annotations
@@ -23,7 +28,7 @@ from pathlib import Path
 from typing import Any
 
 from . import agent, chat, config, db, llm, memory
-from .web import HTTPError, Request, Response, route
+from .web import HTTPError, Request, Response, on_shutdown, on_startup, route
 
 MAX_REASON_CHARS = 500
 PAUSED_MESSAGE = "The model was paused for an image/video job – try again when it finishes"
@@ -131,7 +136,14 @@ def post_project(req: Request) -> Response:
 @route("GET", r"/api/coding/projects/(\d+)")
 def get_project(req: Request, project_id: int) -> Response:
     project = _coding_project(project_id)
-    return Response({"project": project, "tasks": [_task_view(t) for t in db.list_tasks(project_id)]})
+    return Response(
+        {
+            "project": project,
+            "tasks": [_task_view(t) for t in db.list_tasks(project_id)],
+            "test_command": agent.get_test_command(project_id),
+            "last_test_run": agent.latest_test_run(project_id),
+        }
+    )
 
 
 @route("POST", r"/api/coding/projects/(\d+)/plan")
@@ -200,3 +212,54 @@ def post_reject(req: Request, project_id: int, task_id: int) -> Response:
     reason = _optional_text(data, "reason", MAX_REASON_CHARS)
     _project_task(project_id, task_id)
     return Response({"task": _call(agent.reject, project_id, task_id, reason)})
+
+
+# --------------------------------------------------------------------------- test & fix loop
+
+
+@route("POST", r"/api/coding/projects/(\d+)/test-command")
+def post_test_command(req: Request, project_id: int) -> Response:
+    data = req.json()
+    _coding_project(project_id)
+    return Response({"command": _call(agent.set_test_command, project_id, data.get("command"))})
+
+
+@route("POST", r"/api/coding/projects/(\d+)/run-tests")
+def post_run_tests(req: Request, project_id: int) -> Response:
+    req.json()
+    _coding_project(project_id)
+    return Response({"run": _call(agent.start_test_run, project_id)}, HTTPStatus.ACCEPTED)
+
+
+@route("GET", r"/api/coding/projects/(\d+)/test-runs/(\d+)")
+def get_test_run(req: Request, project_id: int, run_id: int) -> Response:
+    _coding_project(project_id)
+    return Response({"run": agent.get_test_run(project_id, run_id)})
+
+
+@route("POST", r"/api/coding/projects/(\d+)/test-runs/(\d+)/cancel")
+def post_cancel_test_run(req: Request, project_id: int, run_id: int) -> Response:
+    req.json()
+    _coding_project(project_id)
+    return Response({"run": _call(agent.cancel_test_run, project_id, run_id)})
+
+
+@route("POST", r"/api/coding/projects/(\d+)/fix-tests")
+def post_fix_tests(req: Request, project_id: int) -> Response:
+    data = req.json()
+    _coding_project(project_id)
+    run_id = data.get("run_id")
+    if isinstance(run_id, bool) or not isinstance(run_id, int) or run_id < 1:
+        raise ValueError("'run_id' must be the id of a test run")
+    task_id = _call(agent.add_fix_tests_step, project_id, run_id)
+    return Response({"task_id": task_id}, HTTPStatus.CREATED)
+
+
+@on_startup
+def _recover_test_runs(server: object = None) -> None:
+    agent.recover_test_runs()
+
+
+@on_shutdown
+def _stop_test_runs(server: object = None) -> None:
+    agent.stop_test_runs()

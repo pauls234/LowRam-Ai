@@ -1,13 +1,14 @@
 import http.client
 import json
 import os
+import shutil
 import threading
 import types
 import unittest
 from unittest import mock
 
-from backend import app, chat, config, db
-from tests.helpers import HttpError, LowRAMTestCase, Text
+from backend import agent, app, chat, config, db
+from tests.helpers import HttpError, LowRAMTestCase, Text, wait_until
 
 TOKEN = "t"
 BUGGY = "def add(a, b):\n    return a - b\n"
@@ -268,6 +269,80 @@ class WorkflowTests(CodingApiTestCase):
             status, data = self.api("POST", f"/api/coding/projects/{pid}/plan")
         self.assertEqual(status, 200, data)
         self.assertEqual(len(started), 1)
+
+
+@unittest.skipUnless(os.name == "posix" and shutil.which("python3"), "needs python3 on PATH (POSIX)")
+class TestLoopApiTests(CodingApiTestCase):
+    def setUp(self):
+        super().setUp()
+        self.addCleanup(agent.stop_test_runs)
+
+    def finished_run(self, pid, rid):
+        def done():
+            status, data = self.api("GET", f"/api/coding/projects/{pid}/test-runs/{rid}")
+            self.assertEqual(status, 200, data)
+            return data["run"]["state"] != "running"
+
+        self.assertTrue(wait_until(done, 20), "test run did not finish")
+        return self.api("GET", f"/api/coding/projects/{pid}/test-runs/{rid}")[1]["run"]
+
+    def test_command_run_and_fix(self):
+        pid = self.new_project()
+        base = f"/api/coding/projects/{pid}"
+        status, data = self.api("POST", f"{base}/run-tests")
+        self.assertEqual(status, 409, data)  # no command saved yet
+        for bad in ("", "x" * 301, "python3 -c 1\nrm -rf ~", "/bin/sh -c id", "../evil", "no-such-program-xyz", 5, None):
+            with self.subTest(command=bad):
+                status, data = self.api("POST", f"{base}/test-command", {"command": bad})
+                self.assertEqual(status, 400, data)
+        command = "python3 -c \"import sys; print('calc.py: add is wrong'); sys.exit(2)\""
+        status, data = self.api("POST", f"{base}/test-command", {"command": command})
+        self.assertEqual((status, data), (200, {"command": command}))
+        status, data = self.api("GET", base)
+        self.assertEqual((data["test_command"], data["last_test_run"]), (command, None))
+
+        status, data = self.api("POST", f"{base}/run-tests", {})
+        self.assertEqual((status, data["run"]["state"]), (202, "running"), data)
+        run = self.finished_run(pid, data["run"]["id"])
+        self.assertEqual((run["state"], run["exit_code"], run["command"]), ("failed", 2, command))
+        self.assertIn("calc.py: add is wrong", run["output_tail"])
+        self.assertTrue(run["started_at"] and run["finished_at"])
+        self.assertEqual(self.api("GET", base)[1]["last_test_run"]["id"], run["id"])
+
+        for bad in ("1", True, 0, None):
+            with self.subTest(run_id=bad):
+                self.assertEqual(self.api("POST", f"{base}/fix-tests", {"run_id": bad})[0], 400)
+        self.assertEqual(self.api("POST", f"{base}/fix-tests", {"run_id": 9999})[0], 404)
+        status, data = self.api("POST", f"{base}/fix-tests", {"run_id": run["id"]})
+        self.assertEqual(status, 201, data)
+        task = self.api("GET", base)[1]["tasks"][-1]
+        self.assertEqual((task["id"], task["title"], task["status"]), (data["task_id"], "Fehlschlagende Tests beheben", "pending"))
+        self.assertEqual(task["step"]["files"], ["calc.py"])
+        self.assertIn(f"Testbefehl: {command}", task["step"]["detail"])
+        self.assertIn("Exit-Code: 2", task["step"]["detail"])
+        self.assertIn("calc.py: add is wrong", task["step"]["detail"])
+
+        self.api("POST", f"{base}/test-command", {"command": "python3 -c pass"})
+        rid = self.api("POST", f"{base}/run-tests")[1]["run"]["id"]
+        self.assertEqual(self.finished_run(pid, rid)["state"], "passed")
+        self.assertEqual(self.api("POST", f"{base}/fix-tests", {"run_id": rid})[0], 409)  # nothing to fix
+
+    def test_one_run_at_a_time_cancel_and_not_found(self):
+        pid = self.new_project()
+        other = self.new_project("Other")
+        base = f"/api/coding/projects/{pid}"
+        self.api("POST", f"{base}/test-command", {"command": "python3 -c \"import time; time.sleep(30)\""})
+        status, data = self.api("POST", f"{base}/run-tests")
+        self.assertEqual(status, 202, data)
+        rid = data["run"]["id"]
+        self.assertEqual(self.api("POST", f"{base}/run-tests")[0], 409)
+        self.assertEqual(self.api("GET", f"/api/coding/projects/{other}/test-runs/{rid}")[0], 404)
+        self.assertEqual(self.api("GET", f"{base}/test-runs/9999")[0], 404)
+        general = db.create_project("general", "general", tasks=[("t", "")])
+        self.assertEqual(self.api("POST", f"/api/coding/projects/{general}/run-tests")[0], 404)
+        status, data = self.api("POST", f"{base}/test-runs/{rid}/cancel")
+        self.assertEqual((status, data["run"]["state"], data["run"]["error"]), (200, "error", agent.CANCELLED_RUN))
+        self.assertEqual(self.api("POST", f"{base}/test-runs/{rid}/cancel")[0], 409)
 
 
 if __name__ == "__main__":
