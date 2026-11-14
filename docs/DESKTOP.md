@@ -76,6 +76,24 @@ python lowram.py app [--browser]         # same via the CLI
   `window.pywebview.api.pick_file(title, ["*.gguf"])`. Both open a native
   dialog and return an absolute path or `null` (cancelled). In the browser
   `window.pywebview` does not exist; the UI falls back to a text field.
+* Native texts (start screen, error page, error dialogs) are German.
+
+### Menu bar (macOS)
+
+When the window runs, a **LowRAM** item appears in the macOS menu bar
+(`desktop/tray.py`, an `NSStatusItem` built with pyobjc, which pywebview
+already installs; created on the main thread via `AppHelper.callAfter`):
+
+* **LowRAM AI öffnen** – shows the window again.
+* A read-only status line, refreshed every 3 s from the running server, e.g.
+  `Modell: bereit (qwen2.5-3b) · Aufgabe läuft`.
+* **Beenden** – clean shutdown (server, task loop, llama-server), then quit.
+
+With the menu-bar item present, closing the window only hides it and LowRAM
+AI keeps running (setting `desktop.keep_running_in_menu_bar`, default
+`true`; `false` = closing the window quits). The icon is optional: if pyobjc
+is missing or anything fails, this is logged and the app behaves as before
+(closing the window quits). Windows and Linux have no tray icon.
 
 ## Where things are
 

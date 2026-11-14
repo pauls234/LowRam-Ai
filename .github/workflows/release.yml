@@ -37,6 +37,7 @@ jobs:
           # every feature module must be in the bundle (they are imported by name)
           curl -fsS http://127.0.0.1:8799/api/status | python -c "import json, sys; from backend import app; s = json.load(sys.stdin); missing = set(app.FEATURE_MODULES) - set(s['features']); sys.exit(f'missing in the bundle: {sorted(missing)}' if missing else 0)"
           curl -fsS -o /dev/null http://127.0.0.1:8799/api/power
+          curl -fsS http://127.0.0.1:8799/api/diagnostics | python -c "import json, sys; d = json.load(sys.stdin); assert isinstance(d['checks'], list) and d['checks'] and isinstance(d['report'], str), d"
           curl -fsS http://127.0.0.1:8799/ | grep -q '<title>LowRAM AI'
           curl -fsS -o /dev/null http://127.0.0.1:8799/static/app.js
           kill -TERM "$pid"
@@ -87,6 +88,8 @@ jobs:
           $missing = $expected | Where-Object { $status.features -notcontains $_ }
           if ($missing) { Stop-Process -Id $proc.Id -Force; throw "Missing in the bundle: $missing" }
           Invoke-WebRequest -Uri http://127.0.0.1:8799/api/power -UseBasicParsing | Out-Null
+          $diag = Invoke-RestMethod -Uri http://127.0.0.1:8799/api/diagnostics -TimeoutSec 30
+          if (-not $diag.checks -or -not $diag.report) { Stop-Process -Id $proc.Id -Force; throw "Unexpected /api/diagnostics answer" }
           $index = Invoke-WebRequest -Uri http://127.0.0.1:8799/ -UseBasicParsing
           if ($index.Content -notmatch "<title>LowRAM AI") { throw "Unexpected index page" }
           Invoke-WebRequest -Uri http://127.0.0.1:8799/static/app.js -UseBasicParsing | Out-Null

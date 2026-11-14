@@ -25,6 +25,7 @@ DEFAULTS: dict[str, Any] = {
         "port": None,  # None = pick a free port
         "ctx_size": None,  # None = derive from the RAM budget
         "models_dir": None,  # None = <home>/models; or an absolute folder, e.g. on an external SSD
+        "profile": "auto",  # "auto" | "saver" | "fast" – llama-server tuning (KV cache, flash attention, context)
     },
     "media": {
         "image_model_id": None,
@@ -37,7 +38,21 @@ DEFAULTS: dict[str, Any] = {
         "device_name": None,
         "discoverable": True,  # announce this host on the LAN so helpers can find it without a code
     },
-    "ui": {"theme": "system"},
+    "ui": {
+        "theme": "system",
+        "check_updates": True,  # look for a newer release on GitHub (at most every 6 h)
+        "language": "auto",  # "auto" (browser language, German fallback) | "de" | "en"
+    },
+    "desktop": {
+        "keep_running_in_menu_bar": True,  # closing the window keeps LowRAM AI in the macOS menu bar
+    },
+    "resilience": {
+        "wait_for_ram_minutes": 30,  # a task loop waits this long for RAM to recover instead of stopping
+        "idle_unload_minutes": 15,  # unload the model after this much idle time to free RAM (0 = never)
+        "retry_transient": True,  # after an engine crash/restart, continue the interrupted task once
+        "first_token_timeout_s": 1800,  # slow machines: reading a long prompt can take many minutes
+        "idle_token_timeout_s": 300,  # no new token for this long → the request is considered stuck
+    },
     "chat": {
         "instructions": "",  # custom instructions added to every conversation (max 4000 chars)
     },

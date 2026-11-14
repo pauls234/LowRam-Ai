@@ -123,7 +123,7 @@ class PortTests(DesktopTestCase):
         self.addCleanup(busy.close)
         with self.assertRaises(launcher.LauncherError) as ctx:
             launcher.start_server(app, [busy.getsockname()[1]])
-        self.assertIn("used by another program", str(ctx.exception))
+        self.assertIn("anderen Programm verwendet", str(ctx.exception))
         self.assertNotIn("LOWRAM_PORT", os.environ)
 
     def test_port_argument_validation_and_finder_arguments(self):
@@ -247,7 +247,7 @@ class RunTests(DesktopTestCase):
 
         def create_window(title, **kw):
             calls.append(("create", title, kw["width"], kw["height"], kw["min_size"], kw["text_select"],
-                          "Starting" in kw["html"]))
+                          "startet" in kw["html"]))
             self.api = kw["js_api"]
             return FakeWindow()
 
@@ -312,8 +312,8 @@ class RunTests(DesktopTestCase):
             code = launcher.main(["--port", str(busy.getsockname()[1])])
         self.assertEqual(code, 1)
         self.assertEqual(len(pages), 1)
-        self.assertIn("could not start", pages[0])
-        self.assertIn("used by another program", pages[0])
+        self.assertIn("konnte nicht starten", pages[0])
+        self.assertIn("anderen Programm verwendet", pages[0])
         self.assertIn("app.log", pages[0])
 
     def test_no_native_webview_falls_back_to_browser(self):
@@ -380,10 +380,10 @@ class DesktopApiTests(unittest.TestCase):
         api, calls = self.make([model])
         self.assertEqual(api.pick_file("Import a model", ["*.gguf", "*.bin"]), model)
         self.assertEqual(calls[0], (10, {"directory": str(Path.home()), "allow_multiple": False,
-                                         "file_types": ("Supported files (*.gguf;*.bin)",)}))
+                                         "file_types": ("Unterstützte Dateien (*.gguf;*.bin)",)}))
         api.pick_file("x", ["evil);(*.*", "*.gguf;rm"])
         api.pick_file("x", "not-a-list")
-        self.assertEqual([c[1]["file_types"] for c in calls[1:]], [("Supported files (*.gguf)",)] * 2)
+        self.assertEqual([c[1]["file_types"] for c in calls[1:]], [("Unterstützte Dateien (*.gguf)",)] * 2)
 
     def test_dialog_errors_and_missing_window_give_none(self):
         api = launcher.DesktopApi(types.SimpleNamespace(OPEN_DIALOG=10, FOLDER_DIALOG=20))
@@ -462,6 +462,178 @@ class LoggingTests(DesktopTestCase):
             except RuntimeError:
                 sys.excepthook(*sys.exc_info())
         self.assertIn("Uncaught exception", logs.output[0])
+
+
+class _Hook:
+    """pywebview-style event: ``events.closing += handler``."""
+
+    def __init__(self):
+        self.handlers = []
+
+    def __iadd__(self, handler):
+        self.handlers.append(handler)
+        return self
+
+
+class FakeTray:
+    def __init__(self, on_open, on_quit, status):
+        self.on_open, self.on_quit, self.status = on_open, on_quit, status
+        self.closed = threading.Event()
+
+    def close(self):
+        self.closed.set()
+
+
+class TrayTests(DesktopTestCase):
+    def test_status_line_is_german_and_tolerant(self):
+        from desktop import tray
+
+        engine = types.SimpleNamespace(
+            external=lambda: False,
+            _manager=types.SimpleNamespace(snapshot=lambda: {"state": "ready", "model_id": "qwen"}))
+        media = types.SimpleNamespace(WORKER=types.SimpleNamespace(current_job_id=lambda: 7))
+        server = types.SimpleNamespace(loop=types.SimpleNamespace(status=lambda: {"active": True}))
+        line = tray.status_line(server, {"backend.engine": engine, "backend.media": media})
+        self.assertEqual(line, "Modell: bereit (qwen) · Aufgabe läuft · Bild/Video wird erstellt")
+        broken = types.SimpleNamespace(external=lambda: (_ for _ in ()).throw(RuntimeError("x")))
+        self.assertEqual(tray.status_line(None, {"backend.engine": broken}), "Keine laufende Aufgabe")
+        idle = types.SimpleNamespace(external=lambda: False,
+                                     _manager=types.SimpleNamespace(snapshot=lambda: {"state": "stopped"}))
+        self.assertEqual(tray.status_line(None, {"backend.engine": idle}), "Modell: aus · Keine laufende Aufgabe")
+
+    def test_create_is_optional(self):
+        from desktop import tray
+
+        self.assertIsNone(tray.create(lambda: None, lambda: None, str, platform="linux"))
+        self.assertIsNone(tray.create(lambda: None, lambda: None, str, platform="win32"))
+        # macOS without pyobjc: logged, no exception
+        with mock.patch.dict(sys.modules, {"PyObjCTools": None, "AppKit": None, "Foundation": None}):
+            self.assertIsNone(tray.create(lambda: None, lambda: None, str, platform="darwin"))
+
+    def test_tray_refresh_and_quit_off_the_gui_thread(self):
+        from desktop import tray
+
+        quit_threads = []
+        quit_done = threading.Event()
+
+        def on_quit():
+            quit_threads.append(threading.current_thread().name)
+            quit_done.set()
+
+        t = tray.Tray(lambda: None, on_quit, lambda: "Modell: bereit", refresh_s=0.01)
+        self.assertEqual(t.refresh(), "Modell: bereit")
+        t.status = lambda: 1 / 0
+        self.assertEqual(t.refresh(), "Status nicht verfügbar")
+        t.quit()
+        self.assertTrue(quit_done.wait(5))
+        self.assertEqual(quit_threads, ["lowram-tray-quit"])
+        t.start_refresher()
+        t.close()
+        t.close()  # idempotent
+
+    def _window(self, calls):
+        class FakeWindow:
+            events = types.SimpleNamespace(closing=_Hook())
+
+            def load_url(self, url):
+                calls.append("loaded")
+
+            def load_html(self, html):
+                calls.append("error page")
+
+            def hide(self):
+                calls.append("hide")
+
+            def show(self):
+                calls.append("show")
+
+            def restore(self):
+                calls.append("restore")
+
+            def destroy(self):
+                calls.append("destroy")
+
+        return FakeWindow()
+
+    def test_close_hides_to_menu_bar_and_quit_shuts_down(self):
+        port = free_port()
+        calls, trays = [], []
+        window = self._window(calls)
+
+        def factory(**kw):
+            trays.append(FakeTray(**kw))
+            return trays[-1]
+
+        def start(func, **kw):
+            func()
+            self.assertIn("Modell", trays[0].status())  # status line reads the in-process server
+            (handler,) = window.events.closing.handlers
+            self.assertIs(handler(), False)  # closing the window keeps the app running
+            for _ in range(100):
+                if "hide" in calls:
+                    break
+                threading.Event().wait(0.01)
+            self.assertTrue(answers(port))
+            trays[0].on_open()
+            trays[0].on_quit()  # "Beenden"
+            self.assertFalse(answers(port))
+            self.assertIs(handler(), True)  # the final close is not intercepted
+
+        fake = fake_webview(lambda title, **kw: window, start)
+        with mock.patch.dict(sys.modules, {"webview": fake}), \
+                mock.patch("desktop.launcher.default_tray_factory", factory), \
+                mock.patch("desktop.launcher.webbrowser.open", side_effect=AssertionError("no browser")):
+            starter = launcher.Starter([port], self.home)
+            code = launcher.run_window(starter, self.home / "webview", None, tray_factory=factory)
+            starter.close()
+        self.assertEqual(code, 0)
+        self.assertEqual(calls, ["loaded", "hide", "show", "restore", "destroy"])
+        self.assertTrue(trays[0].closed.is_set())
+        self.assertEqual(self.events, ["startup", "shutdown"])
+
+    def test_close_quits_when_setting_is_off_or_tray_missing(self):
+        port = free_port()
+        calls = []
+        window = self._window(calls)
+        trays = []
+
+        def start(func, **kw):
+            func()
+            (handler,) = window.events.closing.handlers
+            with mock.patch("desktop.launcher.keep_running_in_menu_bar", return_value=False):
+                self.assertIs(handler(), True)
+
+        fake = fake_webview(lambda title, **kw: window, start)
+        with mock.patch.dict(sys.modules, {"webview": fake}):
+            starter = launcher.Starter([port], self.home)
+            code = launcher.run_window(starter, self.home / "webview", None,
+                                       tray_factory=lambda **kw: trays.append(FakeTray(**kw)) or trays[-1])
+            starter.close()
+        self.assertEqual(code, 0)
+        self.assertTrue(trays[0].closed.is_set())
+
+        # a factory that fails or returns None: no handler, the app works as before
+        for factory in (lambda **kw: None, lambda **kw: 1 / 0):
+            window = self._window(calls)
+            fake = fake_webview(lambda title, **kw: window, lambda func, **kw: func())
+            with mock.patch.dict(sys.modules, {"webview": fake}):
+                starter = launcher.Starter([free_port()], self.home)
+                self.assertEqual(launcher.run_window(starter, self.home / "webview", None, tray_factory=factory), 0)
+                starter.close()
+            self.assertEqual(window.events.closing.handlers, [])
+
+    def test_keep_running_setting_defaults_to_true(self):
+        self.assertTrue(launcher.keep_running_in_menu_bar())
+        with mock.patch("backend.settings.load", return_value={"desktop": {"keep_running_in_menu_bar": False}}):
+            self.assertFalse(launcher.keep_running_in_menu_bar())
+        with mock.patch("backend.settings.load", side_effect=OSError("disk")):
+            self.assertTrue(launcher.keep_running_in_menu_bar())
+
+    def test_spec_bundles_tray_and_feature_modules(self):
+        spec = (REPO / "desktop" / "LowRAM-AI.spec").read_text("utf-8")
+        self.assertIn('"desktop.tray"', spec)
+        for name in app.FEATURE_MODULES:
+            self.assertIn(f'"{name}"', spec)
 
 
 if __name__ == "__main__":

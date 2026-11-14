@@ -823,6 +823,36 @@ class SmartChatApiTests(ChatApiTestCase):
         self.send(cid, "And again?").rest()
         self.assertIn("remember the milk", self.sent()[1]["content"])
 
+    def test_knowledge_sources_in_prompt_and_stored(self):
+        from backend import knowledge
+
+        coll = knowledge.create_collection("Handbuch")
+        knowledge.add_document(coll["id"], "auto.txt", "Der Ölwechsel ist alle 15000 Kilometer fällig.")
+        knowledge.add_document(coll["id"], "garten.md", "Tomaten brauchen Sonne.")
+        cid = self.new_chat()
+        events = self.send(cid, "Wann ist der Ölwechsel fällig?", collection_id=coll["id"]).rest()
+        expected = [{"document": "auto.txt", "document_id": 1, "snippet": "Der Ölwechsel ist alle 15000 Kilometer fällig."}]
+        self.assertEqual(events[0]["assistant_message"]["sources"], expected)
+        self.assertEqual(events[-1]["message"]["sources"], expected)
+        prompt = self.sent()[-1]["content"]
+        self.assertTrue(prompt.startswith("Wann ist der Ölwechsel fällig?"))
+        self.assertIn("Quellen", prompt)
+        self.assertIn("[1] auto.txt\nDer Ölwechsel ist alle 15000 Kilometer fällig.", prompt)
+        self.assertIn("[1], [2]", prompt)
+        self.assertNotIn("Tomaten", prompt)
+        stored = self.messages(cid)
+        self.assertEqual((stored[0]["sources"], stored[1]["sources"]), ([], expected))
+        # regenerate with the collection keeps sources; without one there are none
+        self.assertEqual(self.api("GET", f"/api/chats/{cid}")[0], 200)
+        events = SSEClient(self.port, f"/api/chats/{cid}/regenerate", {"collection_id": coll["id"]}).rest()
+        self.assertEqual(events[-1]["message"]["sources"], expected)
+        self.send(cid, "Danke").rest()
+        self.assertEqual(self.messages(cid)[-1]["sources"], [])
+        # errors before streaming
+        self.assertEqual(self.send(cid, "hi", collection_id=999).status, 404)
+        for bad in ("1", 0, True, 1.5):
+            self.assertEqual(self.send(cid, "hi", collection_id=bad).status, 400, bad)
+
     def test_attachment_only_message_large_body_and_errors(self):
         cid = self.new_chat()
         big = [{"name": f"f{i}.txt", "content": "z" * (200 * 1024)} for i in range(5)]  # > 1 MiB body
@@ -965,8 +995,8 @@ class MigrationTests(LowRAMTestCase):
         conn.close()
         chat._MIGRATED.discard(str(config.db_path()))
         message = chat.list_messages(1)[0]
-        self.assertEqual((message["content"], message["tokens"], message["truncated"], message["attachments"]),
-                         ("hi", None, False, []))
+        self.assertEqual((message["content"], message["tokens"], message["truncated"], message["attachments"],
+                          message["sources"]), ("hi", None, False, [], []))
         self.assertEqual(chat.list_conversations("HI")[0]["title"], "old")
 
 
