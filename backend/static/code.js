@@ -11,7 +11,7 @@
   const STATUS_TEXT = { pending: LR.t('Pending'), running: LR.t('Working'), done: LR.t('Done'), failed: LR.t('Failed'), proposed: LR.t('Needs review'), approved: LR.t('Applied'), rejected: LR.t('Rejected') };
   const MAX_DIFF_LINES = 3000;
   const ui = {};
-  const st = { projects: [], loaded: false, selected: null, detail: null, busy: null, review: null, tests: new Map(), testsMissing: false };
+  const st = { projects: [], loaded: false, selected: null, detail: null, busy: null, review: null, tests: new Map(), testsMissing: false, explored: new Map(), noAutoReview: false };
 
   /* ------------------------------------------------------------ diff viewer */
 
@@ -136,10 +136,14 @@
       const data = await LR.get('/api/coding/projects/' + encodeURIComponent(id));
       if (id !== st.selected) return;
       st.detail = { project: data.project, tasks: Array.isArray(data.tasks) ? data.tasks : [] };
+      const p = data.project || {};
+      st.detail.tests = 'test_command' in data || 'test_command' in p
+        ? { command: LR.str('test_command' in data ? data.test_command : p.test_command), last: data.last_test_run || null }
+        : null;
       renderDetail();
       // Reopening a project with an open proposal shows it again right away.
       const open = st.detail.tasks.find((t) => t.status === 'proposed');
-      if (open && !ui.reviewSlot.childElementCount && st.autoReview !== id + ':' + open.id) {
+      if (open && !st.noAutoReview && !ui.reviewSlot.childElementCount && st.autoReview !== id + ':' + open.id) {
         st.autoReview = id + ':' + open.id;
         review(open);
       }
@@ -286,7 +290,8 @@
     } finally {
       st.busy = null;
       if (ui.stopTimer) { ui.stopTimer(); ui.stopTimer = null; }
-      await loadDetail();
+      st.noAutoReview = true;
+      try { await loadDetail(); } finally { st.noAutoReview = false; }
       loadProjects().catch(() => {});
       LR.refreshStatus();
     }
@@ -351,7 +356,10 @@
       return;
     }
     if (result.status === 'proposed') {
+      if (Array.isArray(result.explored_files)) st.explored.set(result.task_id, result.explored_files);
+      st.autoReview = pid + ':' + result.task_id;
       showProposal(pid, result.task_id, {
+        explored: result.explored_files,
         step: result.step,
         summary: result.summary,
         diff: result.diff,
@@ -361,7 +369,7 @@
       });
     } else if (result.status === 'failed') {
       const errors = Array.isArray(result.errors) ? result.errors : [result.error || LR.t('Unknown error')];
-      showOutcome(LR.callout({ tone: 'error', role: 'alert', title: LR.t('The proposal was rejected by the safety checks'), text: errors.join(' · '), extra: h('p', { class: 'muted small', text: LR.t('Nothing was written. You can run the step again or reword it.') }) }));
+      showOutcome(LR.callout({ tone: 'error', role: 'alert', title: LR.t('The proposal was rejected by the safety checks'), text: errors.join(' · '), extra: h('div', null, [exploredLine(result.explored_files), h('p', { class: 'muted small', text: LR.t('Nothing was written. You can run the step again or reword it.') })]) }));
     } else if (result.status === 'paused') {
       showOutcome(LR.callout({ tone: 'warn', title: LR.t('Paused – not enough free memory'), text: LR.str(result.reason) }));
     } else if (result.status === 'empty') {
@@ -379,6 +387,7 @@
       const p = data.proposal || {};
       const changes = Array.isArray(p.changes) ? p.changes : [];
       showProposal(st.selected, task.id, {
+        explored: Array.isArray(p.explored_files) ? p.explored_files : st.explored.get(task.id),
         step: p.step || task.title,
         summary: p.summary,
         diff: p.diff,
@@ -390,6 +399,13 @@
     } catch (err) {
       ui.reviewSlot.replaceChildren(LR.callout({ tone: 'error', title: LR.t('Could not load the proposal'), text: err.message, role: 'alert' }));
     }
+  }
+
+  /** "Looked at: a.py, b.py" – files the model asked to read during the step. */
+  function exploredLine(files) {
+    const list = Array.isArray(files) ? files.filter((f) => typeof f === 'string' && f) : [];
+    if (!list.length) return null;
+    return h('p', { class: 'explored muted small' }, [icon('eye'), h('span', { text: LR.t('Looked at: {files}', { files: list.join(', ') }) })]);
   }
 
   function showProposal(pid, taskId, p) {
@@ -408,6 +424,7 @@
         LR.badge(LR.t('Not applied yet'), 'warn'),
       ]),
       p.summary ? h('p', { class: 'proposal-summary', text: p.summary }) : null,
+      exploredLine(p.explored),
       attention.size ? LR.callout({ tone: 'warn', title: LR.t('Look closely at flagged files'), text: LR.t('These files can run code or change how the project is built: ') + [...attention].join(', ') }) : null,
       warnings.length ? LR.callout({ tone: 'warn', title: LR.t('Warnings'), text: warnings.join(' ') }) : null,
       diffView(p.diff, attention, actions),
@@ -516,7 +533,8 @@
   /** Shown when the backend stores a test command per project (`test_command` in the project). */
   function renderTests(project) {
     const slot = ui.testsSlot;
-    if (!project || !('test_command' in project) || st.testsMissing) {
+    const tests = st.detail && st.detail.tests;
+    if (!project || !tests || st.testsMissing) {
       slot.replaceChildren();
       slot.hidden = true;
       ui.testsFor = null;
@@ -525,7 +543,13 @@
     slot.hidden = false;
     const pid = project.id;
     const t = testState(pid);
-    if (t.savedCommand === undefined) t.savedCommand = LR.str(project.test_command);
+    if (t.savedCommand === undefined) t.savedCommand = tests.command;
+    // Show the last run when the project opens (and pick up runs started elsewhere).
+    const last = tests.last;
+    if (last && LR.isNum(last.id) && (!t.run || (LR.isNum(t.run.id) && last.id > t.run.id))) {
+      t.run = last;
+      if (last.state === 'running') pollRun(pid);
+    }
     if (ui.testsFor !== pid) {
       ui.testsFor = pid;
       const cmd = h('input', { class: 'input mono', type: 'text', maxlength: '300', spellcheck: 'false', autocomplete: 'off', placeholder: LR.t('e.g. pytest -q') });
@@ -566,7 +590,8 @@
     const out = [];
     if (t.error) out.push(LR.callout({ tone: 'error', role: 'alert', title: LR.t('Could not run the tests'), text: t.error }));
     if (run) {
-      const state = RUN_STATE[run.state] || ['info', LR.str(run.state)];
+      const cancelled = run.state === 'error' && /cancel/i.test(LR.str(run.error));
+      const state = cancelled ? ['warn', 'Test run cancelled'] : RUN_STATE[run.state] || ['info', LR.str(run.state)];
       const meta = [
         LR.isNum(run.exit_code) ? LR.t('exit code {n}', { n: run.exit_code }) : '',
         run.started_at && run.finished_at ? fmt.duration((fmt.parseTime(run.finished_at) - fmt.parseTime(run.started_at)) / 1000) : '',
@@ -575,7 +600,10 @@
         run.state === 'running' ? LR.spinner() : icon(run.state === 'passed' ? 'check' : 'alert'),
         h('span', { class: 'strong', text: LR.t(state[1]) }),
         meta ? h('span', { class: 'muted small', text: meta }) : null,
+        run.state === 'running' && LR.isNum(run.id) ? LR.button({ text: LR.t('Cancel'), icon: 'stop', size: 'sm', variant: 'secondary', cls: 'tests-cancel', disabled: Boolean(t.cancelling), onclick: (ev) => cancelRun(pid, run.id, ev.currentTarget) }) : null,
       ]));
+      if (run.command) out.push(h('p', { class: 'muted small tests-cmd' }, [h('span', { text: LR.t('Command:') + ' ' }), h('code', { text: LR.str(run.command) })]));
+      if (run.error && run.state !== 'running') out.push(h('p', { class: 'small tests-error', text: runErrorText(run.error) }));
       if (run.output_tail) out.push(h('pre', { class: 'tests-output', tabindex: '0', 'aria-label': LR.t('Test output (last lines)'), text: LR.str(run.output_tail) }));
       if (run.state === 'failed' || run.state === 'timeout') {
         out.push(h('div', { class: 'row-actions' }, [LR.button({
@@ -590,6 +618,29 @@
     ui.testsRun.replaceChildren(...out);
     const pre = ui.testsRun.querySelector('.tests-output');
     if (pre) pre.scrollTop = pre.scrollHeight;
+  }
+
+  function runErrorText(error) {
+    const e = LR.str(error);
+    if (/^cancelled by the user/i.test(e)) return LR.t('You cancelled the test run.');
+    if (/^interrupted: LowRAM AI stopped/i.test(e)) return LR.t('Interrupted: LowRAM AI was closed during the test run.');
+    return e;
+  }
+
+  async function cancelRun(pid, runId, btn) {
+    const t = testState(pid);
+    t.cancelling = true;
+    LR.setBusy(btn, true, LR.t('Cancelling…'));
+    try {
+      const data = await LR.post('/api/coding/projects/' + pid + '/test-runs/' + encodeURIComponent(runId) + '/cancel', {});
+      if (data.run) t.run = data.run;
+    } catch (err) {
+      if (err.status !== 409) t.error = err.message; // 409: it had just finished
+    } finally {
+      t.cancelling = false;
+      renderTestRun(pid);
+      pollRun(pid);
+    }
   }
 
   function testsMissing() {
@@ -631,6 +682,11 @@
     } catch (err) {
       if (LR.isMissingRoute(err)) { testsMissing(); return; }
       t.error = err.message;
+      if (err.status === 409) {
+        t.starting = false;
+        await loadDetail();
+        if (t.run && t.run.state === 'running') t.error = null;
+      }
     } finally {
       t.starting = false;
       renderTestRun(pid);

@@ -1135,6 +1135,11 @@
     'Adding a step…': 'Schritt wird hinzugefügt…',
     'New step: fix the failing tests': 'Neuer Schritt: fehlschlagende Tests beheben',
     'Run it like any other step and review the proposed change. Then run the tests again.': 'Führe ihn wie jeden anderen Schritt aus und prüfe die vorgeschlagene Änderung. Danach die Tests erneut ausführen.',
+    'Test run cancelled': 'Testlauf abgebrochen',
+    'Command:': 'Befehl:',
+    'You cancelled the test run.': 'Du hast den Testlauf abgebrochen.',
+    'Interrupted: LowRAM AI was closed during the test run.': 'Unterbrochen: LowRAM AI wurde während des Testlaufs beendet.',
+    'Looked at: {files}': 'Hat sich angesehen: {files}',
   };
 
   const NOUNS_DE = {
