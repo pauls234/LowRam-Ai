@@ -1463,6 +1463,13 @@ a.kb-row:hover { background: var(--surface-2); }
   font: 12.5px/1.55 var(--font-mono); white-space: pre-wrap; overflow-wrap: anywhere; max-height: 320px; overflow: auto;
 }
 
+.tests-cancel { margin-left: auto; }
+.tests-cmd { margin: 0; display: flex; gap: 6px; align-items: baseline; flex-wrap: wrap; }
+.tests-cmd code { font-size: 12.5px; overflow-wrap: anywhere; }
+.tests-error { margin: 0; color: var(--text-2); overflow-wrap: anywhere; }
+.explored { display: flex; align-items: center; gap: 6px; margin: 8px 0 0; overflow-wrap: anywhere; }
+.explored .icon { width: 14px; height: 14px; flex: none; }
+
 @media (max-width: 640px) {
   .composer-bar { flex-wrap: wrap; row-gap: 6px; }
   .switch-row { flex-wrap: wrap; row-gap: 10px; }
