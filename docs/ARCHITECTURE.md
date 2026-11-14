@@ -242,6 +242,23 @@ would have a different certificate and therefore a different number.
 * `GET /api/power` → `{battery, keep_awake: {enabled, active: [reasons]}, settings}`.
 * Integration: task loop (stop reason `"on_battery"`, notification when finished), media jobs (wait while on low battery, notification when done), device worker (no claims on low battery), cluster host (notification on pairing request and when a merged result is ready).
 
+### Polish round v0.3.1 (binding)
+
+**Diagnostics + updates (`diagnostics.py`)**
+* `GET /api/diagnostics` -> `{checks: [{id, title, status: "ok"|"warn"|"fail", detail, hint}], report: str}`; checks: engine runtime installed/version, model available (external drive!), llama-server health, RAM/disk free, models folder writable, media runtime, LAN (Devices listener, discovery port bound, openssl present), Python/platform/app version. `report` = plain-text copyable summary WITHOUT secrets/paths of user content (home dir shown as `~`).
+* `POST /api/diagnostics/selftest {}` -> runs a tiny chat completion against the running model ("Antworte mit OK") and returns `{ok, seconds, tokens_per_s, error}`.
+* `GET /api/update` -> `{current, latest: str|null, url: str|null, available: bool, checked: bool, error: str|null}`: checks `https://api.github.com/repos/pauls234/LowRam-Ai/releases/latest` (https only, allow-list api.github.com, 5 s timeout, cached 6 h, `settings.ui.check_updates` default true, repo constant in one place). A private repo answers 404 unauthenticated -> `checked: false` and NO error shown to the user (silent); never send tokens.
+
+**Knowledge base (`knowledge.py`, local documents for chat)**
+* Tables via db.register_schema: collections(id,name,created_at), documents(id,collection_id,name,chars,created_at), chunks(id,document_id,position,text); pure-Python BM25 search (no new deps), chunks ~800 chars with 100 overlap.
+* `GET /api/knowledge` -> `{collections: [{id, name, documents: n, chars}]}`; `POST /api/knowledge {name}` -> 201; `POST /api/knowledge/<id>/documents {name, content}` (text/markdown/code; also base64 `pdf` is NOT supported) <= 2 MB each, <= 200 documents per collection; `GET /api/knowledge/<id>`; `POST /api/knowledge/<id>/documents/<doc_id>/delete`; `POST /api/knowledge/<id>/delete`.
+* `POST /api/knowledge/<id>/search {query, k?}` -> `{results: [{document, text, score}]}`.
+* Chat: `POST /api/chats/<id>/messages` accepts `collection_id`; the top chunks (within the context budget) are added to the prompt as "Quellen" with document names; the assistant message stores `sources: [{document, snippet}]` (Message.sources) and the UI shows them under the answer.
+
+**German UI + menu bar**: UI strings in German (`backend/static/i18n.js`: `LR.t(key)` with de/en dictionaries, language from `settings.ui.language` = "auto"|"de"|"en", default "auto" -> browser language, German fallback); system prompts tell the model to answer in the user's language, default German. Menu-bar/tray icon in `desktop/` (open window, status, quit) must be optional (never crash the app if the tray library is missing).
+
+**Models**: catalog gets `default_for: ["chat"|"code"|"general"]` hints; on first run with purpose "coding" the wizard recommends a Coder model that fits; catalog install failure "file not found" triggers self-healing: look up the repo tree via the HF API and offer the best matching Q4_K_M GGUF file (`POST /api/engine/models/<id>/install` returns 409 `{suggestion: {filename, size_bytes}}`, UI offers one-click retry with `{filename}`).
+
 ### Desktop (`desktop/launcher.py`)
 
 `main(argv) -> int`: pick a port (prefer 8765), `app.start_background(port)`,
