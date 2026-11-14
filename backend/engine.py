@@ -35,7 +35,7 @@ import urllib.error
 import urllib.request
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from http import HTTPStatus
 from pathlib import Path
 from typing import Any
@@ -112,6 +112,7 @@ class CatalogEntry:
     files: tuple[str, ...] = ()  # all parts of a split model, the first is loaded; () = (filename,)
     local_path: str | None = None  # imported models: where the file lives (never copied or deleted)
     revision: str = "main"
+    default_for: tuple[str, ...] = ()  # hints for first-run wizards: "chat" | "code" | "general"
 
     @property
     def all_files(self) -> tuple[str, ...]:
@@ -172,7 +173,22 @@ CATALOG: tuple[CatalogEntry, ...] = (
         "Apache-2.0", "High-quality coding model for machines with 24 GB RAM or more.", 80,
     ),
 )
+# Which tasks a catalog model is a good default for (the wizard picks the best one that fits).
+DEFAULT_FOR: dict[str, tuple[str, ...]] = {
+    "qwen2.5-0.5b-instruct": ("chat",),
+    "qwen2.5-1.5b-instruct": ("chat", "general"),
+    "qwen2.5-coder-1.5b-instruct": ("code",),
+    "phi-3.5-mini-instruct": ("general",),
+    "qwen3-4b": ("chat", "general"),
+    "qwen2.5-7b-instruct": ("chat", "general"),
+    "qwen2.5-coder-7b-instruct": ("code",),
+    "qwen3-8b": ("general",),
+    "qwen2.5-14b-instruct": ("chat", "general"),
+    "qwen2.5-coder-14b-instruct": ("code",),
+}
+CATALOG = tuple(replace(entry, default_for=DEFAULT_FOR.get(entry.id, ())) for entry in CATALOG)
 _BY_ID = {entry.id: entry for entry in CATALOG}
+PURPOSES = ("chat", "code")
 
 
 def all_entries() -> list[CatalogEntry]:
@@ -202,10 +218,17 @@ def model_fits(entry: CatalogEntry, total_bytes: int) -> bool:
     return entry.min_ram_gb * GIB <= total_bytes and entry.size_bytes <= total_bytes * (1 - RAM_HEADROOM)
 
 
-def recommended_model_id(total_bytes: int | None = None) -> str:
-    """Best chat model that fits this machine's RAM with ~40 % headroom."""
+def normalize_purpose(purpose: object) -> str:
+    """``"code"``/``"coding"`` -> ``"code"``; anything else -> ``"chat"``."""
+    return "code" if isinstance(purpose, str) and purpose.strip().lower() in ("code", "coding") else "chat"
+
+
+def recommended_model_id(total_bytes: int | None = None, purpose: str | None = None) -> str:
+    """Best catalog model for ``purpose`` (default chat; "code"/"coding" -> a Coder model) that
+    fits this machine's RAM with ~40 % headroom; the smallest one when none fits."""
     total = total_ram() if total_bytes is None else total_bytes
-    chat = [entry for entry in CATALOG if entry.purpose == "chat"]
+    wanted = normalize_purpose(purpose)
+    chat = [entry for entry in CATALOG if entry.purpose == wanted]
     fits = [entry for entry in chat if model_fits(entry, total)]
     if not fits:
         return min(chat, key=lambda e: e.size_bytes).id
@@ -271,13 +294,15 @@ def model_dict(entry: CatalogEntry, total: int | None = None, recommended: str |
         "license": entry.license, "description": entry.description, "source": entry.source,
         "path": str(model_path(entry)) if entry.source != "catalog" or available else None,
         "available": available, "fits_ram": model_fits(entry, total),
+        "default_for": list(entry.default_for),
     }
 
 
-def catalog() -> list[dict]:
-    """Built-in catalog plus the user's own models. Never fails because a drive is unplugged."""
+def catalog(purpose: str | None = None) -> list[dict]:
+    """Built-in catalog plus the user's own models. Never fails because a drive is unplugged.
+    ``recommended`` marks the best model for ``purpose`` (default chat)."""
     total = total_ram()
-    recommended = recommended_model_id(total)
+    recommended = recommended_model_id(total, purpose)
     return [model_dict(entry, total, recommended) for entry in all_entries()]
 
 
@@ -516,39 +541,106 @@ def install_runtime() -> dict:
 # --------------------------------------------------------------------------- model install / delete
 
 
-def _hf_file_meta(entry: CatalogEntry) -> tuple[str, int]:
-    """``(sha256, size)`` of the catalog file from the Hugging Face API."""
+class ModelFileMissing(EngineError):
+    """The catalog file is not in the Hugging Face repo; ``suggestion`` is a file that is."""
+
+    def __init__(self, message: str, suggestion: dict):
+        super().__init__(message, HTTPStatus.CONFLICT)
+        self.suggestion = suggestion
+
+
+# Order in which quantizations replace a missing Q4_K_M file (closest quality/size first).
+QUANT_PREFERENCE = ("Q4_K_M", "Q4_K_S", "Q4_0", "Q5_K_M", "Q5_K_S", "Q4_K_L", "IQ4_XS", "IQ4_NL",
+                    "Q3_K_L", "Q3_K_M", "Q5_0", "Q6_K", "Q3_K_S", "Q8_0", "Q2_K")
+
+
+def suggest_file(entry: CatalogEntry, items: list[dict], total_bytes: int | None = None) -> dict | None:
+    """Best replacement GGUF in a repo tree: a Q4_K_M file, else the closest quant that fits the RAM.
+
+    Only single-file models with a SHA-256 qualify (installs are always verified).
+    """
+    total = total_ram() if total_bytes is None else total_bytes
+    limit = total * (1 - RAM_HEADROOM)
+    candidates = [g for g in gguf_groups(items) if len(g["parts"]) == 1 and g["parts"][0]["sha256"]]
+    fitting = [g for g in candidates if g["size_bytes"] <= limit]
+    if not fitting:
+        return None
+
+    def closeness(g: dict) -> tuple:
+        quant = (g["quant"] or "").upper()
+        order = QUANT_PREFERENCE.index(quant) if quant in QUANT_PREFERENCE else len(QUANT_PREFERENCE)
+        return order, abs(g["size_bytes"] - entry.size_bytes), g["filename"]
+
+    best = min(fitting, key=closeness)
+    return {"filename": best["filename"], "size_bytes": best["size_bytes"]}
+
+
+def _hf_catalog_tree(entry: CatalogEntry) -> list[dict]:
+    """All items of the catalog repo's file list (paginated)."""
     url: str | None = HF_TREE_URL.format(repo=entry.repo)
+    items: list[dict] = []
     try:
         for _page in range(MAX_HF_PAGES):
             if url is None:
                 break
-            items, url = downloads.fetch_json_with_next(url)
-            if not isinstance(items, list):
+            page, url = downloads.fetch_json_with_next(url)
+            if not isinstance(page, list):
                 raise EngineError("Hugging Face returned an unexpected file list", HTTPStatus.BAD_GATEWAY)
-            for item in items:
-                if isinstance(item, dict) and item.get("path") == entry.filename:
-                    lfs = item.get("lfs") if isinstance(item.get("lfs"), dict) else {}
-                    sha, size = lfs.get("oid"), lfs.get("size")
-                    if (
-                        isinstance(sha, str) and downloads.SHA256_RE.fullmatch(sha)
-                        and isinstance(size, int) and not isinstance(size, bool) and size > 0
-                    ):
-                        return sha.lower(), size
-                    raise EngineError(
-                        f"Hugging Face reports no SHA-256 for {entry.filename}; refusing an unverified download",
-                        HTTPStatus.BAD_GATEWAY,
-                    )
+            items.extend(item for item in page if isinstance(item, dict))
     except downloads.DownloadError as exc:
         raise EngineError(f"Could not read the model details from Hugging Face: {exc}", HTTPStatus.BAD_GATEWAY) from None
+    return items
+
+
+def _hf_file_meta(entry: CatalogEntry, filename: str | None = None) -> tuple[str, int]:
+    """``(sha256, size)`` of the catalog file (or ``filename`` of the same repo) from the Hugging Face API.
+
+    Raises :class:`ModelFileMissing` (409 + suggestion) when the catalog file is gone from the repo.
+    """
+    target = filename or entry.filename
+    items = _hf_catalog_tree(entry)
+    for item in items:
+        if item.get("path") == target and item.get("type", "file") == "file":
+            lfs = item.get("lfs") if isinstance(item.get("lfs"), dict) else {}
+            sha, size = lfs.get("oid"), lfs.get("size")
+            if (
+                isinstance(sha, str) and downloads.SHA256_RE.fullmatch(sha)
+                and isinstance(size, int) and not isinstance(size, bool) and size > 0
+            ):
+                return sha.lower(), size
+            raise EngineError(
+                f"Hugging Face reports no SHA-256 for {target}; refusing an unverified download",
+                HTTPStatus.BAD_GATEWAY,
+            )
+    if filename is not None:
+        raise EngineError(f"{filename} is not a file of {entry.repo} on Hugging Face", HTTPStatus.BAD_REQUEST)
+    suggestion = suggest_file(entry, items)
+    if suggestion is not None:
+        raise ModelFileMissing(
+            f"{entry.filename} was not found in {entry.repo} on Hugging Face; "
+            f"{suggestion['filename']} is available instead",
+            suggestion,
+        )
     raise EngineError(f"{entry.filename} was not found in {entry.repo} on Hugging Face", HTTPStatus.BAD_GATEWAY)
 
 
-def _model_installed(entry: CatalogEntry, sha256: str, size: int) -> Callable[[Path], None]:
+def _clean_install_filename(filename: object) -> str | None:
+    if filename is None:
+        return None
+    if not isinstance(filename, str) or len(filename) > 400 or not filename.lower().endswith(".gguf"):
+        raise EngineError("filename must be a .gguf file of the model's repository", HTTPStatus.BAD_REQUEST)
+    parts = filename.split("/")
+    if not all(HF_PATH_PART_RE.fullmatch(p) for p in parts) or SPLIT_RE.match(parts[-1]):
+        raise EngineError("filename must be a single .gguf file of the model's repository", HTTPStatus.BAD_REQUEST)
+    return filename
+
+
+def _model_installed(entry: CatalogEntry, sha256: str, size: int,
+                     filename: str | None = None) -> Callable[[Path], None]:
     def finish(path: Path) -> None:
         artifacts.write_json_atomic(
             _sidecar(entry),
-            {"id": entry.id, "repo": entry.repo, "filename": entry.filename, "sha256": sha256,
+            {"id": entry.id, "repo": entry.repo, "filename": filename or entry.filename, "sha256": sha256,
              "size_bytes": size, "installed_at": db.utcnow()},
         )
         if entry.purpose == "chat" and not settings.get("engine", "model_id"):
@@ -557,8 +649,13 @@ def _model_installed(entry: CatalogEntry, sha256: str, size: int) -> Callable[[P
     return finish
 
 
-def install_model(model_id: str) -> dict:
+def install_model(model_id: str, filename: object = None) -> dict:
+    """Download a catalog model. ``filename`` (from a 409 suggestion) picks another GGUF file of
+    the same repo; it is stored under the catalog file name so the entry finds it."""
     entry = get_entry(model_id)
+    chosen = _clean_install_filename(filename)
+    if chosen == entry.filename:
+        chosen = None
     if entry.source != "catalog":
         raise EngineError(f"{entry.name} is already one of your models")
     job_id = f"model-{entry.id}"
@@ -569,11 +666,11 @@ def install_model(model_id: str) -> dict:
         raise EngineError(f"{entry.name} is already installed")
     _not_moving()
     _require_models_dir()
-    sha256, size = _hf_file_meta(entry)
-    url = HF_RESOLVE_URL.format(repo=entry.repo, filename=quote(entry.filename))
+    sha256, size = _hf_file_meta(entry, chosen)
+    url = HF_RESOLVE_URL.format(repo=entry.repo, filename=quote(chosen or entry.filename))
     return downloads.start(
         job_id, url, model_path(entry), sha256=sha256, size=size, label=entry.name, kind="model",
-        on_complete=_model_installed(entry, sha256, size),
+        on_complete=_model_installed(entry, sha256, size, chosen),
     )
 
 
@@ -1710,7 +1807,12 @@ def route_status(req: Request) -> Response:
 @route("GET", r"/api/engine/catalog")
 @_api
 def route_catalog(req: Request) -> Response:
-    return Response({"models": catalog(), "ram_total_bytes": total_ram()})
+    purpose = req.arg("purpose")
+    total = total_ram()
+    return Response({
+        "models": catalog(purpose), "ram_total_bytes": total,
+        "recommended": {p: recommended_model_id(total, p) for p in PURPOSES},
+    })
 
 
 @route("POST", r"/api/engine/runtime/install")
@@ -1723,8 +1825,12 @@ def route_install_runtime(req: Request) -> Response:
 @route("POST", r"/api/engine/models/([a-z0-9][a-z0-9._-]{0,63})/install")
 @_api
 def route_install_model(req: Request, _model_id: object) -> Response:
-    req.json()
-    return Response({"download": install_model(_path_id(req))}, HTTPStatus.ACCEPTED)
+    data = req.json()
+    try:
+        download = install_model(_path_id(req), data.get("filename"))
+    except ModelFileMissing as exc:
+        return Response({"error": str(exc), "suggestion": exc.suggestion}, HTTPStatus.CONFLICT)
+    return Response({"download": download}, HTTPStatus.ACCEPTED)
 
 
 @route("POST", r"/api/engine/models/([a-z0-9][a-z0-9._-]{0,63})/delete")

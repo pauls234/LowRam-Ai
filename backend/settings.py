@@ -37,7 +37,11 @@ DEFAULTS: dict[str, Any] = {
         "device_name": None,
         "discoverable": True,  # announce this host on the LAN so helpers can find it without a code
     },
-    "ui": {"theme": "system"},
+    "ui": {
+        "theme": "system",
+        "check_updates": True,  # look for a newer release on GitHub (at most every 6 h)
+        "language": "auto",  # "auto" (browser language, German fallback) | "de" | "en"
+    },
     "desktop": {
         "keep_running_in_menu_bar": True,  # closing the window keeps LowRAM AI in the macOS menu bar
     },
