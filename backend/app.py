@@ -17,6 +17,7 @@ import json
 import logging
 import re
 import secrets
+import signal
 import sys
 import threading
 from collections.abc import Iterator
@@ -378,6 +379,17 @@ def main(argv: list[str] | None = None) -> int:
     host, port = server.server_address[:2]
     print(f"LowRAM AI: http://{host}:{port}  (model endpoint: {config.llm_url()})")
     print("Local use only - do not expose this port to the network. Press Ctrl+C to stop.")
+
+    def _terminate(signum, frame):  # SIGTERM / SIGHUP: same clean shutdown as Ctrl+C (stops llama-server)
+        raise KeyboardInterrupt
+
+    for name in ("SIGTERM", "SIGHUP"):
+        sig = getattr(signal, name, None)
+        if sig is not None:
+            try:
+                signal.signal(sig, _terminate)
+            except (ValueError, OSError):  # not in the main thread / unsupported here
+                pass
     try:
         server.serve_forever()
     except KeyboardInterrupt:
