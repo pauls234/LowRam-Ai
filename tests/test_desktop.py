@@ -555,7 +555,8 @@ class TrayTests(DesktopTestCase):
 
         return FakeWindow()
 
-    def test_close_hides_to_menu_bar_and_quit_shuts_down(self):
+    @mock.patch("desktop.launcher.keep_running_in_menu_bar", return_value=True)  # opt-in setting
+    def test_close_hides_to_menu_bar_and_quit_shuts_down(self, _keep):
         port = free_port()
         calls, trays = [], []
         window = self._window(calls)
@@ -622,12 +623,12 @@ class TrayTests(DesktopTestCase):
                 starter.close()
             self.assertEqual(window.events.closing.handlers, [])
 
-    def test_keep_running_setting_defaults_to_true(self):
-        self.assertTrue(launcher.keep_running_in_menu_bar())
-        with mock.patch("backend.settings.load", return_value={"desktop": {"keep_running_in_menu_bar": False}}):
-            self.assertFalse(launcher.keep_running_in_menu_bar())
-        with mock.patch("backend.settings.load", side_effect=OSError("disk")):
+    def test_keep_running_setting_is_opt_in(self):
+        self.assertFalse(launcher.keep_running_in_menu_bar())
+        with mock.patch("backend.settings.load", return_value={"desktop": {"keep_running_in_menu_bar": True}}):
             self.assertTrue(launcher.keep_running_in_menu_bar())
+        with mock.patch("backend.settings.load", side_effect=OSError("disk")):
+            self.assertFalse(launcher.keep_running_in_menu_bar())
 
     def test_spec_bundles_tray_and_feature_modules(self):
         spec = (REPO / "desktop" / "LowRAM-AI.spec").read_text("utf-8")

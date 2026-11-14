@@ -767,15 +767,16 @@ class SignalWatcher:
 
 
 def keep_running_in_menu_bar() -> bool:
-    """``settings.desktop.keep_running_in_menu_bar`` (default true; any problem -> true)."""
+    """``settings.desktop.keep_running_in_menu_bar`` – opt-in (default false; any problem -> false,
+    so closing the window always quits unless the user explicitly chose otherwise)."""
     try:
         from backend import settings
 
-        value = settings.load().get("desktop", {}).get("keep_running_in_menu_bar", True)
+        value = settings.load().get("desktop", {}).get("keep_running_in_menu_bar", False)
     except Exception:
         log.debug("Could not read the desktop settings", exc_info=True)
-        return True
-    return value is not False
+        return False
+    return value is True
 
 
 def default_tray_factory(**kwargs: Any) -> Any:

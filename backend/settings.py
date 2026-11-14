@@ -44,7 +44,7 @@ DEFAULTS: dict[str, Any] = {
         "language": "auto",  # "auto" (browser language, German fallback) | "de" | "en"
     },
     "desktop": {
-        "keep_running_in_menu_bar": True,  # closing the window keeps LowRAM AI in the macOS menu bar
+        "keep_running_in_menu_bar": False,  # opt-in: closing the window keeps LowRAM AI in the macOS menu bar
     },
     "resilience": {
         "wait_for_ram_minutes": 30,  # a task loop waits this long for RAM to recover instead of stopping
