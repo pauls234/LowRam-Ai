@@ -37,7 +37,11 @@ DEFAULTS: dict[str, Any] = {
         "device_name": None,
         "discoverable": True,  # announce this host on the LAN so helpers can find it without a code
     },
-    "ui": {"theme": "system"},
+    "ui": {
+        "theme": "system",
+        "check_updates": True,  # look for a newer release on GitHub (at most every 6 h)
+        "language": "auto",  # "auto" (browser language, German fallback) | "de" | "en"
+    },
     "chat": {
         "instructions": "",  # custom instructions added to every conversation (max 4000 chars)
     },

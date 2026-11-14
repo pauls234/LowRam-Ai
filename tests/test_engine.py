@@ -94,7 +94,7 @@ class CatalogTests(EngineTestCase):
     def test_catalog_api_shape_and_installed_flag(self):
         models = engine.catalog()
         keys = {"id", "name", "family", "purpose", "params", "quant", "size_bytes", "min_ram_gb", "recommended",
-                "installed", "license", "description", "source", "path", "available", "fits_ram"}
+                "installed", "license", "description", "source", "path", "available", "fits_ram", "default_for"}
         self.assertTrue(all(set(m) == keys for m in models))
         self.assertEqual(sum(m["recommended"] for m in models), 1)
         self.assertFalse(any(m["installed"] for m in models))
@@ -952,6 +952,103 @@ class OwnModelRouteTests(EngineTestCase):
         self.assertEqual(self.api("POST", "/api/engine/storage", {})[0], 400)
         self.assertEqual(self.api("POST", "/api/engine/storage", {"models_dir": "/"})[0], 400)
         self.assertEqual(self.api("POST", "/api/engine/storage", {"models_dir": None, "move_existing": "yes"})[0], 400)
+
+
+# --------------------------------------------------------------------------- polish v0.3.1: purposes + self-healing
+
+
+def tree_item(path, data):
+    return {"type": "file", "path": path, "size": len(data),
+            "lfs": {"oid": hashlib.sha256(data).hexdigest(), "size": len(data)}}
+
+
+class PurposeTests(EngineTestCase):
+    def test_default_for_hints(self):
+        allowed = {"chat", "code", "general"}
+        for entry in engine.CATALOG:
+            self.assertTrue(entry.default_for, entry.id)
+            self.assertTrue(set(entry.default_for) <= allowed, entry.id)
+            if entry.purpose == "code":
+                self.assertIn("code", entry.default_for)
+        self.assertEqual(engine.catalog()[0]["default_for"], list(engine.CATALOG[0].default_for))
+
+    def test_code_recommendation(self):
+        for gib, model_id in ((4, "qwen2.5-coder-1.5b-instruct"), (16, "qwen2.5-coder-7b-instruct"),
+                              (32, "qwen2.5-coder-14b-instruct"), (1, "qwen2.5-coder-1.5b-instruct")):
+            for purpose in ("code", "coding"):
+                self.assertEqual(engine.recommended_model_id(gib * GIB, purpose), model_id)
+        self.assertEqual(engine.recommended_model_id(16 * GIB, "chat"), engine.recommended_model_id(16 * GIB))
+        self.assertEqual(engine.get_entry(engine.recommended_model_id(16 * GIB, None)).purpose, "chat")
+        rec = [m["id"] for m in engine.catalog("code") if m["recommended"]]
+        self.assertEqual(len(rec), 1)
+        self.assertEqual(engine.get_entry(rec[0]).purpose, "code")
+
+
+class SelfHealingInstallTests(EngineTestCase):
+    setUp = EngineRouteTests.setUp
+    api = EngineRouteTests.api
+
+    def tree(self, entry, items):
+        self.hub.json[f"huggingface.co/api/models/{entry.repo}/tree/main"] = (items, None)
+
+    def test_missing_file_suggests_q4_k_m(self):
+        entry = engine.get_entry(SMALL)
+        good, other = b"GGUF" * 300, b"GGUF" * 400
+        self.tree(entry, [
+            {"type": "file", "path": "README.md", "size": 5},
+            tree_item("Qwen2.5-1.5B-Instruct-Q8_0.gguf", other),
+            tree_item("qwen2.5-1.5b-instruct-q4_k_m.gguf", good),
+            tree_item("Qwen2.5-1.5B-Instruct-Q4_K_M-00001-of-00002.gguf", good),
+        ])
+        with self.assertRaises(engine.ModelFileMissing) as ctx:
+            engine.install_model(SMALL)
+        self.assertEqual(ctx.exception.status, 409)
+        self.assertEqual(ctx.exception.suggestion, {"filename": "qwen2.5-1.5b-instruct-q4_k_m.gguf", "size_bytes": 1200})
+        status, body = self.api("POST", f"/api/engine/models/{SMALL}/install", {})
+        self.assertEqual(status, 409)
+        self.assertEqual(body["suggestion"]["filename"], "qwen2.5-1.5b-instruct-q4_k_m.gguf")
+        self.assertIn("error", body)
+        self.assertEqual(downloads.list_jobs(), [])
+        # one-click retry with the suggested file: verified and stored under the catalog name
+        self.hub.files[f"huggingface.co/{entry.repo}/resolve/main/qwen2.5-1.5b-instruct-q4_k_m.gguf"] = good
+        status, body = self.api("POST", f"/api/engine/models/{SMALL}/install",
+                                {"filename": "qwen2.5-1.5b-instruct-q4_k_m.gguf"})
+        self.assertEqual(status, 202, body)
+        self.assertEqual(downloads.wait(body["download"]["id"], 15)["state"], "done")
+        self.assertTrue(engine.is_installed(entry))
+        self.assertEqual(engine.model_path(entry).read_bytes(), good)
+        meta = json.loads((config.models_dir() / f"{SMALL}.json").read_text())
+        self.assertEqual(meta["filename"], "qwen2.5-1.5b-instruct-q4_k_m.gguf")
+
+    def test_suggestion_falls_back_to_closest_quant_that_fits(self):
+        entry = engine.get_entry(SMALL)
+        items = [tree_item("m-Q8_0.gguf", b"a" * 50), tree_item("m-Q5_K_M.gguf", b"b" * 40),
+                 tree_item("m-Q4_K_M.gguf", b"c" * 900)]
+        self.assertEqual(engine.suggest_file(entry, items, total_bytes=100)["filename"], "m-Q5_K_M.gguf")
+        self.assertIsNone(engine.suggest_file(entry, items, total_bytes=10))
+        unverified = [{"type": "file", "path": "m-Q4_K_M.gguf", "size": 5}]
+        self.assertIsNone(engine.suggest_file(entry, unverified))
+        self.tree(entry, unverified)
+        with self.assertRaises(engine.EngineError) as ctx:
+            engine.install_model(SMALL)
+        self.assertEqual(ctx.exception.status, 502)
+        self.assertNotIsInstance(ctx.exception, engine.ModelFileMissing)
+
+    def test_filename_must_exist_and_be_safe(self):
+        entry = engine.get_entry(SMALL)
+        self.tree(entry, [tree_item("ok-Q4_K_M.gguf", b"x" * 10)])
+        for bad in ("../x.gguf", "/abs.gguf", "x.bin", 5, "a-00001-of-00002.gguf", "missing-Q4_K_M.gguf"):
+            status, body = self.api("POST", f"/api/engine/models/{SMALL}/install", {"filename": bad})
+            self.assertEqual(status, 400, (bad, body))
+        self.assertEqual(downloads.list_jobs(), [])
+
+    def test_catalog_route_recommends_per_purpose(self):
+        status, body = self.api("GET", "/api/engine/catalog?purpose=code")
+        self.assertEqual(status, 200)
+        self.assertEqual(engine.get_entry(body["recommended"]["code"]).purpose, "code")
+        self.assertEqual(engine.get_entry(body["recommended"]["chat"]).purpose, "chat")
+        rec = [m for m in body["models"] if m["recommended"]]
+        self.assertEqual([m["id"] for m in rec], [body["recommended"]["code"]])
 
 
 if __name__ == "__main__":
