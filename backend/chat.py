@@ -507,7 +507,13 @@ def list_messages(chat_id: int) -> list[dict]:
         rows = conn.execute(
             f"SELECT {_MESSAGE_COLUMNS} FROM messages WHERE conversation_id = ? ORDER BY id", (chat_id,)
         ).fetchall()
-        return _messages_with_attachments(conn, rows)
+        messages = _messages_with_attachments(conn, rows)
+    # While an answer is regenerated the previous one stays stored (directly before it)
+    # until the new one has text; only the new one is shown.
+    return [
+        m for i, m in enumerate(messages)
+        if not (m["role"] == "assistant" and i + 1 < len(messages) and messages[i + 1]["role"] == "assistant")
+    ]
 
 
 def _recent_messages(chat_id: int, char_limit: int, before_id: int | None = None,
@@ -584,19 +590,36 @@ def _last_turn(conn: sqlite3.Connection, chat_id: int) -> tuple[dict | None, dic
 
 @web.on_startup
 def recover_interrupted(server: object = None) -> int:
-    """Mark answers that were still ``streaming`` when LowRAM AI stopped as ``stopped``."""
+    """Mark answers that were still ``streaming`` when LowRAM AI stopped as ``stopped``.
+
+    An interrupted regenerate (its new answer directly follows the previous
+    one) keeps the previous answer unless the new one already has text.
+    """
     with _ACTIVE_LOCK:
         active = [answer.assistant_id for answer in _ACTIVE.values()]
     marks = ",".join("?" for _ in active)
     extra = f" AND id NOT IN ({marks})" if active else ""
     with _connect() as conn, db.transaction(conn):
-        cur = conn.execute(
-            "UPDATE messages SET status = 'stopped', error = COALESCE(error, ?) WHERE status = 'streaming'" + extra,
-            (INTERRUPTED_ERROR, *active),
-        )
-    if cur.rowcount:
-        log.warning("Marked %s interrupted chat answer(s) as stopped", cur.rowcount)
-    return cur.rowcount
+        rows = conn.execute(
+            "SELECT id, conversation_id, content FROM messages WHERE status = 'streaming'" + extra, active
+        ).fetchall()
+        for row in rows:
+            before = conn.execute(
+                "SELECT id, role FROM messages WHERE conversation_id = ? AND id < ? ORDER BY id DESC LIMIT 1",
+                (row["conversation_id"], row["id"]),
+            ).fetchone()
+            if before is not None and before["role"] == "assistant":
+                if not (row["content"] or "").strip():
+                    conn.execute("DELETE FROM messages WHERE id = ?", (row["id"],))
+                    continue
+                conn.execute("DELETE FROM messages WHERE id = ?", (before["id"],))
+            conn.execute(
+                "UPDATE messages SET status = 'stopped', error = COALESCE(error, ?) WHERE id = ?",
+                (INTERRUPTED_ERROR, row["id"]),
+            )
+    if rows:
+        log.warning("Recovered %s interrupted chat answer(s)", len(rows))
+    return len(rows)
 
 
 # --------------------------------------------------------------------------- export
@@ -1126,13 +1149,15 @@ class _Answer:
     Holds no reference to its :class:`ChatStream`, so dropping the stream
     object triggers ``ChatStream.__del__`` (which releases the slot) at once.
     For ``continue`` the answer starts with the stored text and ``restore``
-    holds the previous state, written back if nothing new arrives.
+    holds the previous state, written back if nothing new arrives. For
+    ``regenerate`` the answer ``replaces`` the previous one (``previous``),
+    which is deleted only once the new answer has text; otherwise it is kept.
     """
 
     def __init__(self, *, chat: dict, user_message: dict | None, assistant_message: dict, messages: list[dict],
                  max_tokens: int, temperature: float, url: str | None, slot: ExitStack,
                  wait=None, action: str = "message", extra: dict | None = None, restore: dict | None = None,
-                 memory: dict | None = None) -> None:
+                 memory: dict | None = None, replaces: int | None = None, previous: dict | None = None) -> None:
         self.chat_id = int(chat["id"])
         self.chat = chat
         self.user_message = user_message
@@ -1147,6 +1172,9 @@ class _Answer:
         self.extra = extra or {}
         self.restore = restore
         self.memory = memory  # summarisation job from _with_memory, run before the answer
+        self.replaces = replaces
+        self.previous = previous
+        self.kept_previous = False
         self.loading = False
         self.stats: dict = {}
         self.stop_event = threading.Event()
@@ -1270,23 +1298,33 @@ class _Answer:
             if self.final is not None:
                 return self.final
             values = self._final_values(status, error)
+            keep = self.replaces is not None and not self.has_content()  # regenerate without text
             now = db.utcnow()
             for attempt in range(3):
                 try:
                     with _connect() as conn, db.transaction(conn):
+                        if keep:
+                            conn.execute("DELETE FROM messages WHERE id = ?", (self.assistant_id,))
+                            break
                         conn.execute(
                             "UPDATE messages SET content = ?, status = ?, error = ?, duration_s = ?, tokens = ?, "
                             "tokens_per_s = ?, finish_reason = ? WHERE id = ?",
                             (values["content"], values["status"], values["error"], values["duration_s"],
                              values["tokens"], values["tokens_per_s"], values["finish_reason"], self.assistant_id),
                         )
+                        if self.replaces is not None:
+                            conn.execute("DELETE FROM messages WHERE id = ?", (self.replaces,))
                         conn.execute("UPDATE conversations SET updated_at = ? WHERE id = ?", (now, self.chat_id))
                     break
                 except sqlite3.OperationalError:
                     if attempt == 2:
                         raise
                     time.sleep(0.5 * (attempt + 1))
-            self.final = {**self.assistant, **values, "truncated": values["finish_reason"] == "length"}
+            self.kept_previous = keep
+            if keep:
+                self.final = dict(self.previous or {})
+            else:
+                self.final = {**self.assistant, **values, "truncated": values["finish_reason"] == "length"}
             self._unregister()
             return self.final
 
@@ -1377,10 +1415,11 @@ def _events(answer: _Answer) -> Iterator[dict]:
             log.exception("Chat #%s: the answer failed", answer.chat_id)
             status, error = "error", f"Unexpected error while answering: {type(exc).__name__}: {exc}"
         message = answer.finalize(status, error)
+        kept = {"kept_previous": True} if answer.kept_previous else {}  # regenerate without text
         if status == "error":
-            yield {"type": "error", "error": error, "message": message}
+            yield {"type": "error", "error": error, "message": message, **kept}
         else:
-            yield {"type": "done", "message": message}
+            yield {"type": "done", "message": message, **kept}
     finally:  # also on GeneratorExit (client gone) and errors in finalize
         answer.stop_worker()
         answer.abandon()
@@ -1431,6 +1470,8 @@ def _open_stream(chat_id: int, percent: object, prepare) -> ChatStream:
     mode = chat["mode"] if chat["mode"] in MODES else "chat"
     slot = ExitStack()
     slot.enter_context(db.inference_slot(f"chat #{chat_id}"))
+    fields: dict | None = None
+    answer: _Answer | None = None
     try:
         endpoint = prepare_model()
         budget, max_tokens = context_limits(plan.context_chars, plan.max_tokens, mode, endpoint["ctx_size"])
@@ -1442,9 +1483,37 @@ def _open_stream(chat_id: int, percent: object, prepare) -> ChatStream:
         with _ACTIVE_LOCK:
             _ACTIVE[chat_id] = answer
         return ChatStream(answer)
-    except BaseException:
+    except BaseException as exc:
+        if answer is not None:
+            answer._unregister()
+        if fields is not None:  # prepare already stored the rows
+            _settle_unstarted(fields, f"The answer could not be started: {type(exc).__name__}: {exc}")
         slot.close()
         raise
+
+
+def _settle_unstarted(fields: dict, error: str) -> None:
+    """Never leave a message ``streaming`` when the answer could not be set up after ``prepare``:
+    a new answer is marked ``error``, a continued one is restored, a regenerated one is dropped
+    (the previous answer stays)."""
+    message_id = fields["assistant_message"]["id"]
+    restore = fields.get("restore")
+    try:
+        with _connect() as conn, db.transaction(conn):
+            if restore is not None:
+                conn.execute(
+                    "UPDATE messages SET status = ?, finish_reason = ?, error = NULL WHERE id = ? AND status = 'streaming'",
+                    (restore["status"], restore["finish_reason"], message_id),
+                )
+            elif fields.get("replaces") is not None:
+                conn.execute("DELETE FROM messages WHERE id = ? AND status = 'streaming'", (message_id,))
+            else:
+                conn.execute(
+                    "UPDATE messages SET status = 'error', error = ? WHERE id = ? AND status = 'streaming'",
+                    (error[: db.MAX_ERROR_CHARS], message_id),
+                )
+    except Exception:  # the original error is what the caller reports
+        log.exception("Could not settle the unstarted answer #%s", message_id)
 
 
 def start_answer(chat_id: int, content: object, percent: object = None, attachments: object = None,
@@ -1490,11 +1559,11 @@ def regenerate_answer(chat_id: int, percent: object = None, collection_id: objec
             )
             now = db.utcnow()
             with db.transaction(conn):
-                cur = conn.execute(
-                    "DELETE FROM messages WHERE id = ? AND id = (SELECT MAX(id) FROM messages WHERE conversation_id = ?)",
-                    (old["id"], chat_id),
-                )
-                if cur.rowcount != 1:
+                # The previous answer stays until the new one has text (see _Answer.finalize).
+                newest = conn.execute(
+                    "SELECT MAX(id) FROM messages WHERE conversation_id = ?", (chat_id,)
+                ).fetchone()[0]
+                if newest != old["id"]:
                     raise HTTPError(HTTPStatus.CONFLICT, "The chat changed meanwhile; reload it and try again")
                 new_id = conn.execute(
                     "INSERT INTO messages (conversation_id, role, content, status, model, created_at, sources) "
@@ -1506,6 +1575,7 @@ def regenerate_answer(chat_id: int, percent: object = None, collection_id: objec
                 "chat": _get_conversation(conn, chat_id), "user_message": user,
                 "assistant_message": _get_message(conn, new_id), "messages": messages,
                 "action": "regenerate", "extra": {"replaced_message_id": old["id"]}, "memory": job,
+                "replaces": old["id"], "previous": old,
             }
 
     return _open_stream(chat_id, percent, prepare)
