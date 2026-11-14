@@ -18,7 +18,7 @@ class ChatTests(LowRAMTestCase):
         self.assertEqual(req["json"]["max_tokens"], 123)
         self.assertEqual(req["json"]["model"], "m1")
         self.assertEqual(req["json"]["messages"], MSGS)
-        self.assertIs(req["json"]["stream"], False)
+        self.assertIs(req["json"]["stream"], True)  # llm.chat streams internally (no fixed total timeout)
         self.assertNotIn("Authorization", req["headers"])
 
     def test_api_key_sent_as_bearer(self):
@@ -28,12 +28,29 @@ class ChatTests(LowRAMTestCase):
 
     def test_http_error(self):
         self.llm.push(HttpError(503, "overloaded"))
-        with self.assertRaisesRegex(llm.LLMError, "HTTP 503.*overloaded"):
+        with self.assertRaisesRegex(llm.LLMError, "HTTP 503.*overloaded") as ctx:
             llm.chat(MSGS)
+        self.assertTrue(ctx.exception.transient)  # engine restarting / loading
+        self.assertFalse(ctx.exception.context_overflow)
+        self.assertEqual(ctx.exception.status, 503)
+
+    def test_error_classification(self):
+        self.llm.push(
+            HttpError(500, "kaboom"),
+            HttpError(400, '{"error":{"code":400,"message":"the request exceeds the available context size, '
+                           'try increasing it","type":"exceed_context_size_error"}}'),
+            HttpError(400, "bad temperature"),
+            HttpError(502, "bad gateway"),
+        )
+        for transient, overflow in [(False, False), (False, True), (False, False), (True, False)]:
+            with self.assertRaises(llm.LLMError) as ctx:
+                llm.chat(MSGS)
+            self.assertEqual((ctx.exception.transient, ctx.exception.context_overflow), (transient, overflow))
 
     def test_unreachable_endpoint(self):
-        with self.assertRaisesRegex(llm.LLMError, "Could not reach"):
+        with self.assertRaisesRegex(llm.LLMError, "Could not reach") as ctx:
             llm.chat(MSGS, url=closed_port_url(), timeout=3)
+        self.assertTrue(ctx.exception.transient)  # connection refused: the engine may be restarting
 
     def test_malformed_json(self):
         self.llm.push(Raw(b"this is {not json"))

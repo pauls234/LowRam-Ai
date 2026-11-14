@@ -56,8 +56,11 @@ class RunNextTests(LowRAMTestCase):
         md = Path(task["result_path"])
         self.assertEqual(md.suffix, ".md")
         self.assertEqual(md.read_text(), "Hello!\n")
+        self.assertFalse(runner.partial_path(pid, task["id"]).exists())  # replaced by the result
         meta = json.loads(md.with_suffix(".json").read_text())
         self.assertEqual(meta["task_id"], task["id"])
+        self.assertEqual((meta["attempts"], meta["resumed_from_checkpoint"], meta["context_retry"]),
+                         (1, False, False))
         self.assertEqual(meta["title"], "Say hi")
         self.assertEqual(meta["percent"], 40)
         self.assertIn(str(self.home), str(md))
@@ -84,11 +87,15 @@ class RunNextTests(LowRAMTestCase):
         from unittest import mock
         from tests.helpers import closed_port_url
 
+        from backend import settings
+
+        settings.update("resilience", {"retry_transient": False})  # waiting for the model: test_resilience
         pid = runner.create_project("p", "task")
         with mock.patch.dict(os.environ, {"LOWRAM_LLM_URL": closed_port_url()}):
             out = runner.run_next(pid)
         self.assertEqual(out["status"], "failed")
         self.assertIn("Could not reach", out["error"])
+        self.assertNotIn("partial answer", out["error"])  # nothing was received, nothing claimed as kept
 
     def test_paused_on_low_ram_claims_nothing(self):
         self.set_memory(total_gib=8, available_mib=100)

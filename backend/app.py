@@ -132,6 +132,9 @@ class LoopController:
         with self._lock:
             task = outcome.get("task") or {}
             status = outcome["status"]
+            if status == "waiting":  # RAM guard / model restart: show the wait, change no counters
+                self._state["last_message"] = str(outcome.get("reason") or "")[:500]
+                return
             if status == "done":
                 self._state["completed"] += 1
             elif status == "failed":
