@@ -235,6 +235,33 @@ class ResolvePathTests(LowRAMTestCase):
             with self.subTest(path=rel), self.assertRaises(agent.ProposalError):
                 agent.resolve_repo_path(self.repo, rel)
 
+    def test_directory_rules_are_case_insensitive(self):
+        # APFS/NTFS: "Node_Modules" is the same folder as "node_modules"
+        for rel in ("Node_Modules/a.js", "NODE_MODULES/x/a.js", "src/VENV/a.py", "PODS/a.swift", "deriveddata/a.swift",
+                    ".GIT/config.txt", ".Venv/a.py"):
+            with self.subTest(path=rel), self.assertRaises(agent.ProposalError):
+                agent.resolve_repo_path(self.repo, rel)
+        for rel in (".GITHUB/workflows/ci.yml", ".GitHub/x.yml", "SiteCustomize.py", ".Pre-Commit-Config.YAML"):
+            with self.subTest(path=rel), self.assertRaises(agent.ProposalError):
+                agent.resolve_repo_path(self.repo, rel, write=True)
+        agent.resolve_repo_path(self.repo, ".GitHub/workflows/ci.yml")  # readable like .github
+        for name in ("Node_Modules", "VENV", ".Git"):
+            (self.repo / name).mkdir()
+            (self.repo / name / "hidden_dep.py").write_text("x = 1\n")
+        self.assertNotIn("hidden_dep.py", " ".join(e["path"] for e in agent.index_repository(self.repo)))
+
+    def test_files_run_by_tests_need_attention(self):
+        for rel in ("tests/test_calc.py", "Tests/helpers.py", "pkg/test/util.py", "src/__tests__/a.js", "test_x.py",
+                    "pkg/calc_test.py", "conftest.py", "makefile", "MAKEFILE", "package.json", "setup.py",
+                    "pyproject.toml", "tox.ini", "noxfile.py", "pytest.ini", "run.sh", "app.test.js", "x.spec.ts"):
+            with self.subTest(path=rel):
+                self.assertTrue(agent.runs_during_tests(rel))
+                self.assertTrue(agent.needs_attention(rel))
+        for rel in ("calc.py", "src/testing.py", "attest.py", "docs/test.md.bak.txt", "contest.py", "README.md"):
+            with self.subTest(path=rel):
+                self.assertFalse(agent.runs_during_tests(rel))
+                self.assertFalse(agent.needs_attention(rel))
+
     def test_env_example_allowed_by_sensitivity_but_text_check_applies(self):
         self.assertFalse(agent.is_sensitive(".env.example"))
         self.assertTrue(agent.is_sensitive(".ENV"))

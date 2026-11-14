@@ -136,11 +136,13 @@ def post_project(req: Request) -> Response:
 @route("GET", r"/api/coding/projects/(\d+)")
 def get_project(req: Request, project_id: int) -> Response:
     project = _coding_project(project_id)
+    settings = agent.get_test_settings(project_id)
     return Response(
         {
             "project": project,
             "tasks": [_task_view(t) for t in db.list_tasks(project_id)],
-            "test_command": agent.get_test_command(project_id),
+            "test_command": settings["command"],
+            "test_sandbox": settings["sandbox"],
             "last_test_run": agent.latest_test_run(project_id),
         }
     )
@@ -221,14 +223,27 @@ def post_reject(req: Request, project_id: int, task_id: int) -> Response:
 def post_test_command(req: Request, project_id: int) -> Response:
     data = req.json()
     _coding_project(project_id)
-    return Response({"command": _call(agent.set_test_command, project_id, data.get("command"))})
+    return Response(_call(agent.set_test_command, project_id, data.get("command"), data.get("sandbox")))
 
 
 @route("POST", r"/api/coding/projects/(\d+)/run-tests")
 def post_run_tests(req: Request, project_id: int) -> Response:
-    req.json()
+    """202 ``{run}``; 409 ``{error, needs_confirmation: true, ai_files}`` when approved AI proposals
+    wrote files the run executes – the UI asks the user and repeats with ``{"confirm": true}``."""
+    data = req.json()
+    confirm = data.get("confirm", False)
+    if not isinstance(confirm, bool):
+        raise ValueError("'confirm' must be true or false")
     _coding_project(project_id)
-    return Response({"run": _call(agent.start_test_run, project_id)}, HTTPStatus.ACCEPTED)
+    try:
+        run = agent.start_test_run(project_id, confirm)
+    except agent.ConfirmationRequired as exc:
+        return Response(
+            {"error": str(exc), "needs_confirmation": True, "ai_files": exc.files}, HTTPStatus.CONFLICT
+        )
+    except agent.AgentError as exc:
+        raise HTTPError(HTTPStatus.CONFLICT, str(exc)) from exc
+    return Response({"run": run}, HTTPStatus.ACCEPTED)
 
 
 @route("GET", r"/api/coding/projects/(\d+)/test-runs/(\d+)")

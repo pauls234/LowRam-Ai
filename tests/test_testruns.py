@@ -3,15 +3,20 @@
 import json
 import os
 import shutil
+import sqlite3
+import sys
 import unittest
+from contextlib import closing
+from pathlib import Path
 from unittest import mock
 
 import psutil
 
-from backend import agent, db
-from tests.helpers import LowRAMTestCase, wait_until
+from backend import agent, config, db
+from tests.helpers import LowRAMTestCase, Text, wait_until
 
 BUGGY = "def add(a, b):\n    return a - b\n"
+FIXED = "def add(a, b):\n    return a + b\n"
 TEST_FILE = "from calc import add\n\nassert add(1, 2) == 3\n"
 REPORT_SCRIPT = (
     "import os, sys\n"
@@ -38,6 +43,7 @@ class TestRunCase(LowRAMTestCase):
             {"calc.py": BUGGY, "tests/test_calc.py": TEST_FILE, "report.py": REPORT_SCRIPT, ".env": "TOKEN=x\n"}
         )
         self.pid = agent.create_coding_project("Fix add", str(self.repo))
+        agent.recover_test_runs()  # like app startup: clears the shutdown flag of earlier tests
         self.addCleanup(agent.stop_test_runs)
 
     def executable(self, rel: str, text: str = "#!/bin/sh\necho hi\n", mode: int = 0o755):
@@ -115,9 +121,15 @@ class ValidationTests(TestRunCase):
 
     def test_command_is_stored_per_project(self):
         other = agent.create_coding_project("Other", str(self.repo))
-        self.assertEqual(agent.set_test_command(self.pid, "  python3 -m unittest  "), "python3 -m unittest")
-        agent.set_test_command(self.pid, "python3 -m pytest")
+        self.assertEqual(
+            agent.set_test_command(self.pid, "  python3 -m unittest  "), {"command": "python3 -m unittest", "sandbox": True}
+        )
+        self.assertEqual(agent.set_test_command(self.pid, "python3 -m pytest", False)["sandbox"], False)
+        self.assertEqual(agent.set_test_command(self.pid, "python3 -m pytest"), {"command": "python3 -m pytest", "sandbox": False})
         self.assertEqual(agent.get_test_command(self.pid), "python3 -m pytest")
+        with self.assertRaises(ValueError):
+            agent.set_test_command(self.pid, "python3 -m pytest", "yes")
+        self.assertEqual(agent.get_test_settings(other), {"command": None, "sandbox": True})
         self.assertIsNone(agent.get_test_command(other))
         with self.assertRaises(agent.AgentError):
             agent.start_test_run(other)  # no command saved
@@ -264,6 +276,159 @@ class FixTestsTests(TestRunCase):
         with self.assertRaises(agent.AgentError):
             agent.add_fix_tests_step(self.pid, running["id"])
         self.assertEqual(db.list_tasks(self.pid), [])
+
+
+class SandboxProfileTests(LowRAMTestCase):
+    HOME = Path("/Users/me")
+
+    def profile(self, repo="/Users/me/code/app", home=HOME):
+        return agent.sandbox_profile(Path(repo), home=Path(home), data_dir=Path("/Users/me/.lowram-ai"))
+
+    def test_profile(self):
+        profile = self.profile()
+        self.assertTrue(profile.startswith("(version 1)\n(allow default)\n"))
+        for path in ("/Users/me/code/app", "/private/tmp", "/private/var/folders", "/dev"):
+            self.assertIn(f'    (subpath "{path}")', profile.split("(allow file-write*")[1].split(")\n(deny")[0])
+        secrets = profile.split("(deny file-read* file-write*")[1]
+        for rel in (".ssh", ".aws", ".gnupg", ".config/gh", ".netrc", "Library/Keychains", ".lowram-ai"):
+            self.assertIn(f'(subpath "/Users/me/{rel}")', secrets)
+        self.assertEqual(profile.count('"/Users/me/.lowram-ai"'), 1)  # data folder listed once
+        self.assertIn("(deny network-outbound)", profile)
+        self.assertIn('(allow network-outbound (remote ip "localhost:*"))', profile)
+        self.assertIn("(allow network-outbound (remote unix-socket))", profile)
+        # later rules win: write-deny, then the writable folders, then the secret folders
+        order = [profile.index(rule) for rule in ("(deny file-write*)", "(allow file-write*", "(deny file-read*")]
+        self.assertEqual(order, sorted(order))
+        self.assertEqual(profile.count("("), profile.count(")"))
+
+    def test_paths_needing_escapes_are_refused(self):
+        for repo in ('/Users/me/co"de', "/Users/me/back\\slash", "/Users/me/new\nline", "relative/app"):
+            with self.subTest(repo=repo), self.assertRaises(agent.AgentError):
+                self.profile(repo)
+        with self.assertRaises(agent.AgentError):
+            self.profile(home='/Users/"me')
+
+    def test_sandbox_command(self):
+        repo = self.make_repo()
+        args = ["python3", "-m", "pytest", "-q"]
+        with mock.patch.object(agent, "_sandbox_state", return_value="ok"):
+            popen_args, exe, sandboxed, warning = agent.sandbox_command(repo, args, "/usr/bin/python3", True)
+            self.assertEqual(popen_args[:2], [agent.SANDBOX_EXEC, "-p"])
+            self.assertIn(f'(subpath "{repo}")', popen_args[2])
+            self.assertEqual(popen_args[3:], ["--", "/usr/bin/python3", "-m", "pytest", "-q"])
+            self.assertEqual((exe, sandboxed, warning), (agent.SANDBOX_EXEC, True, None))
+            self.assertEqual(
+                agent.sandbox_command(repo, args, "/x", False), (args, "/x", False, agent.SANDBOX_OFF_WARNING)
+            )
+        with mock.patch.object(agent, "_sandbox_state", return_value="unsupported"):
+            self.assertEqual(
+                agent.sandbox_command(repo, args, "/x", True), (args, "/x", False, agent.SANDBOX_UNAVAILABLE_WARNING)
+            )
+        with mock.patch.object(agent, "_sandbox_state", return_value="missing"):
+            self.assertEqual(agent.sandbox_command(repo, args, "/x", True)[2:], (False, agent.SANDBOX_MISSING_WARNING))
+
+    @unittest.skipIf(sys.platform == "darwin", "macOS has sandbox-exec")
+    def test_no_sandbox_outside_macos(self):
+        self.assertEqual(agent._sandbox_state(), "unsupported")
+
+
+@unittest.skipUnless(POSIX_PY, "needs python3 on PATH and POSIX process groups")
+class RunRecordTests(TestRunCase):
+    @unittest.skipIf(sys.platform == "darwin", "runs are sandboxed on macOS")
+    def test_runs_outside_macos_are_not_sandboxed_and_say_so(self):
+        run = self.run_command("python3 -c pass")
+        self.assertEqual((run["sandboxed"], run["warning"]), (False, agent.SANDBOX_UNAVAILABLE_WARNING))
+        self.assertNotIn("ai_writes_seen", run)
+        agent.set_test_command(self.pid, "python3 -c pass", False)
+        run = self.finish(agent.start_test_run(self.pid))
+        self.assertEqual((run["sandboxed"], run["warning"]), (False, agent.SANDBOX_OFF_WARNING))
+
+    def test_only_the_newest_runs_are_kept(self):
+        other = agent.create_coding_project("Other", str(self.repo))
+        with db.connect() as conn, db.transaction(conn):
+            for project in (self.pid, other):
+                for _ in range(25):
+                    conn.execute(
+                        "INSERT INTO coding_test_runs (project_id, command, state, started_at, finished_at) "
+                        "VALUES (?, 'x', 'passed', ?, ?)",
+                        (project, db.utcnow(), db.utcnow()),
+                    )
+        run = self.run_command("python3 -c pass")
+        with db.connect() as conn:
+            ids = [r["id"] for r in conn.execute("SELECT id FROM coding_test_runs WHERE project_id = ? ORDER BY id", (self.pid,))]
+            others = conn.execute("SELECT COUNT(*) FROM coding_test_runs WHERE project_id = ?", (other,)).fetchone()[0]
+        self.assertEqual(len(ids), agent.MAX_TEST_RUNS_KEPT)
+        self.assertEqual(ids[-1], run["id"])
+        self.assertEqual(others, 25)  # other projects are pruned only when their own runs finish
+
+    def test_no_new_runs_after_shutdown(self):
+        agent.set_test_command(self.pid, "python3 -c pass")
+        agent.stop_test_runs()
+        with self.assertRaises(db.Busy) as ctx:
+            agent.start_test_run(self.pid)
+        self.assertEqual(str(ctx.exception), "LowRAM AI wird beendet")
+        self.assertIsNone(agent.latest_test_run(self.pid))
+        agent.recover_test_runs()  # next startup
+        self.assertEqual(self.finish(agent.start_test_run(self.pid))["state"], "passed")
+
+
+@unittest.skipUnless(POSIX_PY, "needs python3 on PATH and POSIX process groups")
+class ConfirmationTests(TestRunCase):
+    def approve(self, changes):
+        existing = [c["path"] for c in changes if (self.repo / c["path"]).exists()]
+        agent.add_step(self.pid, "AI change", existing)
+        self.llm.push(Text(json.dumps({"summary": "change", "changes": changes})))
+        out = agent.execute_coding_step(self.pid)
+        self.assertEqual(out["status"], "proposed", out)
+        agent.approve(self.pid, out["task_id"])
+        return out
+
+    def test_ai_written_test_files_need_confirmation(self):
+        agent.set_test_command(self.pid, "python3 -c pass")
+        self.finish(agent.start_test_run(self.pid))  # nothing written by the AI yet
+        out = self.approve([{"path": "calc.py", "content": FIXED}])
+        self.assertEqual(out["attention"], [])
+        self.finish(agent.start_test_run(self.pid))  # calc.py is not run directly by the test runner
+        out = self.approve(
+            [
+                {"path": "tests/test_calc.py", "content": TEST_FILE + "assert add(2, 2) == 4\n"},
+                {"path": "run_all.sh", "content": "echo hi\n"},
+                {"path": "calc.py", "content": FIXED + "# checked\n"},
+            ]
+        )
+        self.assertEqual(sorted(out["attention"]), ["run_all.sh", "tests/test_calc.py"])
+        last = agent.latest_test_run(self.pid)["id"]
+        with self.assertRaises(agent.ConfirmationRequired) as ctx:
+            agent.start_test_run(self.pid)
+        self.assertEqual(ctx.exception.files, ["run_all.sh", "tests/test_calc.py"])
+        self.assertIn("Die KI hat diese Dateien geschrieben", str(ctx.exception))
+        self.assertEqual(agent.latest_test_run(self.pid)["id"], last)  # nothing started
+        self.assertEqual(self.finish(agent.start_test_run(self.pid, confirm=True))["state"], "passed")
+        self.assertEqual(agent.unconfirmed_ai_files(self.pid)[0], [])
+        self.finish(agent.start_test_run(self.pid))  # confirmed once: no new AI files since
+
+
+OLD_SCHEMA = """
+CREATE TABLE coding_test_commands (project_id INTEGER PRIMARY KEY, command TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE coding_test_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, project_id INTEGER NOT NULL, command TEXT NOT NULL, state TEXT NOT NULL,
+    exit_code INTEGER, output_tail TEXT NOT NULL DEFAULT '', error TEXT, started_at TEXT NOT NULL, finished_at TEXT
+);
+INSERT INTO coding_test_commands VALUES (1, 'python3 -m pytest', 'then');
+INSERT INTO coding_test_runs (project_id, command, state, started_at) VALUES (1, 'python3 -m pytest', 'passed', 'then');
+"""
+
+
+class MigrationTests(LowRAMTestCase):
+    def test_tables_of_earlier_builds_get_the_new_columns(self):
+        with closing(sqlite3.connect(config.db_path())) as raw:
+            raw.executescript(OLD_SCHEMA)
+        pid = agent.create_coding_project("Old", str(self.make_repo({"a.py": "x = 1\n"})))
+        self.assertEqual(pid, 1)
+        self.assertEqual(agent.get_test_settings(pid), {"command": "python3 -m pytest", "sandbox": True})
+        run = agent.latest_test_run(pid)
+        self.assertEqual((run["state"], run["sandboxed"], run["warning"]), ("passed", False, None))
+        self.assertEqual(agent.unconfirmed_ai_files(pid), ([], 0))
 
 
 if __name__ == "__main__":
