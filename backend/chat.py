@@ -258,6 +258,10 @@ def validate_attachments(value: object) -> list[dict]:
     for position, item in enumerate(value, start=1):
         if not isinstance(item, dict) or not isinstance(item.get("name"), str) or not isinstance(item.get("content"), str):
             raise ValueError(f"Attachment {position} must be an object with text 'name' and 'content'")
+        try:
+            item["name"].encode("utf-8")
+        except UnicodeEncodeError:
+            raise ValueError(f"Attachment {position} has a file name that is not valid text") from None
         name = clean_attachment_name(item["name"], position)
         content = item["content"]
         if "\x00" in content:
