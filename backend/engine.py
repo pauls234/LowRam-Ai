@@ -82,6 +82,7 @@ RESTART_LIMIT = 3  # automatic restarts of a llama-server that crashed after it 
 RESTART_WINDOW_S = 600.0  # ... within 10 minutes; one crash more and the state stays "error"
 RESTART_BACKOFF_S = (2.0, 10.0, 30.0)  # pause before the 1st / 2nd / 3rd automatic restart
 IDLE_CHECK_S = 30.0  # how often a ready server checks whether it was idle long enough to unload it
+CRASH_LOCK_MESSAGE = "Die KI ist mehrfach abgestürzt – bitte Modell/Einstellungen prüfen."
 
 # Platform key -> regexes for the release asset names (first match wins; .tar.gz preferred).
 ASSET_PATTERNS: dict[str, tuple[str, ...]] = {
@@ -478,6 +479,7 @@ FLAG_SPELLINGS: dict[str, tuple[str, ...]] = {
     "ubatch_size": ("--ubatch-size", "-ub"),
     "parallel": ("--parallel", "-np"),
     "jinja": ("--jinja",),
+    "threads": ("--threads", "-t"),
 }
 _HELP_LINE_RE = re.compile(r"^[ \t]{0,8}(-{1,2}[A-Za-z].*)$")  # option lines start (nearly) at column 0
 _HELP_GAP_RE = re.compile(r"(?<![,\s])\s{2,}")  # option names | description
@@ -512,6 +514,50 @@ def parse_help(text: str) -> ServerFlags | None:
 
 
 _flags_cache: dict[tuple[str, int, int], ServerFlags | None] = {}
+_perf_cores: int | None = None
+SYSCTL_TIMEOUT_S = 2.0
+LLAMA_NICE = 5  # llama-server answers interactively: a little below normal priority
+MEDIA_NICE = 10  # image/video generation (sd-cli): the desktop stays responsive
+
+
+def performance_cores() -> int:
+    """Performance cores (Apple silicon: ``hw.perflevel0.physicalcpu``), else physical cores, else 4. Cached."""
+    global _perf_cores
+    if _perf_cores is not None:
+        return _perf_cores
+    cores = None
+    if sys.platform == "darwin":
+        sysctl = "/usr/sbin/sysctl" if os.path.exists("/usr/sbin/sysctl") else "sysctl"
+        try:
+            out = subprocess.run([sysctl, "-n", "hw.perflevel0.physicalcpu"], stdin=subprocess.DEVNULL,
+                                 capture_output=True, timeout=SYSCTL_TIMEOUT_S, check=False)
+            value = int(out.stdout.decode("ascii", "replace").strip())
+            cores = value if value > 0 else None
+        except (OSError, subprocess.SubprocessError, ValueError):
+            cores = None  # Intel Macs have no perflevel0
+    if cores is None:
+        try:
+            cores = psutil.cpu_count(logical=False) or None
+        except Exception:  # noqa: BLE001 - psutil may fail in sandboxes
+            cores = None
+    _perf_cores = cores or 4
+    return _perf_cores
+
+
+def inference_threads() -> int:
+    """Threads for llama-server / sd-cli: two performance cores stay free for the desktop (less heat)."""
+    return max(2, performance_cores() - 2)
+
+
+def lower_priority(pid: int, niceness: int) -> None:
+    """Let a heavy child process yield the CPU to the desktop. Never fatal (only logged)."""
+    try:
+        if os.name == "nt":
+            psutil.Process(pid).nice(psutil.BELOW_NORMAL_PRIORITY_CLASS)
+        else:
+            os.setpriority(os.PRIO_PROCESS, pid, niceness)
+    except (OSError, psutil.Error, AttributeError) as exc:
+        log.info("Could not lower the priority of process %s: %s", pid, exc)
 
 
 def supported_flags(path: Path) -> ServerFlags | None:
@@ -1635,11 +1681,46 @@ KV_F16_MIB_PER_1K_TOKENS_PER_B = 64
 KV_RAM_SHARE = 0.5  # at most half of the RAM left after the model goes to the KV cache
 CACHE_REUSE_TOKENS = 256  # reuse cached prompt prefixes across chat turns (llama-server --cache-reuse)
 FAST_BATCH, FAST_UBATCH = 4096, 1024  # fast profile (llama.cpp defaults: 2048 / 512)
+FAST_MIN_RAM = 15 * GIB  # "fast" needs a 16 GB machine (they report a little less than 16 GiB)
+RAM_SAFETY = 0.85  # model + KV cache may use at most 85 % of the available RAM ...
+CTX_FLOOR = 2048  # ... the context shrinks down to this when the RAM is tight
+MODEL_RAM_LIMIT = 0.8  # a model file larger than 80 % of the total RAM is refused
 
 
 def current_profile() -> str:
     value = settings.get("engine", "profile")
     return value if value in PROFILES else "auto"
+
+
+def effective_profile() -> tuple[str, list[str]]:
+    """The profile actually used (``fast`` needs 16 GB RAM, else ``auto``) and notes for the status."""
+    profile = current_profile()
+    if profile == "fast" and total_ram() < FAST_MIN_RAM:
+        return "auto", ["Profil „fast“ braucht mindestens 16 GB Arbeitsspeicher – es wird „auto“ verwendet."]
+    return profile, []
+
+
+def kv_cache_bytes(params_b: float, ctx: int, *, kv_q8: bool) -> int:
+    """Rough KV cache size (see :data:`KV_F16_MIB_PER_1K_TOKENS_PER_B`)."""
+    return int(KV_F16_MIB_PER_1K_TOKENS_PER_B * MIB * max(params_b, 0.1) * (0.5 if kv_q8 else 1.0) * ctx / 1024)
+
+
+def fit_ctx_to_ram(ctx: int, params_b: float, model_bytes: int, available: int, *, kv_q8: bool) -> int:
+    """Lower ``ctx`` in 1024 steps (not below :data:`CTX_FLOOR`) until model + KV cache fit 85 % of ``available``."""
+    while ctx > CTX_FLOOR and model_bytes + kv_cache_bytes(params_b, ctx, kv_q8=kv_q8) > available * RAM_SAFETY:
+        ctx = max(CTX_FLOOR, (ctx - 1) // 1024 * 1024)
+    return ctx
+
+
+def check_model_fits(entry: CatalogEntry) -> int:
+    """Size of the model's files; refuses (409) a model that needs more than 80 % of the total RAM."""
+    model_bytes, total = _model_bytes(entry), total_ram()
+    if model_bytes > MODEL_RAM_LIMIT * total:
+        device = "deinen Mac" if sys.platform == "darwin" else "deinen Computer"
+        need = f"{model_bytes / GIB:.1f}".replace(".", ",")
+        raise EngineError(f"Dieses Modell braucht etwa {need} GB und ist für {device} mit {total / GIB:.0f} GB "
+                          "Arbeitsspeicher zu groß – wähle ein kleineres Modell.", HTTPStatus.CONFLICT)
+    return model_bytes
 
 
 def _model_bytes(entry: CatalogEntry) -> int:
@@ -1676,7 +1757,7 @@ def ctx_size(entry: CatalogEntry | None = None, *, profile: str | None = None, k
     configured = settings.get("engine", "ctx_size")
     if isinstance(configured, int) and not isinstance(configured, bool) and 512 <= configured <= 131072:
         return configured
-    profile = profile if profile in PROFILES else current_profile()
+    profile = profile if profile in PROFILES else effective_profile()[0]
     entry = entry or find_entry(settings.get("engine", "model_id"))
     if entry is None:  # no model chosen yet: the old rule by total RAM
         upper = CTX_MAX_SAVER if profile == "saver" else CTX_MAX
@@ -1690,19 +1771,25 @@ def server_args(entry: CatalogEntry, binary: Path) -> tuple[list[str], dict]:
     """``-c`` plus the tuning options for ``entry`` (only those the binary lists) and the ``tuning`` status.
 
     auto/saver: flash attention, KV cache q8_0 (only with flash attention), prompt-cache reuse;
-    fast: flash attention, f16 KV cache, larger batches. Unknown options (``--help`` failed): only
-    ``--parallel 1`` like every earlier version.
+    fast (16 GB RAM and more): flash attention, f16 KV cache, larger batches. Threads: all performance
+    cores but two. Unknown options (``--help`` failed): only ``--parallel 1`` like every earlier version.
+    The context shrinks (down to 2048) until model + KV cache fit 85 % of the available RAM; a model
+    larger than 80 % of the total RAM is refused (409).
     """
+    model_bytes = check_model_fits(entry)
     flags = supported_flags(binary)
-    profile = current_profile()
+    profile, notes = effective_profile()
     args: list[str] = []
     flash = kv_q8 = False
-    reuse = None
+    reuse = threads = None
     if flags is None:
         args += ["--parallel", "1"]
     else:
         if opt := flags.get("parallel"):
             args += [opt, "1"]
+        if opt := flags.get("threads"):
+            threads = inference_threads()
+            args += [opt, str(threads)]
         if opt := flags.get("flash_attn"):
             args += [opt, "on"] if flags.flash_attn_value else [opt]
             flash = True
@@ -1720,9 +1807,15 @@ def server_args(entry: CatalogEntry, binary: Path) -> tuple[list[str], dict]:
                 args += [opt, str(FAST_UBATCH)]
         if opt := flags.get("jinja"):
             args.append(opt)
-    ctx = ctx_size(entry, profile=profile, kv_q8=kv_q8)
+    available = int(psutil.virtual_memory().available)
+    wanted = ctx_size(entry, profile=profile, kv_q8=kv_q8, available=available)
+    ctx = fit_ctx_to_ram(wanted, _params_billions(entry, model_bytes), model_bytes, available, kv_q8=kv_q8)
+    if ctx < wanted:
+        log.warning("Context %s does not fit the free RAM (%.1f GiB) next to the model; using %s",
+                    wanted, available / GIB, ctx)
+        notes.append(f"Kontext wegen knappem Arbeitsspeicher auf {ctx} Token verkleinert.")
     tuning = {"profile": profile, "flash_attn": flash, "kv_cache": "q8_0" if kv_q8 else "f16", "ctx_size": ctx,
-              "cache_reuse": reuse}
+              "cache_reuse": reuse, "threads": threads, "note": " ".join(notes) or None}
     return ["-c", str(ctx), *args], tuning
 
 
@@ -1883,6 +1976,7 @@ class EngineManager:
         self._key: str | None = None
         self._shutting_down = False
         self._restart_times: list[float] = []  # automatic restarts within RESTART_WINDOW_S (monotonic)
+        self._crash_locked = False  # restart limit reached: only a manual start may start it again
         self._last_use = time.monotonic()
         self._info = self._idle()
 
@@ -1895,6 +1989,19 @@ class EngineManager:
         """Record a use of the model (the idle unloader counts from the last one)."""
         with self._lock:
             self._last_use = time.monotonic()
+
+    def check_alive(self) -> None:
+        """A "ready" server whose process already exited is handled as crashed right now.
+
+        The watch thread notices an exit only some milliseconds later; until then the state would
+        still say "ready" with the URL of a dead port. Same path as the monitor (``_on_exit``): mark it
+        down and let the supervisor restart it; the generation check makes the late monitor a no-op.
+        """
+        with self._lock:
+            proc, gen = self._proc, self._gen
+            dead = proc is not None and self._info["state"] == "ready" and proc.poll() is not None
+        if dead:
+            self._on_exit(proc, gen, log_path(), was_ready=True)
 
     def snapshot(self) -> dict:
         with self._lock:
@@ -1940,10 +2047,18 @@ class EngineManager:
             raise EngineError("The llama.cpp runtime is not installed yet. Install it under Models & Settings.")
         return binary
 
-    def start(self, model_id: str | None = None, *, persist: bool = True) -> dict:
+    def start(self, model_id: str | None = None, *, persist: bool = True, manual: bool = False) -> dict:
+        """``manual``: the user pressed start – this also lifts the lock after repeated crashes."""
         with self._op:
             self._check_startable()
+            with self._lock:
+                if manual:
+                    self._crash_locked = False
+                    self._restart_times.clear()
+                elif self._crash_locked:
+                    raise EngineError(CRASH_LOCK_MESSAGE, HTTPStatus.CONFLICT)
             entry = self._pick_model(model_id)
+            check_model_fits(entry)  # before a running server is stopped for it
             binary = self._binary()
             with self._lock:
                 if self._info["state"] in ("starting", "ready") and self._info["model_id"] == entry.id:
@@ -1983,6 +2098,7 @@ class EngineManager:
             raise EngineError(f"Could not start llama-server: {exc}", HTTPStatus.INTERNAL_SERVER_ERROR) from None
         finally:
             os.close(log_fd)
+        lower_priority(proc.pid, LLAMA_NICE)
         with self._lock:
             self._gen += 1
             gen = self._gen
@@ -2067,7 +2183,7 @@ class EngineManager:
             now = time.monotonic()
             self._restart_times = [t for t in self._restart_times if now - t < RESTART_WINDOW_S]
             model_id = self._info["model_id"]
-            if (was_ready and model_id and not self._shutting_down and not self._paused
+            if (was_ready and model_id and not self._shutting_down and not self._paused and not self._crash_locked
                     and len(self._restart_times) < RESTART_LIMIT):
                 self._restart_times.append(now)
                 delay = RESTART_BACKOFF_S[min(len(self._restart_times), len(RESTART_BACKOFF_S)) - 1]
@@ -2077,8 +2193,9 @@ class EngineManager:
             else:
                 head = f"llama-server {reason}."
                 if was_ready and len(self._restart_times) >= RESTART_LIMIT:
-                    head = (f"llama-server {reason} again after {RESTART_LIMIT} automatic restarts within "
-                            f"{RESTART_WINDOW_S / 60:g} minutes, so it is not restarted any more.")
+                    self._crash_locked = True  # stays "error" until the user starts it again
+                    head = (f"{CRASH_LOCK_MESSAGE} llama-server {reason} – schon {RESTART_LIMIT} automatische "
+                            f"Neustarts in {RESTART_WINDOW_S / 60:g} Minuten.")
                 self._info.update(state="error", pid=None, error=(
                     head + (f" Last log lines:\n{tail}" if tail else ""))[:4000])
             self._cond.notify_all()
@@ -2191,6 +2308,7 @@ class EngineManager:
     def ensure_running(self, timeout: float = HEALTH_TIMEOUT_S, model_id: str | None = None) -> str:
         if external():
             return config.llm_url()
+        self.check_alive()  # never hand out the URL of a process that just died
         with self._lock:
             self._last_use = time.monotonic()  # in use from now on: the idle unloader leaves it alone
             info = dict(self._info)
@@ -2202,6 +2320,10 @@ class EngineManager:
             while True:
                 state = self._info["state"]
                 if state == "ready" and self._url:
+                    proc = self._proc
+                    if proc is not None and proc.poll() is not None:  # died a moment ago: wait for the restart
+                        self._on_exit(proc, self._gen, log_path(), was_ready=True)
+                        continue
                     self._last_use = time.monotonic()
                     return self._url
                 if state == "error":
@@ -2269,6 +2391,7 @@ atexit.register(lambda: _manager.kill_now())
 
 
 def status() -> dict:
+    _manager.check_alive()
     return {
         "runtime": runtime_info(),
         "server": _manager.snapshot(),
@@ -2278,8 +2401,9 @@ def status() -> dict:
     }
 
 
-def start(model_id: str | None = None, *, persist: bool = True) -> dict:
-    return _manager.start(model_id, persist=persist)
+def start(model_id: str | None = None, *, persist: bool = True, manual: bool = False) -> dict:
+    """Start llama-server; ``manual`` (the user's start button) also lifts the lock after repeated crashes."""
+    return _manager.start(model_id, persist=persist, manual=manual)
 
 
 def stop() -> dict:
@@ -2404,7 +2528,7 @@ def route_start(req: Request) -> Response:
     model_id = req.json().get("model_id")
     if model_id is not None and (not isinstance(model_id, str) or not MODEL_ID_RE.fullmatch(model_id)):
         raise HTTPError(HTTPStatus.BAD_REQUEST, "model_id must be a catalog id")
-    return Response({"server": start(model_id)}, HTTPStatus.ACCEPTED)
+    return Response({"server": start(model_id, manual=True)}, HTTPStatus.ACCEPTED)
 
 
 @route("POST", r"/api/engine/stop")

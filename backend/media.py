@@ -777,6 +777,43 @@ def _probe_binary(path: Path) -> dict | None:
     return info
 
 
+SD_NICE = 10  # generation runs for minutes: lower priority keeps the desktop responsive (and cooler)
+_threads_cache: dict[tuple[str, int, int], bool] = {}
+
+
+def _sd_lists_threads(path: Path) -> bool:
+    """``sd-cli -h`` lists ``-t/--threads`` (cached per binary path, mtime and size)."""
+    try:
+        stat = path.stat()
+    except OSError:
+        return False
+    key = (str(path), stat.st_mtime_ns, stat.st_size)
+    with _probe_lock:
+        if key in _threads_cache:
+            return _threads_cache[key]
+    found = False
+    try:
+        result = subprocess.run(
+            [str(path), "-h"], cwd=str(media_tmp_dir()), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, timeout=PROBE_TIMEOUT_S, env=_child_env(path), check=False,
+        )
+        text = result.stdout[:262144].decode("utf-8", "replace")
+        found = re.search(r"(?m)^[ \t]{0,8}(?:-t\b|--threads\b)", text) is not None
+    except (OSError, subprocess.SubprocessError) as exc:
+        log.info("Could not read the options of %s: %s", path, exc)
+    with _probe_lock:
+        _threads_cache[key] = found
+    return found
+
+
+def _engine_attr(name: str) -> Any:
+    """A helper of ``backend.engine`` (thread count, priority), or ``None`` when it is not available."""
+    try:
+        return getattr(importlib.import_module(f"{__package__}.engine"), name, None)
+    except ImportError:
+        return None
+
+
 RUNTIME_CACHE_TTL_S = 30.0
 _runtime_cache: tuple[float, dict] | None = None
 
@@ -787,6 +824,7 @@ def invalidate_runtime_cache() -> None:
     with _probe_lock:
         _runtime_cache = None
         _probe_cache.clear()
+        _threads_cache.clear()
 
 
 def _runtime_installed(path: Path) -> None:
@@ -1296,10 +1334,13 @@ class MediaWorker:
             else:
                 argv = build_video_args(binary, model, files, job, tmp / "output.webm")
                 timeout = VIDEO_TIMEOUT_S
+            threads = _engine_attr("inference_threads")
+            if callable(threads) and _sd_lists_threads(binary):
+                argv[1:1] = ["-t", str(threads())]  # leave two performance cores for the desktop
             parser = ProgressParser(job["kind"], job["params"].get("steps"))
             _update_running(job_id, 0.01, "Loading the model… (this can take a minute)")
             code = self._run_process(job_id, argv, tmp, timeout, stop, _ProgressReporter(job_id, parser),
-                                     _child_env(binary))
+                                     _child_env(binary), nice=SD_NICE)
             if code != 0:
                 summary = parser.failure_summary()
                 raise MediaJobError(
@@ -1371,8 +1412,9 @@ class MediaWorker:
         stop: threading.Event,
         reporter: _ProgressReporter,
         env: dict[str, str],
+        nice: int | None = None,
     ) -> int:
-        """Run ``argv`` (no shell) in its own process group; cancellable, with a timeout."""
+        """Run ``argv`` (no shell) in its own process group; cancellable, with a timeout; ``nice``: lower priority."""
         self._check_cancel(job_id, stop)
         kwargs: dict[str, Any] = {}
         if os.name == "nt":
@@ -1386,6 +1428,9 @@ class MediaWorker:
             )
         except OSError as exc:
             raise MediaJobError(f"Could not start {Path(argv[0]).name}: {exc}") from exc
+        lower = _engine_attr("lower_priority") if nice is not None else None
+        if callable(lower):
+            lower(proc.pid, nice)  # never raises
         with self._lock:
             self._proc = proc
             cancelled_early = job_id in self._cancel

@@ -219,6 +219,14 @@ class RuntimeDiscoveryTests(MediaTestCase):
 
 @unittest.skipUnless(POSIX, "fake executables are POSIX scripts")
 class WorkerTests(MediaTestCase):
+    def test_sd_gets_threads_and_low_priority(self):
+        self.engine.inference_threads = lambda: 6  # the engine's helpers (unit-tested in test_engine)
+        self.engine.lower_priority = mock.Mock()
+        job = self.wait_status(media.submit_job(image_job(prompt="a cat"))["id"])
+        self.assertEqual(job["status"], "done", job)
+        self.assertEqual(self.argv_calls()[-1]["argv"][:2], ["-t", "6"])  # the fake's -h lists -t/--threads
+        self.assertEqual(self.engine.lower_priority.call_args.args[1], 10)
+
     def test_image_job_end_to_end(self):
         job = media.submit_job(image_job(prompt=NASTY, seed=11))
         self.assertEqual(job["status"], "queued")
