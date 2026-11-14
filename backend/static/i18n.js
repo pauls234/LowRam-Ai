@@ -79,6 +79,10 @@
     'File not found – install {file} ({size}) instead?': 'Datei nicht gefunden – stattdessen {file} ({size}) installieren?',
     'The model file is no longer available under its old name. LowRAM AI found a matching file in the same repository.': 'Die Modelldatei gibt es unter ihrem alten Namen nicht mehr. LowRAM AI hat im selben Repository eine passende Datei gefunden.',
     'Install instead': 'Stattdessen installieren',
+    'Run code written by the AI?': 'Von der KI geschriebenen Code ausführen?',
+    'These files were written by the AI and are executed by the test run: {files}. Only continue if you have reviewed them. Run the tests anyway?': 'Diese Dateien hat die KI geschrieben, und sie werden beim Testlauf ausgeführt: {files}. Fahre nur fort, wenn du sie geprüft hast. Tests trotzdem ausführen?',
+    'Run tests anyway': 'Tests trotzdem ausführen',
+    'Tests ran without the macOS sandbox.': 'Die Tests liefen ohne macOS-Sandbox.',
 
     // app
     'Not available in this build': 'In dieser Version nicht enthalten',

@@ -603,6 +603,7 @@
         run.state === 'running' && LR.isNum(run.id) ? LR.button({ text: LR.t('Cancel'), icon: 'stop', size: 'sm', variant: 'secondary', cls: 'tests-cancel', disabled: Boolean(t.cancelling), onclick: (ev) => cancelRun(pid, run.id, ev.currentTarget) }) : null,
       ]));
       if (run.command) out.push(h('p', { class: 'muted small tests-cmd' }, [h('span', { text: LR.t('Command:') + ' ' }), h('code', { text: LR.str(run.command) })]));
+      if (run.sandboxed === false) out.push(LR.callout({ tone: 'warn', title: LR.t('Tests ran without the macOS sandbox.'), text: LR.str(run.warning || '') }));
       if (run.error && run.state !== 'running') out.push(h('p', { class: 'small tests-error', text: runErrorText(run.error) }));
       if (run.output_tail) out.push(h('pre', { class: 'tests-output', tabindex: '0', 'aria-label': LR.t('Test output (last lines)'), text: LR.str(run.output_tail) }));
       if (run.state === 'failed' || run.state === 'timeout') {
@@ -676,7 +677,23 @@
     t.starting = true;
     renderTestRun(pid);
     try {
-      const data = await LR.post('/api/coding/projects/' + pid + '/run-tests', {});
+      const url = '/api/coding/projects/' + pid + '/run-tests';
+      let data;
+      try {
+        data = await LR.post(url, {});
+      } catch (first) {
+        // The AI wrote files that this test run executes: never run them without an explicit OK.
+        if (!(first.status === 409 && first.data && first.data.needs_confirmation)) throw first;
+        const files = Array.isArray(first.data.ai_files) ? first.data.ai_files.slice(0, 12).map(String) : [];
+        const ok = await LR.confirm({
+          title: LR.t('Run code written by the AI?'),
+          message: LR.t('These files were written by the AI and are executed by the test run: {files}. Only continue if you have reviewed them. Run the tests anyway?', { files: files.join(', ') || '–' }),
+          confirmText: LR.t('Run tests anyway'),
+          danger: true,
+        });
+        if (!ok) return;
+        data = await LR.post(url, { confirm: true });
+      }
       t.run = data.run || null;
       pollRun(pid);
     } catch (err) {
