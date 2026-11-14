@@ -49,13 +49,27 @@ LOWRAM_ICNS="$ICNS" "$PYTHON" -m PyInstaller --noconfirm --clean \
 echo "==> Check bundle"
 test -x "$APP/Contents/MacOS/LowRAM AI"
 test -f "$APP/Contents/Resources/LowRAM-AI.icns"
-plutil -extract CFBundleIdentifier raw "$APP/Contents/Info.plist" | grep -qx "ai.lowram.studio"
-# PyInstaller signs ad hoc (required on Apple Silicon); re-sign if the seal is broken.
-if ! codesign --verify --deep --strict "$APP" 2>/dev/null; then
-  codesign --force --deep --sign - "$APP"
-  codesign --verify --deep --strict "$APP"
-fi
+PLIST="$APP/Contents/Info.plist"
+plutil -extract CFBundleIdentifier raw "$PLIST" | grep -qx "ai.lowram.studio"
+plutil -extract CFBundleShortVersionString raw "$PLIST" | grep -qx "$VERSION"
+plutil -extract NSLocalNetworkUsageDescription raw "$PLIST" >/dev/null
+plutil -extract LSMinimumSystemVersion raw "$PLIST" | grep -qx "12.0"
+
+echo "==> Ad-hoc signature"
+# Not a Developer ID signature (see docs/DESKTOP.md), but Apple Silicon needs a
+# valid seal over the whole bundle after PyInstaller has assembled it.
+codesign --force --deep --sign - "$APP"
+codesign --verify --deep --strict --verbose=2 "$APP"
 
 echo "==> Zip"
+# ditto keeps symlinks (Python.framework inside the bundle), permissions and
+# extended attributes; plain `zip` would break the signature.
 ditto -c -k --keepParent "$APP" "$ZIP"
+CHECK="$BUILD/zip-check"
+rm -rf "$CHECK"
+mkdir -p "$CHECK"
+ditto -x -k "$ZIP" "$CHECK"
+codesign --verify --deep --strict "$CHECK/LowRAM AI.app"
+test -x "$CHECK/LowRAM AI.app/Contents/MacOS/LowRAM AI"
+rm -rf "$CHECK"
 echo "Built $APP and $ZIP ($(du -h "$ZIP" | cut -f1))"

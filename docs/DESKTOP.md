@@ -103,13 +103,51 @@ models – when it is missing, LowRAM AI says so instead of failing silently.
 
 ### Devices (other computers)
 
-The first time you turn on **Devices**, macOS asks *"Do you want the
-application "LowRAM AI" to accept incoming network connections?"* – click
-**Allow**. Other computers on your network need this to connect; LowRAM AI
-then listens on your local network with TLS and per-device keys, only while
-Devices is on. Windows shows a similar firewall prompt – allow it for
-*private* networks only. If you clicked *Deny* by mistake: System Settings →
-Network → Firewall → Options → LowRAM AI → Allow incoming connections.
+Turning on **Devices** can bring up two macOS prompts – allow both:
+
+1. **Local Network** (macOS 15 and newer): *"LowRAM AI" would like to find and
+   connect to devices on your local network* (with the text "LowRAM AI finds
+   and connects to your other computers on the same network."). Needed for
+   finding other computers (UDP broadcast/multicast on port 8767) and for
+   connecting to them. If you denied it: System Settings → Privacy & Security
+   → Local Network → turn on LowRAM AI.
+2. **Incoming connections** (only if the macOS firewall is on): *"Do you want
+   the application "LowRAM AI" to accept incoming network connections?"* –
+   click **Allow** so other computers can connect. If you clicked *Deny*:
+   System Settings → Network → Firewall → Options → LowRAM AI → Allow
+   incoming connections.
+
+LowRAM AI listens on your local network only while Devices is on, with TLS
+and per-device keys. Windows shows a similar firewall prompt – allow it for
+*private* networks only. Because the app is only ad-hoc signed, macOS may ask
+again after you install a new version.
+
+### MacBook: long jobs, battery and notifications
+
+* **Stays awake while it works.** During the task queue, image/video jobs and
+  helping another computer, LowRAM AI runs macOS's own `caffeinate -i -w
+  <its process id>`, so the Mac does not fall asleep in the middle of a job.
+  It ends as soon as the last job finishes (and by itself if LowRAM AI quits
+  or crashes). Closing the lid still puts a MacBook to sleep unless an
+  external display is connected. Setting: *Keep the computer awake*
+  (`power.keep_awake`). On Windows the same is done with
+  `SetThreadExecutionState`; on Linux nothing is changed.
+* **Pauses on low battery.** On battery below 20 % (setting
+  `power.battery_min_percent`, 0 = never), long jobs wait: the task queue
+  stops between two tasks ("On battery at 15 % – long jobs pause below 20 %.
+  Plug in to continue."), image/video jobs stay queued with that message, and
+  a helper computer stops taking new tasks. Plug in and they continue (the
+  task queue needs one click on *Run*). Chat is never paused.
+* **Notifications** when the task queue finishes, an image or video is ready
+  or failed, a computer asks to join (with the number to compare), or a
+  combined result of a distributed project is ready. They are sent with
+  `osascript` (`display notification`); macOS shows them as coming from
+  *Script Editor*, and the first one may ask for permission – if you see
+  nothing, allow notifications for Script Editor in System Settings →
+  Notifications. Setting: `power.notifications`. At most one notification per
+  kind every 5 seconds.
+* `GET /api/power` shows the battery, the active keep-awake reasons and the
+  settings.
 
 ## Build the app yourself
 
@@ -125,8 +163,13 @@ python -m PyInstaller --noconfirm --clean desktop/LowRAM-AI.spec   # Windows/Lin
   `FEATURE_MODULES` in the spec), `backend/static/`, the splash icon and
   certifi's CA bundle (HTTPS downloads in the frozen app).
 * `desktop/build_macos.sh` turns `desktop/assets/icon-*.png` into an `.icns`
-  with `sips`/`iconutil`, runs PyInstaller, checks the bundle
-  (`ai.lowram.studio`, ad-hoc signature) and zips it with `ditto`.
+  with `sips`/`iconutil`, runs PyInstaller, checks the Info.plist
+  (`ai.lowram.studio`, version, macOS 12+, `NSLocalNetworkUsageDescription`,
+  `NSAllowsLocalNetworking` for the window's `http://127.0.0.1`), signs the
+  whole bundle ad hoc (`codesign --force --deep --sign -`), zips it with
+  `ditto` (keeps symlinks and permissions) and verifies the signature of the
+  unzipped copy. No `NSBonjourServices`: discovery uses plain UDP
+  broadcast/multicast, not Bonjour.
   `LOWRAM_TARGET_ARCH=universal2` builds for Intel Macs too (needs a universal2 Python).
 * Smoke test without a window: `"dist/LowRAM AI.app/Contents/MacOS/LowRAM AI" --headless --port 8799`
   then `curl http://127.0.0.1:8799/api/status`.

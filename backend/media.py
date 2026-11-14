@@ -60,7 +60,7 @@ from typing import Any
 
 import psutil
 
-from . import config, db, settings
+from . import config, db, power, settings
 from .web import FileResponse, HTTPError, Request, Response, on_shutdown, on_startup, route
 
 log = logging.getLogger("lowram.media")
@@ -93,6 +93,7 @@ VIDEO_TIMEOUT_S = 6 * 3600
 TRANSCODE_TIMEOUT_S = 30 * 60
 PROBE_TIMEOUT_S = 15.0
 SLOT_RETRY_S = 2.0
+BATTERY_RETRY_S = 15.0  # how often a job waiting for power re-checks the battery
 IDLE_POLL_S = 5.0
 PROGRESS_WRITE_INTERVAL_S = 0.5
 CANCEL_WAIT_S = 5.0
@@ -1234,6 +1235,10 @@ class MediaWorker:
         job = _next_queued_job()
         if job is None:
             return IDLE_POLL_S
+        on_battery = power.battery_block_reason()
+        if on_battery:  # the job stays queued and shows why
+            _set_queued_message(job["id"], on_battery)
+            return BATTERY_RETRY_S
         with contextlib.ExitStack() as stack:
             try:
                 stack.enter_context(db.inference_slot(f"{job['kind']} generation #{job['id']}"))
@@ -1242,6 +1247,7 @@ class MediaWorker:
                 return SLOT_RETRY_S
             if not _mark_running(job["id"]):
                 return 0.0  # cancelled while waiting
+            stack.enter_context(power.keep_awake(f"{job['kind']} generation #{job['id']}"))
             with self._lock:
                 self._current = job["id"]
             try:
@@ -1311,6 +1317,8 @@ class MediaWorker:
                 output_file=dest.name, output_type=content_type,
             )
             log.info("Media job #%s done (%s)", job_id, content_type)
+            power.notify(f"{job['kind'].capitalize()} ready",
+                         f"Done in {_format_seconds(time.monotonic() - started)}: {job.get('prompt') or ''}")
         except _Cancelled:
             _finish(job_id, "cancelled", message="Cancelled.")
         except _Stopped:
@@ -1320,9 +1328,11 @@ class MediaWorker:
             )
         except MediaJobError as exc:
             _finish(job_id, "failed", message="Failed", error=str(exc))
+            power.notify(f"{job['kind'].capitalize()} failed", str(exc))
         except Exception as exc:  # recorded as an explicit failure, never as success
             log.exception("Media job #%s crashed", job_id)
             _finish(job_id, "failed", message="Failed", error=f"Unexpected error: {exc}")
+            power.notify(f"{job['kind'].capitalize()} failed", f"Unexpected error: {exc}")
         finally:
             if tmp is not None:
                 shutil.rmtree(tmp, ignore_errors=True)

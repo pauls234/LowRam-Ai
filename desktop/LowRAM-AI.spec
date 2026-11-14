@@ -29,7 +29,7 @@ VERSION = re.search(r'__version__\s*=\s*"([^"]+)"', (ROOT / "backend" / "__init_
 # Feature modules are imported by name (importlib) in backend/app.py, so the
 # import scanner cannot see them. Modules that do not exist yet only produce an
 # "ERROR: Hidden import ... not found" line; the build continues.
-FEATURE_MODULES = ["api_coding", "chat", "engine", "downloads", "media", "cluster", "worker"]
+FEATURE_MODULES = ["api_coding", "chat", "engine", "downloads", "media", "cluster", "worker", "power"]
 hiddenimports = sorted(
     {f"backend.{p.stem}" for p in (ROOT / "backend").glob("*.py") if p.stem != "__init__"}
     | {f"backend.{name}" for name in FEATURE_MODULES}
@@ -131,5 +131,10 @@ if sys.platform == "darwin":
             "LSApplicationCategoryType": "public.app-category.productivity",
             # The window loads the local server over plain http://127.0.0.1.
             "NSAppTransportSecurity": {"NSAllowsLocalNetworking": True},
+            # macOS 15+: Devices (UDP broadcast/multicast discovery on port 8767 and
+            # TLS connections to other computers) needs the Local Network
+            # permission; this text is shown in the system prompt. No Bonjour
+            # (NSBonjourServices) is used, so no service types are declared.
+            "NSLocalNetworkUsageDescription": "LowRAM AI finds and connects to your other computers on the same network.",
         },
     )

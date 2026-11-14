@@ -38,7 +38,7 @@ from urllib.parse import urlparse
 
 import psutil
 
-from . import artifacts, cluster, config, db, llm, memory, settings
+from . import artifacts, cluster, config, db, llm, memory, power, settings
 
 log = logging.getLogger("lowram.worker")
 
@@ -698,6 +698,11 @@ class Worker:
                 url = None
                 continue
             model_delay = self.idle_min_s
+            on_battery = power.battery_block_reason()  # MacBook on battery: no new work
+            if on_battery:
+                self._set(state="idle", message=on_battery)
+                self._wait(self.idle_max_s)
+                continue
             busy = self.busy_check()  # do not even claim while this computer is busy
             if busy:
                 self._set(state="idle", message=f"Waiting: {busy}")
@@ -721,7 +726,8 @@ class Worker:
             with self._lock:
                 self._current = task  # from now on stop() hands it back
             try:
-                with self.slot(f"helping {self._status.get('host') or 'another device'} (worker)"):
+                with self.slot(f"helping {self._status.get('host') or 'another device'} (worker)"), \
+                        power.keep_awake("helping another device"):
                     self._process(task, url, plan)
             except db.Busy as exc:  # the slot was taken between the check and the claim
                 self._hand_back(task, f"The helper became busy: {exc}")
