@@ -33,7 +33,9 @@ FEATURE_MODULES = ["api_coding", "chat", "engine", "downloads", "media", "cluste
 hiddenimports = sorted(
     {f"backend.{p.stem}" for p in (ROOT / "backend").glob("*.py") if p.stem != "__init__"}
     | {f"backend.{name}" for name in FEATURE_MODULES}
-    | {"desktop", "desktop.launcher", "certifi"}
+    | {"desktop", "desktop.launcher", "desktop.tray", "certifi"}
+    # menu-bar icon (desktop/tray.py imports these lazily; pyobjc comes with pywebview)
+    | ({"AppKit", "Foundation", "PyObjCTools.AppHelper"} if sys.platform == "darwin" else set())
 )
 
 datas = [
