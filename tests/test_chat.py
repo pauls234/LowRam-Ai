@@ -317,6 +317,28 @@ class ConversationApiTests(ChatApiTestCase):
         self.assertIn("Interrupted", message["error"])
         self.assertIn(chat.recover_interrupted, __import__("backend.web").web.STARTUP_HOOKS)
 
+    def test_startup_settles_an_interrupted_regenerate(self):
+        cid = self.new_chat()
+
+        def add(content, role="assistant", status="streaming"):
+            with db.connect() as conn:
+                conn.execute(
+                    "INSERT INTO messages (conversation_id, role, content, status, created_at) VALUES (?, ?, ?, ?, ?)",
+                    (cid, role, content, status, db.utcnow()),
+                )
+
+        add("q", "user", "complete")
+        add("old", status="complete")
+        add("")  # no text yet: the previous answer stays
+        with self.assertLogs("lowram.chat", "WARNING"):
+            self.assertEqual(chat.recover_interrupted(None), 1)
+        self.assertEqual([(m["content"], m["status"]) for m in self.messages(cid)], [("q", "complete"), ("old", "complete")])
+        add("new text")  # with text: it replaces the previous answer
+        with self.assertLogs("lowram.chat", "WARNING"):
+            chat.recover_interrupted(None)
+        self.assertEqual([(m["content"], m["status"]) for m in self.messages(cid)], [("q", "complete"), ("new text", "stopped")])
+        self.assertEqual(chat.get_conversation(cid)["message_count"], 2)
+
 
 class StreamingApiTests(ChatApiTestCase):
     def test_full_answer_events_and_persistence(self):
@@ -930,6 +952,46 @@ class SmartChatApiTests(ChatApiTestCase):
         self.assertTrue(messages[-1]["content"].startswith("q2") and "file text" in messages[-1]["content"])
         with db.inference_slot("image job"):
             self.assertEqual(SSEClient(self.port, f"/api/chats/{cid}/regenerate", {}).status, 409)
+
+    def test_failed_or_stopped_regenerate_keeps_previous_answer(self):
+        cid = self.new_chat()
+        self.fake.push(Stream(["first"]), HttpError(500, "boom"))
+        old = self.send(cid, "q1").rest()[-1]["message"]
+        error = SSEClient(self.port, f"/api/chats/{cid}/regenerate", {}).rest()[-1]
+        self.assertEqual((error["type"], error["kept_previous"]), ("error", True))
+        self.assertEqual((error["message"]["id"], error["message"]["content"]), (old["id"], "first"))
+        stored = self.messages(cid)
+        self.assertEqual([(m["id"], m["content"], m["status"]) for m in stored[1:]], [(old["id"], "first", "complete")])
+        # Stopped before the first token: kept too; meanwhile only the new answer is listed.
+        release = threading.Event()
+        self.addCleanup(release.set)
+        self.fake.push(Hold(release))
+        client = SSEClient(self.port, f"/api/chats/{cid}/regenerate", {})
+        self.assertEqual(client.next()["type"], "start")
+        self.assertEqual([m["status"] for m in self.messages(cid)], ["complete", "streaming"])
+        self.assertTrue(self.api("POST", f"/api/chats/{cid}/stop", {})[1]["stopped"])
+        done = client.rest()[-1]
+        client.close()
+        self.assertEqual((done["type"], done["kept_previous"], done["message"]["id"]), ("done", True, old["id"]))
+        self.assertEqual([(m["id"], m["status"]) for m in self.messages(cid)], [(stored[0]["id"], "complete"), (old["id"], "complete")])
+        self.assertEqual(chat.get_conversation(cid)["message_count"], 2)
+        self.assertIsNone(db.busy_reason())
+
+    def test_answer_setup_failure_never_leaves_streaming(self):
+        cid = self.new_chat()
+        self.fake.push(Stream(["Partial"], finish_reason="length"))
+        self.send(cid, "q1").rest()
+        with mock.patch.object(chat, "_Answer", side_effect=RuntimeError("kaputt")), self.assertLogs(level="ERROR"):
+            for path, body in (("continue", {}), ("regenerate", {}), ("messages", {"content": "q2"})):
+                with self.subTest(path=path):
+                    self.assertEqual(self.api("POST", f"/api/chats/{cid}/{path}", body)[0], 500)
+        stored = self.messages(cid)
+        self.assertEqual([(m["content"], m["status"]) for m in stored],
+                         [("q1", "complete"), ("Partial", "complete"), ("q2", "complete"), ("", "error")])
+        self.assertTrue(stored[1]["truncated"])
+        self.assertIn("could not be started", stored[3]["error"])
+        self.assertIsNone(db.busy_reason())
+        self.assertFalse(chat._ACTIVE)
 
     def test_search(self):
         apples = self.new_chat(title="Äpfel und Birnen")
