@@ -10,6 +10,15 @@
 * Server: one ``llama-server`` bound to 127.0.0.1, state machine
   stopped -> starting -> ready/error, crash detection with the last log lines.
   Never started when ``LOWRAM_LLM_URL`` points at an external server.
+* Turbo (v0.4): the options the installed binary supports are read from its
+  ``--help`` (cached per binary) and only those are passed; profiles
+  auto/saver/fast pick flash attention, the KV cache type, prompt-cache reuse
+  and a context size derived from the free RAM. A server that crashes after it
+  was ready is restarted (at most :data:`RESTART_LIMIT` times per
+  :data:`RESTART_WINDOW_S`); an idle server is unloaded to free the RAM and
+  loaded again by the next :func:`ensure_running`.
+* Interrupted model downloads are journalled in ``<home>/pending_installs.json``
+  and resumed (HTTP Range, SHA-256 still verified) at the next start.
 """
 
 from __future__ import annotations
@@ -39,7 +48,7 @@ from dataclasses import dataclass, replace
 from http import HTTPStatus
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, unquote, urlparse
+from urllib.parse import quote, unquote, urlencode, urlparse
 
 import psutil
 
@@ -68,6 +77,11 @@ HEALTH_REQUEST_TIMEOUT_S = 2.0
 STOP_GRACE_S = 10.0
 LOG_TAIL_LINES = 20
 MAX_HF_PAGES = 5
+HELP_TIMEOUT_S = 10.0
+RESTART_LIMIT = 3  # automatic restarts of a llama-server that crashed after it was ready ...
+RESTART_WINDOW_S = 600.0  # ... within 10 minutes; one crash more and the state stays "error"
+RESTART_BACKOFF_S = (2.0, 10.0, 30.0)  # pause before the 1st / 2nd / 3rd automatic restart
+IDLE_CHECK_S = 30.0  # how often a ready server checks whether it was idle long enough to unload it
 
 # Platform key -> regexes for the release asset names (first match wins; .tar.gz preferred).
 ASSET_PATTERNS: dict[str, tuple[str, ...]] = {
@@ -453,6 +467,79 @@ def runtime_info() -> dict:
     }
 
 
+# Tuning features -> their spellings in ``llama-server --help`` (preferred first; older builds
+# printed only some of them). A feature is used only when one of its spellings is listed.
+FLAG_SPELLINGS: dict[str, tuple[str, ...]] = {
+    "flash_attn": ("--flash-attn", "-fa"),
+    "cache_type_k": ("--cache-type-k", "-ctk"),
+    "cache_type_v": ("--cache-type-v", "-ctv"),
+    "cache_reuse": ("--cache-reuse",),
+    "batch_size": ("--batch-size", "-b"),
+    "ubatch_size": ("--ubatch-size", "-ub"),
+    "parallel": ("--parallel", "-np"),
+    "jinja": ("--jinja",),
+}
+_HELP_LINE_RE = re.compile(r"^[ \t]{0,8}(-{1,2}[A-Za-z].*)$")  # option lines start (nearly) at column 0
+_HELP_GAP_RE = re.compile(r"(?<![,\s])\s{2,}")  # option names | description
+_HELP_NAME_RE = re.compile(r"(?<![\w-])-{1,2}[A-Za-z][\w-]*")
+
+
+@dataclass(frozen=True)
+class ServerFlags:
+    """Options an installed llama-server accepts (parsed from its ``--help``)."""
+
+    options: frozenset[str]
+    flash_attn_value: bool = False  # newer builds: ``--flash-attn on|off|auto``; older ones: a bare switch
+
+    def get(self, feature: str) -> str | None:
+        return next((name for name in FLAG_SPELLINGS[feature] if name in self.options), None)
+
+
+def parse_help(text: str) -> ServerFlags | None:
+    """Options listed by ``llama-server --help``; ``None`` when the text is not a llama-server help."""
+    options: set[str] = set()
+    flash_value = False
+    for line in text.splitlines():
+        match = _HELP_LINE_RE.match(line)
+        if not match:
+            continue
+        rest = match.group(1)
+        names = set(_HELP_NAME_RE.findall(_HELP_GAP_RE.split(rest, 1)[0]))
+        options |= names
+        if names & {"-fa", "--flash-attn"}:
+            flash_value = bool(re.search(r"on\s*\|\s*off|\bauto\b|'on'", rest, re.IGNORECASE))
+    return ServerFlags(frozenset(options), flash_value) if "--port" in options else None
+
+
+_flags_cache: dict[tuple[str, int, int], ServerFlags | None] = {}
+
+
+def supported_flags(path: Path) -> ServerFlags | None:
+    """Options of ``llama-server --help`` (cached per binary). ``None`` = unknown: use the basic options only."""
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    key = (str(path), st.st_mtime_ns, st.st_size)
+    with _version_lock:
+        if key in _flags_cache:
+            return _flags_cache[key]
+    flags = None
+    try:
+        proc = subprocess.run(
+            [str(path), "--help"], stdin=subprocess.DEVNULL, capture_output=True,
+            timeout=HELP_TIMEOUT_S, env=_child_env(path), check=False,
+        )
+        flags = parse_help((proc.stdout + b"\n" + proc.stderr).decode("utf-8", "replace"))
+        if flags is None:
+            log.info("llama-server --help listed no options; starting it with the basic options only")
+    except (OSError, subprocess.SubprocessError) as exc:
+        log.info("Could not read the llama-server options (%s); starting it with the basic options only", exc)
+    with _version_lock:
+        _flags_cache[key] = flags
+    return flags
+
+
 def platform_key(system: str | None = None, machine: str | None = None) -> str:
     system = system or sys.platform
     machine = (machine or platform.machine() or "").lower()
@@ -668,10 +755,13 @@ def install_model(model_id: str, filename: object = None) -> dict:
     _require_models_dir()
     sha256, size = _hf_file_meta(entry, chosen)
     url = HF_RESOLVE_URL.format(repo=entry.repo, filename=quote(chosen or entry.filename))
-    return downloads.start(
+    job = downloads.start(
         job_id, url, model_path(entry), sha256=sha256, size=size, label=entry.name, kind="model",
         on_complete=_model_installed(entry, sha256, size, chosen),
     )
+    _track_install({"key": job_id, "type": "catalog", "model_id": entry.id, "filename": chosen,
+                    "files": [p.name for p in model_files(entry)]}, [job_id])
+    return job
 
 
 def delete_model(model_id: str) -> None:
@@ -987,8 +1077,12 @@ def _check_free_space(folder: Path, needed: int) -> None:
 
 
 def install_custom(repo: object, filename: object, name: object = None, purpose: object = None,
-                   revision: object = "main") -> tuple[dict, str]:
-    """Download any GGUF model from Hugging Face (verified with its SHA-256). Returns (download, model_id)."""
+                   revision: object = "main", *, resume: bool = False) -> tuple[dict, str]:
+    """Download any GGUF model from Hugging Face (verified with its SHA-256). Returns (download, model_id).
+
+    ``resume``: continue an interrupted install – parts that were already completed (right size) are
+    kept, the others continue from their ``.part`` files. The download is ``None`` if nothing was left.
+    """
     if not isinstance(repo, str) or not HF_REPO_RE.fullmatch(repo) or repo.split("/")[0].lower() in HF_RESERVED:
         raise EngineError("repo must look like owner/name", HTTPStatus.BAD_REQUEST)
     if not isinstance(revision, str) or not HF_REVISION_RE.fullmatch(revision):
@@ -1014,10 +1108,15 @@ def install_custom(repo: object, filename: object, name: object = None, purpose:
         return running[0], model_id
     if find_entry(model_id) is not None:
         raise EngineError("This model is already installed")
-    for base in basenames:
-        if (folder / base).exists():
-            raise EngineError(f"A file named {base} already exists in the models folder")
-    _check_free_space(folder, group["size_bytes"])
+    todo = list(range(count))
+    if resume:  # parts finished before the interruption stay (they were verified when they were renamed)
+        todo = [i for i in todo if not _part_complete(folder / basenames[i], group["parts"][i]["size"])]
+        for i in set(range(count)) - set(todo):  # a complete part's leftover .part is stale
+            Path(str(folder / basenames[i]) + ".part").unlink(missing_ok=True)
+    for i in todo:
+        if (folder / basenames[i]).exists():
+            raise EngineError(f"A file named {basenames[i]} already exists in the models folder")
+    _check_free_space(folder, sum(group["parts"][i]["size"] - _part_bytes(folder / basenames[i]) for i in todo))
     family = repo.split("/")[1]
     family = family[: -len("-GGUF")] if family.upper().endswith("-GGUF") else family
     entry = CatalogEntry(
@@ -1035,13 +1134,21 @@ def install_custom(repo: object, filename: object, name: object = None, purpose:
                 if entry.purpose == "chat" and not settings.get("engine", "model_id"):
                     settings.update("engine", {"model_id": model_id})
 
+    if not todo:  # resume: every part is complete, only the registration was missing
+        finish(folder / basenames[0])
+        return None, model_id  # type: ignore[return-value]
     first = None
-    for index, (job_id, part, base) in enumerate(zip(job_ids, group["parts"], basenames, strict=True), start=1):
+    for i in todo:
+        job_id, part, base = job_ids[i], group["parts"][i], basenames[i]
         url = HF_RESOLVE_REV_URL.format(repo=repo, revision=quote(revision, safe=""), path=quote(part["path"], safe="/"))
-        label = entry.name if count == 1 else f"{entry.name} (part {index}/{count})"
+        label = entry.name if count == 1 else f"{entry.name} (part {i + 1}/{count})"
         job = downloads.start(job_id, url, folder / base, sha256=part["sha256"], size=part["size"], label=label,
                               kind="model", on_complete=finish)
         first = first or job
+    _track_install({"key": f"model-{model_id}", "type": "custom", "model_id": model_id, "repo": repo,
+                    "revision": revision, "filename": filename, "name": name if isinstance(name, str) else None,
+                    "purpose": purpose if isinstance(purpose, str) else None, "files": basenames},
+                   [job_ids[i] for i in todo])
     return first, model_id
 
 
@@ -1080,6 +1187,226 @@ def import_local(path: object, name: object = None, purpose: object = None) -> d
     )
     _register(entry)
     return model_dict(entry)
+
+
+# --------------------------------------------------------------------------- pending installs (resume after a restart)
+
+JOURNAL_FILE = "pending_installs.json"
+INSTALL_WATCH_S = 1.0
+_journal_lock = threading.Lock()
+
+
+def _part_bytes(path: Path) -> int:
+    try:
+        part = Path(str(path) + ".part")
+        return part.stat().st_size if part.is_file() and not part.is_symlink() else 0
+    except OSError:
+        return 0
+
+
+def _part_complete(path: Path, size: int) -> bool:
+    try:
+        return path.is_file() and not path.is_symlink() and path.stat().st_size == size
+    except OSError:
+        return False
+
+
+def _journal_path() -> Path:
+    return config.home_dir() / JOURNAL_FILE
+
+
+def _journal_load(path: Path) -> list[dict]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return []
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        log.warning("Ignoring the unreadable list of interrupted installs (%s)", exc)
+        return []
+    items = data.get("installs") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        return []
+    return [i for i in items if isinstance(i, dict) and isinstance(i.get("key"), str)]
+
+
+def _journal_add(path: Path, record: dict) -> None:
+    with _journal_lock:
+        items = [i for i in _journal_load(path) if i["key"] != record["key"]]
+        artifacts.write_json_atomic(path, {"installs": [*items, record]})
+
+
+def _journal_remove(path: Path, key: str) -> None:
+    """Forget an install. Only touches ``path`` (captured when the install began) and only if it lists ``key``."""
+    with _journal_lock:
+        items = _journal_load(path)
+        rest = [i for i in items if i["key"] != key]
+        if len(rest) == len(items):
+            return
+        if rest:
+            artifacts.write_json_atomic(path, {"installs": rest})
+        else:
+            path.unlink(missing_ok=True)
+
+
+def _track_install(record: dict, job_ids: list[str]) -> None:
+    """Journal a started model install; it is forgotten once its downloads are done, failed or cancelled."""
+    path = _journal_path()
+    try:
+        _journal_add(path, {**record, "jobs": job_ids, "started_at": db.utcnow()})
+    except OSError as exc:
+        log.warning("Could not record the install of %s for resuming: %s", record.get("model_id"), exc)
+        return
+    threading.Thread(target=_watch_install, args=(path, record["key"], job_ids),
+                     name="lowram-install-watch", daemon=True).start()
+
+
+def _watch_install(path: Path, key: str, job_ids: list[str]) -> None:
+    while True:
+        states = [(downloads.get(j) or {}).get("state") for j in job_ids]
+        if all(s == "done" for s in states) or any(s not in downloads.ACTIVE_STATES and s != "done" for s in states):
+            break  # finished, or one part failed / was cancelled (or is unknown)
+        active = next(j for j, s in zip(job_ids, states, strict=True) if s in downloads.ACTIVE_STATES)
+        downloads.wait(active, INSTALL_WATCH_S)
+    try:
+        _journal_remove(path, key)
+    except OSError as exc:
+        log.warning("Could not update the list of interrupted installs: %s", exc)
+
+
+def resume_pending_installs(path: Path | None = None) -> list[str]:
+    """Continue model downloads that were interrupted (journal entry + ``.part`` file). Returns their keys.
+
+    The metadata (size + SHA-256) is fetched again, so a resumed file is verified like a new one.
+    Entries without a ``.part`` file are dropped; when Hugging Face is unreachable they stay for the
+    next start.
+    """
+    path = path or _journal_path()
+    resumed: list[str] = []
+    for item in _journal_load(path):
+        key = item["key"]
+        folder = Path(config.models_dir())
+        if not folder.is_dir():
+            continue  # external drive not connected: try again at the next start
+        files = item.get("files")
+        valid = (isinstance(files, list) and 0 < len(files) <= 100
+                 and all(isinstance(f, str) and HF_PATH_PART_RE.fullmatch(f) for f in files))
+        try:
+            if not valid or not any(_part_bytes(folder / f) for f in files):
+                _journal_remove(path, key)
+                continue
+            if item.get("type") == "catalog":
+                install_model(item.get("model_id"), item.get("filename"))
+                tracked = f"model-{item.get('model_id')}"
+            elif item.get("type") == "custom":
+                job, model_id = install_custom(item.get("repo"), item.get("filename"), item.get("name"),
+                                               item.get("purpose"), item.get("revision", "main"), resume=True)
+                tracked = f"model-{model_id}" if job is not None else None  # None: nothing was left to fetch
+            else:
+                raise ValueError(f"unknown install type {item.get('type')!r}")
+            if tracked != key:  # the install journals itself under its own key
+                _journal_remove(path, key)
+            resumed.append(key)
+            log.info("Resuming the interrupted download %s", key)
+        except EngineError as exc:
+            if exc.status in (HTTPStatus.BAD_GATEWAY, HTTPStatus.SERVICE_UNAVAILABLE):
+                log.warning("Cannot resume %s yet (%s); trying again at the next start", key, exc)
+                continue
+            log.warning("Not resuming %s: %s", key, exc)
+            _journal_remove(path, key)
+        except (ValueError, OSError) as exc:
+            log.warning("Not resuming %s: %s", key, exc)
+            _journal_remove(path, key)
+    return resumed
+
+
+def _resume_installs_quietly(path: Path) -> None:
+    try:
+        resume_pending_installs(path)
+    except Exception:  # noqa: BLE001 - never break app startup
+        log.exception("Resuming interrupted downloads failed")
+
+
+# --------------------------------------------------------------------------- Hugging Face search
+
+HF_SEARCH_URL = "https://huggingface.co/api/models"
+SEARCH_TIMEOUT_S = 8.0
+SEARCH_CACHE_S = 600.0
+SEARCH_CACHE_MAX = 100
+SEARCH_DEFAULT_LIMIT = 20
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+_TIMESTAMP_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}[0-9T:.+Z-]{0,30}")
+_search_cache: dict[tuple[str, int], tuple[float, list[dict]]] = {}
+_search_lock = threading.Lock()
+
+
+def _search_limit(limit: object) -> int:
+    if limit is None or limit == "":
+        return SEARCH_DEFAULT_LIMIT
+    if isinstance(limit, str) and re.fullmatch(r"\d{1,3}", limit.strip()):
+        limit = int(limit.strip())
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 50:
+        raise EngineError("limit must be a number from 1 to 50", HTTPStatus.BAD_REQUEST)
+    return limit
+
+
+def _search_item(item: object) -> dict | None:
+    if not isinstance(item, dict):
+        return None
+    repo = item.get("id") or item.get("modelId")
+    if not isinstance(repo, str) or not HF_REPO_RE.fullmatch(repo) or repo.split("/")[0].lower() in HF_RESERVED:
+        return None
+
+    def count(value: object) -> int:
+        return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+
+    updated = item.get("lastModified") or item.get("createdAt")
+    license_name = None
+    tags = item.get("tags") if isinstance(item.get("tags"), list) else []
+    card = item.get("cardData") if isinstance(item.get("cardData"), dict) else {}
+    for tag in tags:
+        if isinstance(tag, str) and tag.startswith("license:"):
+            license_name = tag[len("license:"):]
+            break
+    if license_name is None and isinstance(card.get("license"), str):
+        license_name = card["license"]
+    if license_name is not None:
+        license_name = _CONTROL_RE.sub("", license_name).strip()[:64] or None
+    return {
+        "repo": repo, "downloads": count(item.get("downloads")), "likes": count(item.get("likes")),
+        "updated": updated if isinstance(updated, str) and _TIMESTAMP_RE.fullmatch(updated) else None,
+        "license": license_name,
+    }
+
+
+def search_models(query: object, limit: object = None) -> list[dict]:
+    """GGUF repos on Hugging Face matching ``query``, most downloaded first (cached 10 minutes)."""
+    if not isinstance(query, str) or not 1 <= len(query.strip()) <= 100 or _CONTROL_RE.search(query):
+        raise EngineError("q must be 1 to 100 characters", HTTPStatus.BAD_REQUEST)
+    text, count = query.strip(), _search_limit(limit)
+    key, now = (text.lower(), count), time.monotonic()
+    with _search_lock:
+        hit = _search_cache.get(key)
+        if hit is not None and now - hit[0] < SEARCH_CACHE_S:
+            return [dict(m) for m in hit[1]]
+    url = HF_SEARCH_URL + "?" + urlencode({"search": text, "filter": "gguf", "sort": "downloads", "limit": count})
+    try:
+        data = downloads.fetch_json(url, timeout=SEARCH_TIMEOUT_S)
+    except downloads.HTTPStatusError as exc:
+        raise EngineError(f"The Hugging Face search failed (HTTP {exc.code}); try again later",
+                          HTTPStatus.BAD_GATEWAY) from None
+    except downloads.DownloadError as exc:
+        raise EngineError(f"Hugging Face is not reachable right now ({exc}). Check the internet connection "
+                          "and try again.", HTTPStatus.BAD_GATEWAY) from None
+    if not isinstance(data, list):
+        raise EngineError("Hugging Face returned an unexpected search result", HTTPStatus.BAD_GATEWAY)
+    models = [m for m in (_search_item(i) for i in data[:count]) if m is not None]
+    with _search_lock:
+        for stale in [k for k, (t, _m) in _search_cache.items() if now - t >= SEARCH_CACHE_S]:
+            del _search_cache[stale]
+        while len(_search_cache) >= SEARCH_CACHE_MAX:
+            del _search_cache[next(iter(_search_cache))]
+        _search_cache[key] = (now, models)
+    return [dict(m) for m in models]
 
 
 # --------------------------------------------------------------------------- models folder (storage)
@@ -1298,11 +1625,116 @@ def default_ctx_size(total_bytes: int | None = None) -> int:
     return 4096 if total_gib < 12 else 8192 if total_gib < 24 else 16384
 
 
-def ctx_size() -> int:
+MIB = 1024**2
+PROFILES = ("auto", "saver", "fast")
+CTX_MIN, CTX_MAX, CTX_MAX_SAVER = 4096, 32768, 8192
+# Rough f16 KV cache size per 1024 tokens of context and billion parameters, independent of the layer
+# layout: modern GQA models need ~8-40 MiB, older full-attention ones (e.g. Phi-3.5) up to ~100 MiB.
+# q8_0 needs half. Deliberately on the safe side: a too large context pushes the machine into swap.
+KV_F16_MIB_PER_1K_TOKENS_PER_B = 64
+KV_RAM_SHARE = 0.5  # at most half of the RAM left after the model goes to the KV cache
+CACHE_REUSE_TOKENS = 256  # reuse cached prompt prefixes across chat turns (llama-server --cache-reuse)
+FAST_BATCH, FAST_UBATCH = 4096, 1024  # fast profile (llama.cpp defaults: 2048 / 512)
+
+
+def current_profile() -> str:
+    value = settings.get("engine", "profile")
+    return value if value in PROFILES else "auto"
+
+
+def _model_bytes(entry: CatalogEntry) -> int:
+    try:
+        return sum(path.stat().st_size for path in model_files(entry))
+    except OSError:
+        return entry.size_bytes
+
+
+def _params_billions(entry: CatalogEntry, model_bytes: int) -> float:
+    match = re.fullmatch(r"(?:\d+x)?(\d+(?:\.\d+)?)[Bb]", (entry.params or "").strip())
+    if match and float(match.group(1)) > 0:
+        return float(match.group(1))  # MoE "8x7B": the KV cache follows the size of one expert
+    return max(model_bytes / 0.6e9, 0.5)  # unknown: ~0.6 bytes per parameter at Q4_K_M
+
+
+def estimate_ctx_size(params_b: float, model_bytes: int, available: int, *, kv_q8: bool,
+                      profile: str = "auto") -> int:
+    """Largest context (multiple of 1024) whose KV cache fits the free RAM after the model.
+
+    KV cache ≈ :data:`KV_F16_MIB_PER_1K_TOKENS_PER_B` MiB per 1024 tokens per billion parameters
+    (f16; q8_0 half), using at most :data:`KV_RAM_SHARE` of ``available - model_bytes``;
+    clamped to 4096..32768 (saver: ..8192).
+    """
+    per_1k = KV_F16_MIB_PER_1K_TOKENS_PER_B * MIB * max(params_b, 0.1) * (0.5 if kv_q8 else 1.0)
+    budget = max(0, available - model_bytes) * KV_RAM_SHARE
+    upper = CTX_MAX_SAVER if profile == "saver" else CTX_MAX
+    return max(CTX_MIN, min(upper, int(budget // per_1k) * 1024))
+
+
+def ctx_size(entry: CatalogEntry | None = None, *, profile: str | None = None, kv_q8: bool = False,
+             available: int | None = None) -> int:
+    """Context size for ``entry`` (default: the selected model); ``settings.engine.ctx_size`` wins."""
     configured = settings.get("engine", "ctx_size")
     if isinstance(configured, int) and not isinstance(configured, bool) and 512 <= configured <= 131072:
         return configured
-    return default_ctx_size()
+    profile = profile if profile in PROFILES else current_profile()
+    entry = entry or find_entry(settings.get("engine", "model_id"))
+    if entry is None:  # no model chosen yet: the old rule by total RAM
+        upper = CTX_MAX_SAVER if profile == "saver" else CTX_MAX
+        return max(CTX_MIN, min(upper, default_ctx_size()))
+    model_bytes = _model_bytes(entry)
+    free = int(psutil.virtual_memory().available) if available is None else available
+    return estimate_ctx_size(_params_billions(entry, model_bytes), model_bytes, free, kv_q8=kv_q8, profile=profile)
+
+
+def server_args(entry: CatalogEntry, binary: Path) -> tuple[list[str], dict]:
+    """``-c`` plus the tuning options for ``entry`` (only those the binary lists) and the ``tuning`` status.
+
+    auto/saver: flash attention, KV cache q8_0 (only with flash attention), prompt-cache reuse;
+    fast: flash attention, f16 KV cache, larger batches. Unknown options (``--help`` failed): only
+    ``--parallel 1`` like every earlier version.
+    """
+    flags = supported_flags(binary)
+    profile = current_profile()
+    args: list[str] = []
+    flash = kv_q8 = False
+    reuse = None
+    if flags is None:
+        args += ["--parallel", "1"]
+    else:
+        if opt := flags.get("parallel"):
+            args += [opt, "1"]
+        if opt := flags.get("flash_attn"):
+            args += [opt, "on"] if flags.flash_attn_value else [opt]
+            flash = True
+        cache_k, cache_v = flags.get("cache_type_k"), flags.get("cache_type_v")
+        if profile != "fast" and flash and cache_k and cache_v:
+            args += [cache_k, "q8_0", cache_v, "q8_0"]
+            kv_q8 = True
+        if opt := flags.get("cache_reuse"):
+            args += [opt, str(CACHE_REUSE_TOKENS)]
+            reuse = CACHE_REUSE_TOKENS
+        if profile == "fast":
+            if opt := flags.get("batch_size"):
+                args += [opt, str(FAST_BATCH)]
+            if opt := flags.get("ubatch_size"):
+                args += [opt, str(FAST_UBATCH)]
+        if opt := flags.get("jinja"):
+            args.append(opt)
+    ctx = ctx_size(entry, profile=profile, kv_q8=kv_q8)
+    tuning = {"profile": profile, "flash_attn": flash, "kv_cache": "q8_0" if kv_q8 else "f16", "ctx_size": ctx,
+              "cache_reuse": reuse}
+    return ["-c", str(ctx), *args], tuning
+
+
+def idle_unload_seconds() -> float | None:
+    """``settings.resilience.idle_unload_minutes`` in seconds; ``None`` = never unload."""
+    try:
+        value = settings.get("resilience", "idle_unload_minutes")
+    except (KeyError, TypeError):
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not value > 0:
+        return None
+    return float(value) * 60.0
 
 
 def _port_free(port: int) -> bool:
@@ -1443,18 +1875,26 @@ class EngineManager:
         self._cond = threading.Condition(self._lock)
         self._op = threading.RLock()  # serialises start/stop/pause
         self._proc: subprocess.Popen | None = None
-        self._gen = 0
+        self._gen = 0  # bumped whenever the current process is replaced, stopped or gone
+        self._stops = 0  # bumped by intentional stops: callers waiting in ensure_running give up
         self._paused = 0
         self._resume_model: str | None = None
         self._url: str | None = None
         self._key: str | None = None
         self._shutting_down = False
+        self._restart_times: list[float] = []  # automatic restarts within RESTART_WINDOW_S (monotonic)
+        self._last_use = time.monotonic()
         self._info = self._idle()
 
     @staticmethod
     def _idle() -> dict:
         return {"state": "stopped", "model_id": None, "port": None, "pid": None, "ctx_size": None,
-                "error": None, "started_at": None}
+                "error": None, "started_at": None, "tuning": None, "restarts": 0, "unloaded_idle": False}
+
+    def touch(self) -> None:
+        """Record a use of the model (the idle unloader counts from the last one)."""
+        with self._lock:
+            self._last_use = time.monotonic()
 
     def snapshot(self) -> dict:
         with self._lock:
@@ -1483,71 +1923,88 @@ class EngineManager:
         usable.sort(key=lambda e: (e.id != best, e.purpose != "chat", e.source != "catalog", -e.rank))
         return usable[0]
 
+    def _check_startable(self) -> None:
+        if self._shutting_down:
+            raise EngineError("LowRAM AI is shutting down", HTTPStatus.SERVICE_UNAVAILABLE)
+        if external():
+            raise EngineError("LOWRAM_LLM_URL is set, so LowRAM AI uses that server and does not start its own")
+        if _mover.active:
+            raise EngineError("Models are being moved to the new folder; try again when that has finished")
+        if self.paused:
+            raise EngineError("The engine is paused while an image or video job uses the memory; try again afterwards")
+
+    @staticmethod
+    def _binary() -> Path:
+        binary, _source = discover_runtime()
+        if binary is None:
+            raise EngineError("The llama.cpp runtime is not installed yet. Install it under Models & Settings.")
+        return binary
+
     def start(self, model_id: str | None = None, *, persist: bool = True) -> dict:
         with self._op:
-            if self._shutting_down:
-                raise EngineError("LowRAM AI is shutting down", HTTPStatus.SERVICE_UNAVAILABLE)
-            if external():
-                raise EngineError("LOWRAM_LLM_URL is set, so LowRAM AI uses that server and does not start its own")
-            if _mover.active:
-                raise EngineError("Models are being moved to the new folder; try again when that has finished")
-            if self.paused:
-                raise EngineError("The engine is paused while an image or video job uses the memory; try again afterwards")
+            self._check_startable()
             entry = self._pick_model(model_id)
-            binary, _source = discover_runtime()
-            if binary is None:
-                raise EngineError("The llama.cpp runtime is not installed yet. Install it under Models & Settings.")
+            binary = self._binary()
             with self._lock:
                 if self._info["state"] in ("starting", "ready") and self._info["model_id"] == entry.id:
                     return dict(self._info)
                 running = self._proc is not None
             if running:
                 self._stop_locked()
-            _reap_orphan()
-            ctx = ctx_size()
-            path = log_path()
-            if path.exists():
-                os.replace(path, path.with_name(path.name + ".1"))
-            key = secrets.token_urlsafe(32)  # llama-server only answers API calls that carry it
-            port = choose_port()  # as late as possible: another process could grab a free port
-            args = [str(binary), "-m", str(model_path(entry)), "--host", "127.0.0.1", "--port", str(port),
-                    "-c", str(ctx), "--parallel", "1", "--api-key", key]
-            log_fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
-            try:
-                kwargs: dict[str, Any] = {"start_new_session": True} if os.name != "nt" else {
-                    "creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
-                proc = subprocess.Popen(
-                    args, stdin=subprocess.DEVNULL, stdout=log_fd, stderr=subprocess.STDOUT,
-                    cwd=str(config.home_dir()), env=_child_env(binary), close_fds=True, **kwargs,
-                )
-            except OSError as exc:
-                with self._lock:
-                    self._info = {**self._idle(), "state": "error", "model_id": entry.id,
-                                  "error": f"Could not start llama-server: {exc}"}
-                    self._cond.notify_all()
-                raise EngineError(f"Could not start llama-server: {exc}", HTTPStatus.INTERNAL_SERVER_ERROR) from None
-            finally:
-                os.close(log_fd)
-            with self._lock:
-                self._gen += 1
-                gen = self._gen
-                self._proc = proc
-                self._key = key
-                self._info = {"state": "starting", "model_id": entry.id, "port": port, "pid": proc.pid,
-                              "ctx_size": ctx, "error": None, "started_at": db.utcnow()}
-                self._cond.notify_all()
-            try:
-                create_time = psutil.Process(proc.pid).create_time()
-                artifacts.write_json_atomic(
-                    _pidfile(), {"pid": proc.pid, "create_time": create_time, "owner": db.owner_id()})
-            except (psutil.Error, OSError):
-                pass
-            log.info("Starting llama-server (pid %s) with %s on port %s, context %s", proc.pid, entry.id, port, ctx)
+            snapshot = self._spawn(entry, binary)
             if persist and model_id is not None:
                 settings.update("engine", {"model_id": entry.id})
-            threading.Thread(target=self._watch, args=(proc, gen, port, path), name="lowram-engine-watch",
-                             daemon=True).start()
-            return self.snapshot()
+            return snapshot
+
+    def _spawn(self, entry: CatalogEntry, binary: Path, restarts: int = 0) -> dict:
+        """Launch llama-server for ``entry`` (caller holds ``_op``)."""
+        _reap_orphan()
+        tuning_args, tuning = server_args(entry, binary)
+        path = log_path()
+        if path.exists():
+            os.replace(path, path.with_name(path.name + ".1"))
+        key = secrets.token_urlsafe(32)  # llama-server only answers API calls that carry it
+        port = choose_port()  # as late as possible: another process could grab a free port
+        args = [str(binary), "-m", str(model_path(entry)), "--host", "127.0.0.1", "--port", str(port),
+                *tuning_args, "--api-key", key]
+        log_fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        try:
+            kwargs: dict[str, Any] = {"start_new_session": True} if os.name != "nt" else {
+                "creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
+            proc = subprocess.Popen(
+                args, stdin=subprocess.DEVNULL, stdout=log_fd, stderr=subprocess.STDOUT,
+                cwd=str(config.home_dir()), env=_child_env(binary), close_fds=True, **kwargs,
+            )
+        except OSError as exc:
+            with self._lock:
+                self._info = {**self._idle(), "state": "error", "model_id": entry.id,
+                              "error": f"Could not start llama-server: {exc}"}
+                self._cond.notify_all()
+            raise EngineError(f"Could not start llama-server: {exc}", HTTPStatus.INTERNAL_SERVER_ERROR) from None
+        finally:
+            os.close(log_fd)
+        with self._lock:
+            self._gen += 1
+            gen = self._gen
+            self._proc = proc
+            self._key = key
+            self._last_use = time.monotonic()
+            self._info = {"state": "starting", "model_id": entry.id, "port": port, "pid": proc.pid,
+                          "ctx_size": tuning["ctx_size"], "error": None, "started_at": db.utcnow(),
+                          "tuning": tuning, "restarts": restarts, "unloaded_idle": False}
+            self._cond.notify_all()
+        try:
+            create_time = psutil.Process(proc.pid).create_time()
+            artifacts.write_json_atomic(
+                _pidfile(), {"pid": proc.pid, "create_time": create_time, "owner": db.owner_id()})
+        except (psutil.Error, OSError):
+            pass
+        log.info("Starting llama-server (pid %s) with %s on port %s: profile %s, context %s, flash attention %s, "
+                 "KV cache %s", proc.pid, entry.id, port, tuning["profile"], tuning["ctx_size"],
+                 "on" if tuning["flash_attn"] else "off", tuning["kv_cache"])
+        threading.Thread(target=self._watch, args=(proc, gen, port, path), name="lowram-engine-watch",
+                         daemon=True).start()
+        return self.snapshot()
 
     def _watch(self, proc: subprocess.Popen, gen: int, port: int, path: Path) -> None:
         deadline = time.monotonic() + HEALTH_TIMEOUT_S
@@ -1583,30 +2040,118 @@ class EngineManager:
                 return
             self._info["state"] = "ready"
             self._url = url
+            self._last_use = time.monotonic()  # the idle time counts from "ready", not from the launch
             config.set_runtime_llm_url(url)
             config.set_runtime_llm_api_key(self._key)
             self._cond.notify_all()
         log.info("llama-server is ready on port %s", port)
-        proc.wait()
-        self._on_exit(proc, gen, path)
+        while True:
+            try:
+                proc.wait(IDLE_CHECK_S)
+                break
+            except subprocess.TimeoutExpired:
+                self._maybe_unload_idle(gen)
+        self._on_exit(proc, gen, path, was_ready=True)
 
-    def _on_exit(self, proc: subprocess.Popen, gen: int, path: Path) -> None:
+    def _on_exit(self, proc: subprocess.Popen, gen: int, path: Path, *, was_ready: bool = False) -> None:
+        """The process ended without being stopped: restart it after a crash of a ready server, else error."""
+        restart: tuple | None = None
+        reason = _exit_reason(proc.returncode)
         with self._lock:
             if gen != self._gen:
-                return  # an intentional stop/restart
+                return  # an intentional stop/restart/idle unload, not a crash
             self._gen += 1
             self._proc = None
             self._clear_url()
             tail = log_tail(path=path)
-            self._info.update(state="error", pid=None, error=(
-                f"llama-server {_exit_reason(proc.returncode)}." + (f" Last log lines:\n{tail}" if tail else "")
-            )[:4000])
+            now = time.monotonic()
+            self._restart_times = [t for t in self._restart_times if now - t < RESTART_WINDOW_S]
+            model_id = self._info["model_id"]
+            if (was_ready and model_id and not self._shutting_down and not self._paused
+                    and len(self._restart_times) < RESTART_LIMIT):
+                self._restart_times.append(now)
+                delay = RESTART_BACKOFF_S[min(len(self._restart_times), len(RESTART_BACKOFF_S)) - 1]
+                restarts = int(self._info.get("restarts") or 0) + 1
+                self._info.update(state="starting", pid=None, port=None, error=None, restarts=restarts)
+                restart = (model_id, self._gen, delay, restarts)
+            else:
+                head = f"llama-server {reason}."
+                if was_ready and len(self._restart_times) >= RESTART_LIMIT:
+                    head = (f"llama-server {reason} again after {RESTART_LIMIT} automatic restarts within "
+                            f"{RESTART_WINDOW_S / 60:g} minutes, so it is not restarted any more.")
+                self._info.update(state="error", pid=None, error=(
+                    head + (f" Last log lines:\n{tail}" if tail else ""))[:4000])
             self._cond.notify_all()
-        log.warning("llama-server %s", _exit_reason(proc.returncode))
         try:
             _pidfile().unlink()
         except OSError:
             pass
+        if restart is None:
+            log.warning("llama-server %s", reason)
+            return
+        log.warning("llama-server %s; restarting it in %g s (automatic restart %d)", reason, restart[2], restart[3])
+        threading.Thread(target=self._auto_restart, args=restart, name="lowram-engine-restart", daemon=True).start()
+
+    def _auto_restart(self, model_id: str, gen: int, delay: float, restarts: int) -> None:
+        """Restart a crashed server after ``delay`` unless it was stopped, paused or replaced meanwhile."""
+        deadline = time.monotonic() + delay
+        with self._cond:
+            while gen == self._gen and not self._shutting_down and not self._paused:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._cond.wait(remaining)
+        with self._op:
+            with self._lock:
+                if gen != self._gen or self._shutting_down or self._paused:
+                    return
+            try:
+                self._check_startable()
+                self._spawn(self._pick_model(model_id), self._binary(), restarts)
+            except EngineError as exc:
+                with self._lock:
+                    if gen == self._gen:
+                        self._gen += 1
+                        self._info.update(state="error", pid=None, error=(
+                            f"llama-server crashed and could not be restarted: {exc}")[:4000])
+                        self._cond.notify_all()
+                log.warning("Automatic restart of llama-server failed: %s", exc)
+
+    def _maybe_unload_idle(self, gen: int) -> None:
+        """Stop the server after ``idle_unload_minutes`` without use (never while an inference holds the slot)."""
+        try:
+            limit = idle_unload_seconds()
+            if limit is None:
+                return
+            with self._lock:
+                if (gen != self._gen or self._info["state"] != "ready" or self._paused or self._shutting_down
+                        or time.monotonic() - self._last_use < limit):
+                    return
+            if db.busy_reason():  # a chat, task or job holds the inference slot: the model is in use
+                self.touch()
+                return
+            with self._op:
+                with self._lock:  # check and stop in one step: a concurrent ensure_running() wins
+                    if (gen != self._gen or self._info["state"] != "ready" or self._paused or self._shutting_down
+                            or time.monotonic() - self._last_use < limit):
+                        return
+                    proc, self._proc = self._proc, None
+                    self._gen += 1
+                    self._stops += 1
+                    self._clear_url()
+                    model_id = self._info["model_id"]
+                    self._info = {**self._idle(), "model_id": model_id, "unloaded_idle": True}
+                    self._cond.notify_all()
+                log.info("Unloading %s after %g minutes without use to free the memory; it loads again "
+                         "with the next request", model_id, limit / 60)
+                if proc is not None:
+                    _terminate(proc)
+                try:
+                    _pidfile().unlink()
+                except OSError:
+                    pass
+        except Exception:  # noqa: BLE001 - the watch thread must keep detecting crashes
+            log.exception("Idle check of llama-server failed")
 
     def _clear_url(self) -> None:
         if self._url is not None:
@@ -1620,6 +2165,7 @@ class EngineManager:
         with self._lock:
             proc, self._proc = self._proc, None
             self._gen += 1
+            self._stops += 1
             self._clear_url()
         if proc is not None:
             _terminate(proc)
@@ -1646,19 +2192,21 @@ class EngineManager:
         if external():
             return config.llm_url()
         with self._lock:
+            self._last_use = time.monotonic()  # in use from now on: the idle unloader leaves it alone
             info = dict(self._info)
         if (model_id is not None and info["model_id"] != model_id) or info["state"] not in ("starting", "ready"):
-            info = self.start(model_id, persist=False)
+            info = self.start(model_id, persist=False)  # also loads a model that was unloaded while idle
         deadline = time.monotonic() + timeout
         with self._cond:
-            gen = self._gen
+            stops = self._stops  # an automatic restart after a crash keeps the callers waiting
             while True:
                 state = self._info["state"]
                 if state == "ready" and self._url:
+                    self._last_use = time.monotonic()
                     return self._url
                 if state == "error":
                     raise EngineError(self._info["error"] or "llama-server failed to start", HTTPStatus.SERVICE_UNAVAILABLE)
-                if state == "stopped" or self._gen != gen:
+                if state == "stopped" or self._stops != stops:
                     raise EngineError("llama-server was stopped while loading", HTTPStatus.SERVICE_UNAVAILABLE)
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -1743,6 +2291,11 @@ def ensure_running(timeout: float = HEALTH_TIMEOUT_S, model_id: str | None = Non
     return _manager.ensure_running(timeout, model_id)
 
 
+def touch() -> None:
+    """Record a use of the managed model (e.g. by an LLM caller), so the idle unloader keeps it loaded."""
+    _manager.touch()
+
+
 @contextmanager
 def pause_for_heavy_job() -> Iterator[None]:
     """Stop the managed llama-server for a RAM-heavy job and restart it afterwards."""
@@ -1770,6 +2323,10 @@ def _auto_start() -> None:
 
 @web.on_startup
 def _on_startup(server: Any) -> None:
+    path = _journal_path()  # resolved now: the thread must not look at another LOWRAM_HOME later
+    if _journal_load(path) and not _manager._shutting_down:
+        threading.Thread(target=_resume_installs_quietly, args=(path,), name="lowram-engine-resume-downloads",
+                         daemon=True).start()
     if external():
         return
     threading.Thread(target=_auto_start, name="lowram-engine-autostart", daemon=True).start()
@@ -1855,6 +2412,12 @@ def route_start(req: Request) -> Response:
 def route_stop(req: Request) -> Response:
     req.json()
     return Response({"server": stop()})
+
+
+@route("GET", r"/api/engine/search")
+@_api
+def route_search(req: Request) -> Response:
+    return Response({"models": search_models(req.arg("q"), req.arg("limit"))})
 
 
 @route("POST", r"/api/engine/custom/resolve")
