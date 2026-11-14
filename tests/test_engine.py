@@ -6,7 +6,10 @@ import shutil
 import socket
 import subprocess
 import threading
+import time
 import unittest
+import urllib.error
+from pathlib import Path
 from unittest import mock
 
 import psutil
@@ -308,7 +311,11 @@ class ServerTests(EngineTestCase):
 
     def test_start_ready_chat_stop(self):
         server = engine.start(SMALL)
-        self.assertEqual((server["state"], server["model_id"], server["ctx_size"]), ("starting", SMALL, 8192))
+        # 8 GiB free, tiny file, 1.5B params, q8_0 KV: the RAM allows more than the 32768 cap
+        self.assertEqual((server["state"], server["model_id"], server["ctx_size"]), ("starting", SMALL, 32768))
+        self.assertEqual(server["tuning"], {"profile": "auto", "flash_attn": True, "kv_cache": "q8_0",
+                                            "ctx_size": 32768, "cache_reuse": 256})
+        self.assertEqual((server["restarts"], server["unloaded_idle"]), (0, False))
         server = self.wait_state("ready")
         url = f"http://127.0.0.1:{server['port']}/v1/chat/completions"
         self.assertEqual(config.llm_url(), url)
@@ -354,12 +361,22 @@ class ServerTests(EngineTestCase):
                 engine.ensure_running(timeout=10)
 
     def test_crash_after_ready_is_detected(self):
-        with mock.patch.dict(os.environ, {"FAKE_LLAMA_MODE": "crash_after_ready"}):
+        """A server that keeps crashing is restarted 3 times, then the state stays error with the log tail."""
+        pids = set()
+        with mock.patch.dict(os.environ, {"FAKE_LLAMA_MODE": "crash_after_ready"}), \
+                mock.patch.object(engine, "RESTART_BACKOFF_S", (0.05,)):
             engine.start(SMALL)
             self.wait_state("ready")
-            server = self.wait_state("error")
+            ok = wait_until(lambda: (pids.add(engine._manager.snapshot()["pid"]),
+                                     engine._manager.snapshot()["state"] == "error")[1], 30)
+            server = engine._manager.snapshot()
+        self.assertTrue(ok, server)
         self.assertIn("GGML_ASSERT", server["error"])
+        self.assertIn("3 automatic restarts", server["error"])
+        self.assertEqual(server["restarts"], 3)
+        self.assertGreaterEqual(len(pids - {None}), 2)  # really new processes
         self.assertEqual(config.llm_url(), config.DEFAULT_LLM_URL)
+        self.assertFalse(wait_until(lambda: engine._manager.snapshot()["state"] != "error", 0.5))
 
     def test_load_timeout(self):
         with mock.patch.dict(os.environ, {"FAKE_LLAMA_MODE": "never_ready"}), \
@@ -485,7 +502,8 @@ class EngineRouteTests(EngineTestCase):
         status, data = self.api("GET", "/api/engine/status")
         self.assertEqual(status, 200)
         self.assertEqual(set(data), {"runtime", "server", "external", "llm_url", "paused"})
-        self.assertEqual(set(data["server"]), {"state", "model_id", "port", "pid", "ctx_size", "error", "started_at"})
+        self.assertEqual(set(data["server"]), {"state", "model_id", "port", "pid", "ctx_size", "error", "started_at",
+                                               "tuning", "restarts", "unloaded_idle"})
         self.assertEqual(set(data["runtime"]), {"installed", "path", "version", "source"})
         status, data = self.api("GET", "/api/engine/catalog")
         self.assertEqual((status, data["ram_total_bytes"]), (200, 16 * GIB))
@@ -1049,6 +1067,377 @@ class SelfHealingInstallTests(EngineTestCase):
         self.assertEqual(engine.get_entry(body["recommended"]["chat"]).purpose, "chat")
         rec = [m for m in body["models"] if m["recommended"]]
         self.assertEqual([m["id"] for m in rec], [body["recommended"]["code"]])
+
+
+# --------------------------------------------------------------------------- v0.4 engine turbo
+
+NEW_HELP = (
+    "----- common params -----\n\n"
+    "-h,    --help, --usage                  print usage and exit\n"
+    "-b,    --batch-size N                   logical maximum batch size (default: 2048)\n"
+    "-ub,   --ubatch-size N                  physical maximum batch size (default: 512)\n"
+    "-fa,   --flash-attn [on|off|auto]       set Flash Attention use ('on', 'off', or 'auto', default: 'auto')\n"
+    "                                        (env: LLAMA_ARG_FLASH_ATTN)\n"
+    "-ctk,  --cache-type-k TYPE              KV cache data type for K\n"
+    "-ctv,  --cache-type-v TYPE              KV cache data type for V\n"
+    "-np,   --parallel N                     number of parallel sequences to decode (default: 1)\n"
+    "--port PORT                             port to listen (default: 8080)\n"
+    "--cache-reuse N                         min chunk size to attempt reusing from the cache via KV shifting\n"
+    "--jinja, --no-jinja                     use jinja template for chat (default: enabled)\n"
+    "                                        example: --override-kv tokenizer.ggml.add_bos_token=bool:false\n"
+)
+OLD_SERVER_HELP = (  # 2024 server usage: values between the aliases, two-space indent, bare -fa switch
+    "usage: llama-server [options]\n\n"
+    "  -c N, --ctx-size N            size of the prompt context\n"
+    "  -fa, --flash-attn             enable Flash Attention (default: disabled)\n"
+    "  -ctk TYPE, --cache-type-k TYPE  KV cache data type for K (default: f16)\n"
+    "  --port PORT                   port to listen (default: 8080)\n"
+)
+
+
+class FlagParsingTests(unittest.TestCase):
+    def test_new_help(self):
+        flags = engine.parse_help(NEW_HELP)
+        self.assertTrue(flags.flash_attn_value)
+        self.assertEqual({f: flags.get(f) for f in engine.FLAG_SPELLINGS}, {
+            "flash_attn": "--flash-attn", "cache_type_k": "--cache-type-k", "cache_type_v": "--cache-type-v",
+            "cache_reuse": "--cache-reuse", "batch_size": "--batch-size", "ubatch_size": "--ubatch-size",
+            "parallel": "--parallel", "jinja": "--jinja"})
+        self.assertIn("--no-jinja", flags.options)
+        self.assertNotIn("--override-kv", flags.options)  # only option columns count, not descriptions
+
+    def test_old_spellings(self):
+        flags = engine.parse_help(OLD_SERVER_HELP)
+        self.assertFalse(flags.flash_attn_value)
+        self.assertEqual([flags.get(f) for f in ("flash_attn", "cache_type_k", "cache_type_v", "cache_reuse")],
+                         ["--flash-attn", "--cache-type-k", None, None])
+        short = engine.parse_help("-fa  enable flash attention\n-ctk TYPE  k type\n-np N  slots\n--port PORT  port\n")
+        self.assertEqual([short.get(f) for f in ("flash_attn", "cache_type_k", "parallel")], ["-fa", "-ctk", "-np"])
+
+    def test_not_a_help_text(self):
+        for text in ("", "error: unknown argument: --help", "Segmentation fault", "-fa on\n"):
+            self.assertIsNone(engine.parse_help(text))
+
+
+class ContextEstimateTests(LowRAMTestCase):
+    def test_estimate(self):
+        est = engine.estimate_ctx_size
+        # 7B Q4 file (4.4 GiB), 12 GiB free: 3.8 GiB for the KV cache, 224 MiB (q8_0) / 448 MiB (f16) per 1k tokens
+        self.assertEqual(est(7, int(4.4 * GIB), 12 * GIB, kv_q8=True), 17408)
+        self.assertEqual(est(7, int(4.4 * GIB), 12 * GIB, kv_q8=False), 8192)
+        self.assertEqual(est(1.5, GIB, 16 * GIB, kv_q8=True), 32768)  # capped
+        self.assertEqual(est(1.5, GIB, 16 * GIB, kv_q8=True, profile="saver"), 8192)
+        self.assertEqual(est(14, 9 * GIB, 6 * GIB, kv_q8=True), 4096)  # model larger than the free RAM: minimum
+
+    def test_ctx_size_for_a_model(self):
+        entry = engine.get_entry("qwen2.5-7b-instruct")  # not downloaded: the catalog size is used
+        self.assertEqual(engine.ctx_size(entry, kv_q8=True, available=12 * GIB),
+                         engine.estimate_ctx_size(7, entry.size_bytes, 12 * GIB, kv_q8=True))
+        settings.update("engine", {"ctx_size": 3000})
+        self.assertEqual(engine.ctx_size(entry, kv_q8=True, available=12 * GIB), 3000)
+
+
+@unittest.skipUnless(POSIX, "the fake llama-server is a shebang script")
+class TurboServerTests(EngineTestCase):
+    def setUp(self):
+        super().setUp()
+        self.managed()
+        self.binary = self.add_fake_runtime()
+        self.add_model()
+
+    def launch(self, **env):
+        with mock.patch.dict(os.environ, env):
+            engine.start(SMALL)
+            server = self.wait_state("ready")
+        line = next(x for x in engine.log_path().read_text().splitlines() if x.startswith("argv="))
+        args = json.loads(line[len("argv="):])
+        engine.stop()
+        return server, args[args.index("-c"):]
+
+    def test_flags_follow_the_installed_build(self):
+        """The fake rejects every option its --help does not list, like a real llama-server."""
+        self.set_memory(16, 1024)  # 1 GiB free: the context depends on the KV cache type
+        turbo = ["--cache-type-k", "q8_0", "--cache-type-v", "q8_0", "--cache-reuse", "256", "--jinja"]
+        cases = {
+            "new": (["-c", "10240", "--parallel", "1", "--flash-attn", "on", *turbo], True, "q8_0", 10240, 256),
+            "old": (["-c", "10240", "--parallel", "1", "--flash-attn", *turbo], True, "q8_0", 10240, 256),
+            "minimal": (["-c", "5120", "--parallel", "1"], False, "f16", 5120, None),  # no flash attention
+            "fail": (["-c", "5120", "--parallel", "1"], False, "f16", 5120, None),  # --help failed
+        }
+        for variant, (expected, flash, kv, ctx, reuse) in cases.items():
+            with self.subTest(variant=variant):
+                engine._flags_cache.clear()
+                server, args = self.launch(FAKE_LLAMA_HELP=variant)
+                self.assertEqual(args, [*expected, "--api-key", "***"])
+                self.assertEqual(server["tuning"], {"profile": "auto", "flash_attn": flash, "kv_cache": kv,
+                                                    "ctx_size": ctx, "cache_reuse": reuse})
+                self.assertEqual(server["ctx_size"], ctx)
+
+    def test_profiles_and_ctx_setting(self):
+        self.set_memory(16, 1024)
+        settings.update("engine", {"profile": "fast"})
+        server, args = self.launch()
+        self.assertEqual(args, ["-c", "5120", "--parallel", "1", "--flash-attn", "on", "--cache-reuse", "256",
+                                "--batch-size", "4096", "--ubatch-size", "1024", "--jinja", "--api-key", "***"])
+        self.assertEqual((server["tuning"]["profile"], server["tuning"]["kv_cache"]), ("fast", "f16"))
+        self.set_memory(16, 8192)
+        settings.update("engine", {"profile": "saver"})
+        server, args = self.launch()
+        self.assertEqual(args, ["-c", "8192", "--parallel", "1", "--flash-attn", "on", "--cache-type-k", "q8_0",
+                                "--cache-type-v", "q8_0", "--cache-reuse", "256", "--jinja", "--api-key", "***"])
+        settings.update("engine", {"profile": "bogus", "ctx_size": 6144})
+        server, args = self.launch()
+        self.assertEqual((args[:2], server["tuning"]["profile"], server["ctx_size"]), (["-c", "6144"], "auto", 6144))
+
+    def test_help_is_read_once_per_binary(self):
+        count = self.tmp / "help-count"
+        with mock.patch.dict(os.environ, {"FAKE_LLAMA_HELP_COUNT": str(count)}):
+            self.launch()
+            self.launch()
+            self.assertIsNotNone(engine.supported_flags(self.binary))
+        self.assertEqual(count.read_text().split(), ["help"])
+
+
+@unittest.skipUnless(POSIX, "the fake llama-server is a shebang script")
+class SupervisorAndIdleTests(EngineTestCase):
+    def setUp(self):
+        super().setUp()
+        self.managed()
+        self.add_fake_runtime()
+        self.add_model()
+        settings.update("engine", {"model_id": SMALL})
+        patcher = mock.patch.object(engine, "IDLE_CHECK_S", 0.05)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_crash_is_restarted_and_waiting_callers_get_the_new_server(self):
+        env = {"FAKE_LLAMA_MODE": "crash_once_after_ready", "FAKE_LLAMA_MARKER": str(self.tmp / "crashed")}
+        with mock.patch.dict(os.environ, env), mock.patch.object(engine, "RESTART_BACKOFF_S", (0.3,)):
+            first = engine.start(SMALL)
+            self.wait_state("ready")
+            self.assertTrue(wait_until(lambda: engine._manager.snapshot()["restarts"] == 1, 10))
+            url = engine.ensure_running(timeout=15)  # waits through the restart instead of failing
+            server = engine._manager.snapshot()
+        self.assertEqual((server["state"], server["restarts"], server["error"]), ("ready", 1, None))
+        self.assertNotEqual(server["pid"], first["pid"])
+        self.assertIn(f":{server['port']}/", url)
+        self.assertEqual(llm.chat([{"role": "user", "content": "hi"}]), "fake llama reply")
+        self.assertIn("GGML_ASSERT", (engine.logs_dir() / "llama-server.log.1").read_text())  # crash log kept
+
+    def test_no_restart_while_shutting_down_or_paused(self):
+        mgr, proc = engine._manager, mock.Mock(returncode=-9)
+        for case in ("shutdown", "pause", "normal"):
+            with self.subTest(case=case), mock.patch.object(mgr, "_auto_restart") as restart:
+                mgr._info = {**mgr._idle(), "state": "ready", "model_id": SMALL}
+                mgr._shutting_down, mgr._paused = case == "shutdown", int(case == "pause")
+                mgr._on_exit(proc, mgr._gen, engine.log_path(), was_ready=True)
+                mgr._shutting_down, mgr._paused = False, 0
+                if case == "normal":
+                    self.assertTrue(wait_until(lambda: restart.called, 5))
+                    self.assertEqual(engine._manager.snapshot()["state"], "starting")
+                else:
+                    self.assertFalse(wait_until(lambda: restart.called, 0.2))
+                    self.assertIn("SIGKILL", engine._manager.snapshot()["error"])
+        mgr._gen += 1  # forget the scheduled (mocked) restart
+
+    def test_idle_model_is_unloaded_and_loaded_again_on_demand(self):
+        settings.update("resilience", {"idle_unload_minutes": 0.01})  # 0.6 s
+        engine.ensure_running(timeout=15)
+        pid = engine._manager.snapshot()["pid"]
+        server = self.wait_state("stopped")
+        self.assertEqual((server["unloaded_idle"], server["restarts"], server["model_id"]), (True, 0, SMALL))
+        self.assertTrue(wait_until(lambda: gone(pid), 5))
+        self.assertEqual(config.llm_url(), config.DEFAULT_LLM_URL)
+        self.assertTrue(engine.status()["server"]["unloaded_idle"])
+        self.assertFalse(wait_until(lambda: engine._manager.snapshot()["state"] != "stopped", 0.3))  # not a crash
+        settings.update("resilience", {"idle_unload_minutes": 0})
+        engine.ensure_running(timeout=15)  # transparent reload
+        server = engine._manager.snapshot()
+        self.assertEqual((server["state"], server["unloaded_idle"]), ("ready", False))
+        self.assertEqual(llm.chat([{"role": "user", "content": "hi"}]), "fake llama reply")
+        self.assertFalse(wait_until(lambda: engine._manager.snapshot()["state"] != "ready", 0.5))  # 0 = never
+
+    def test_busy_slot_and_touch_keep_the_model_loaded(self):
+        engine.ensure_running(timeout=15)
+        settings.update("resilience", {"idle_unload_minutes": 0.005})  # 0.3 s
+        with db.inference_slot("test chat"):
+            self.assertFalse(wait_until(lambda: engine._manager.snapshot()["state"] != "ready", 0.8))
+        end = time.monotonic() + 0.8
+        while time.monotonic() < end:
+            engine.touch()
+            self.assertEqual(engine._manager.snapshot()["state"], "ready")
+            time.sleep(0.05)
+        self.assertTrue(self.wait_state("stopped")["unloaded_idle"])
+
+
+class PendingInstallTests(EngineTestCase):
+    def publish(self, data=b"GGUF" + bytes(range(256)) * 40, sha=None):
+        entry = engine.get_entry(SMALL)
+        self.hub.json[f"huggingface.co/api/models/{entry.repo}/tree/main"] = ([
+            {"type": "file", "path": entry.filename,
+             "lfs": {"oid": sha or hashlib.sha256(data).hexdigest(), "size": len(data)}}], None)
+        key = f"huggingface.co/{entry.repo}/resolve/main/{entry.filename}"
+        self.hub.files[key] = data
+        return entry, key, data
+
+    def journal(self):
+        try:  # the watcher thread may remove the file at any moment
+            return json.loads((self.home / "pending_installs.json").read_text())["installs"]
+        except FileNotFoundError:
+            return []
+
+    def record(self, **values):
+        entry = engine.get_entry(SMALL)
+        rec = {"key": f"model-{SMALL}", "type": "catalog", "model_id": SMALL, "filename": None,
+               "files": [entry.filename], **values}
+        engine._journal_add(self.home / "pending_installs.json", rec)
+
+    def test_install_is_journalled_until_done_failed_or_cancelled(self):
+        entry, _key, _data = self.publish()
+        self.hub.chunk, self.hub.delay = 1024, 0.05
+        job = engine.install_model(SMALL)
+        rec = self.journal()[0]
+        self.assertEqual((rec["key"], rec["type"], rec["model_id"], rec["files"], rec["jobs"]),
+                         (job["id"], "catalog", SMALL, [entry.filename], [job["id"]]))
+        self.assertEqual(downloads.wait(job["id"], 15)["state"], "done")
+        self.assertTrue(wait_until(lambda: self.journal() == [], 5))
+        engine.delete_model(SMALL)
+        job = engine.install_model(SMALL)
+        self.assertEqual(len(self.journal()), 1)
+        self.assertEqual(downloads.cancel(job["id"])["state"], "cancelled")
+        self.assertTrue(wait_until(lambda: self.journal() == [], 5))
+        self.publish(sha="0" * 64)
+        self.hub.delay = 0
+        self.assertEqual(downloads.wait(engine.install_model(SMALL)["id"], 15)["state"], "failed")
+        self.assertTrue(wait_until(lambda: self.journal() == [], 5))
+
+    def test_interrupted_download_resumes_at_startup(self):
+        entry, key, data = self.publish()
+        dest = engine.model_path(entry)
+        Path(str(dest) + ".part").write_bytes(data[:4000])  # what the interrupted run left behind
+        self.record()
+        engine._on_startup(None)
+        self.assertTrue(wait_until(lambda: (downloads.get(f"model-{SMALL}") or {}).get("state") == "done", 15))
+        self.assertEqual(dest.read_bytes(), data)
+        self.assertEqual(self.hub.ranges(key), ["bytes=4000-"])
+        self.assertTrue(engine.is_installed(entry))
+        self.assertTrue(wait_until(lambda: self.journal() == [], 5))
+
+    def test_resumed_download_is_still_verified(self):
+        entry, _key, _data = self.publish()
+        part = Path(str(engine.model_path(entry)) + ".part")
+        part.write_bytes(b"X" * 4000)  # not the start of the real file
+        self.record()
+        self.assertEqual(engine.resume_pending_installs(), [f"model-{SMALL}"])
+        self.assertEqual(downloads.wait(f"model-{SMALL}", 15)["state"], "failed")
+        self.assertFalse(engine.is_installed(entry) or part.exists())
+        self.assertTrue(wait_until(lambda: self.journal() == [], 5))
+
+    def test_stale_entries_are_dropped_and_offline_ones_kept(self):
+        self.record()  # no .part file
+        self.record(key="model-other", model_id="nope", files=["../../evil"])
+        self.assertEqual(engine.resume_pending_installs(), [])
+        self.assertEqual(self.journal(), [])
+        Path(str(engine.model_path(engine.get_entry(SMALL))) + ".part").write_bytes(b"GGUF")
+        self.record()  # Hugging Face does not answer (404 from the fake hub): try again at the next start
+        self.assertEqual(engine.resume_pending_installs(), [])
+        self.assertEqual([r["key"] for r in self.journal()], [f"model-{SMALL}"])
+        (self.home / "pending_installs.json").write_text("{broken")
+        self.assertEqual(engine.resume_pending_installs(), [])
+
+    def test_split_custom_model_resumes_only_missing_parts(self):
+        part1, part2 = b"GGUF" + b"b" * 3000, b"c" * 2500
+        names = ("Big/Cool-7B-Q8_0-00001-of-00002.gguf", "Big/Cool-7B-Q8_0-00002-of-00002.gguf")
+        self.hub.json[TREE] = ([lfs_item(n, data=d) for n, d in zip(names, (part1, part2), strict=True)], None)
+        for name, data in zip(names, (part1, part2), strict=True):
+            self.hub.files[f"huggingface.co/{REPO}/resolve/main/{name}"] = data
+        folder, bases = config.models_dir(), [Path(n).name for n in names]
+        (folder / bases[0]).write_bytes(part1)  # finished before the interruption
+        Path(str(folder / bases[1]) + ".part").write_bytes(part2[:1000])
+        model_id = engine._custom_id("custom", "Cool-7B-Q8_0", f"{REPO}@main/{names[0]}")
+        engine._journal_add(self.home / "pending_installs.json", {
+            "key": f"model-{model_id}", "type": "custom", "model_id": model_id, "repo": REPO, "revision": "main",
+            "filename": names[0], "name": "Big one", "purpose": "chat", "files": bases})
+        self.assertEqual(engine.resume_pending_installs(), [f"model-{model_id}"])
+        self.assertEqual(downloads.wait(f"model-{model_id}-p02", 15)["state"], "done")
+        self.assertIsNone(downloads.get(f"model-{model_id}-p01"))
+        self.assertEqual(self.hub.ranges(f"huggingface.co/{REPO}/resolve/main/{names[1]}"), ["bytes=1000-"])
+        self.assertEqual(self.hub.ranges(f"huggingface.co/{REPO}/resolve/main/{names[0]}"), [])
+        self.assertEqual(engine.get_entry(model_id).name, "Big one")
+        self.assertTrue(wait_until(lambda: self.journal() == [], 5))
+
+    def test_complete_parts_are_registered_without_downloading(self):
+        data = b"GGUF" + b"z" * 2000
+        self.hub.json[TREE] = ([lfs_item("Solo-3B-Q4_K_M.gguf", data=data)], None)
+        (config.models_dir() / "Solo-3B-Q4_K_M.gguf").write_bytes(data)  # renamed, but not registered yet
+        Path(str(config.models_dir() / "Solo-3B-Q4_K_M.gguf") + ".part").write_bytes(b"left over")
+        model_id = engine._custom_id("custom", "Solo-3B-Q4_K_M", f"{REPO}@main/Solo-3B-Q4_K_M.gguf")
+        engine._journal_add(self.home / "pending_installs.json", {
+            "key": f"model-{model_id}", "type": "custom", "repo": REPO, "revision": "main",
+            "filename": "Solo-3B-Q4_K_M.gguf", "files": ["Solo-3B-Q4_K_M.gguf"]})
+        self.assertEqual(engine.resume_pending_installs(), [f"model-{model_id}"])
+        self.assertIsNotNone(engine.find_entry(model_id))
+        self.assertEqual((downloads.list_jobs(), self.journal()), ([], []))
+        self.assertFalse(Path(str(config.models_dir() / "Solo-3B-Q4_K_M.gguf") + ".part").exists())
+
+
+class SearchTests(EngineTestCase):
+    setUp = EngineRouteTests.setUp
+    api = EngineRouteTests.api
+    KEY = "huggingface.co/api/models"
+
+    def requests(self):
+        return [r["query"] for r in self.hub.requests if r["key"] == self.KEY]
+
+    def test_search_results_and_cache(self):
+        engine._search_cache.clear()
+        self.addCleanup(engine._search_cache.clear)
+        self.hub.json[self.KEY] = ([
+            {"id": "Qwen/Qwen2.5-7B-Instruct-GGUF", "downloads": 1234, "likes": 56,
+             "lastModified": "2025-01-02T03:04:05.000Z", "tags": ["gguf", "license:apache-2.0"]},
+            {"id": "someone/Other-GGUF", "downloads": True, "likes": -3, "createdAt": "2024-05-06T07:08:09.000Z",
+             "cardData": {"license": "mit"}},
+            {"id": "gpt2"}, {"id": "api/evil"}, "junk", {"id": "x/y", "lastModified": "<script>"},
+        ], None)
+        status, body = self.api("GET", "/api/engine/search?q=qwen%207b&limit=6")
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["models"], [
+            {"repo": "Qwen/Qwen2.5-7B-Instruct-GGUF", "downloads": 1234, "likes": 56,
+             "updated": "2025-01-02T03:04:05.000Z", "license": "apache-2.0"},
+            {"repo": "someone/Other-GGUF", "downloads": 0, "likes": 0, "updated": "2024-05-06T07:08:09.000Z",
+             "license": "mit"},
+            {"repo": "x/y", "downloads": 0, "likes": 0, "updated": None, "license": None},
+        ])
+        self.assertEqual(self.requests(), ["search=qwen+7b&filter=gguf&sort=downloads&limit=6"])
+        self.assertEqual(self.api("GET", "/api/engine/search?q=QWEN+7b&limit=6")[1], body)  # cached
+        self.assertEqual(len(self.requests()), 1)
+        engine.search_models("qwen 7b")
+        self.assertEqual(self.requests()[-1], "search=qwen+7b&filter=gguf&sort=downloads&limit=20")
+
+    def test_validation_and_unreachable_hub(self):
+        engine._search_cache.clear()
+        self.addCleanup(engine._search_cache.clear)
+        for query in ("", "q=", "q=%20%20", "q=" + "a" * 101, "q=ok&limit=0", "q=ok&limit=51", "q=ok&limit=abc",
+                      "q=a%00b"):
+            status, body = self.api("GET", "/api/engine/search?" + query)
+            self.assertEqual(status, 400, (query, body))
+        self.assertEqual(self.requests(), [])
+        self.hub.status[self.KEY] = 503
+        status, body = self.api("GET", "/api/engine/search?q=llama")
+        self.assertEqual(status, 502)
+        self.assertIn("Hugging Face search failed", body["error"])
+
+        def offline(request, timeout):
+            raise urllib.error.URLError(socket.gaierror(8, "nodename nor servname provided"))
+
+        downloads.set_opener(offline)
+        status, body = self.api("GET", "/api/engine/search?q=llama")
+        self.assertEqual(status, 502)
+        self.assertIn("not reachable", body["error"])
+        downloads.set_opener(self.hub.opener)  # failures are not cached
+        del self.hub.status[self.KEY]
+        self.hub.json[self.KEY] = ([{"id": "a/b", "downloads": 1}], None)
+        self.assertEqual(self.api("GET", "/api/engine/search?q=llama")[1]["models"][0]["repo"], "a/b")
 
 
 if __name__ == "__main__":
