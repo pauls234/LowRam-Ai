@@ -62,7 +62,9 @@ MODEL_ID_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
 TAG_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
 RAM_HEADROOM = 0.40  # leave 40 % of the RAM to the OS and other apps
 
-RELEASES_URL = "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
+# Not "/releases/latest": since v1.0.0 (November 2026) llama.cpp's "latest" release is a milestone
+# without programs, and the builds (b12345) are published as pre-releases. select_release() scans these.
+RELEASES_URL = "https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=10"
 RELEASE_DOWNLOAD_PREFIX = "https://github.com/ggml-org/llama.cpp/releases/download/"
 HF_TREE_URL = "https://huggingface.co/api/models/{repo}/tree/main"
 HF_RESOLVE_URL = "https://huggingface.co/{repo}/resolve/main/{filename}"
@@ -619,6 +621,39 @@ def select_asset(release: Any, key: str) -> tuple[str, dict]:
     raise EngineError(f"The llama.cpp release {tag} has no download for this computer ({key}).")
 
 
+def _asset_sha256(asset: dict) -> str | None:
+    digest = asset.get("digest")
+    if isinstance(digest, str) and digest.lower().startswith("sha256:"):
+        value = digest.split(":", 1)[1]
+        if downloads.SHA256_RE.fullmatch(value):
+            return value
+    return None
+
+
+def select_release(releases: Any, key: str) -> tuple[str, dict]:
+    """``(tag, asset)`` of the newest release with a SHA-256-verified download for ``key``.
+
+    Drafts are skipped, pre-releases count: llama.cpp publishes its builds as pre-releases, while the
+    "latest" release can be a milestone without programs. Without any verified asset the error says why.
+    """
+    if not isinstance(releases, list):
+        raise EngineError("GitHub returned an unexpected answer for the llama.cpp releases", HTTPStatus.BAD_GATEWAY)
+    candidates = [r for r in releases if isinstance(r, dict) and not r.get("draft")]
+    candidates.sort(key=lambda r: str(r.get("published_at") or r.get("created_at") or ""), reverse=True)
+    unverified: tuple[str, dict] | None = None
+    for release in candidates:
+        try:
+            tag, asset = select_asset(release, key)
+        except EngineError:
+            continue
+        if _asset_sha256(asset):
+            return tag, asset
+        unverified = unverified or (tag, asset)
+    if unverified is not None:
+        return unverified  # install_runtime() refuses it with a clear message
+    raise EngineError(f"None of the newest llama.cpp releases has a download for this computer ({key}).")
+
+
 def _runtime_installed(tag: str) -> Callable[[Path], None]:
     def finish(folder: Path) -> None:
         binary = find_server_binary(folder)
@@ -640,20 +675,17 @@ def install_runtime() -> dict:
         return current
     key = platform_key()
     try:
-        release = downloads.fetch_json(RELEASES_URL, headers={"Accept": "application/vnd.github+json"})
+        releases = downloads.fetch_json(RELEASES_URL, headers={"Accept": "application/vnd.github+json"})
     except downloads.DownloadError as exc:
         raise EngineError(f"Could not read the latest llama.cpp release from GitHub: {exc}", HTTPStatus.BAD_GATEWAY) from None
-    tag, asset = select_asset(release, key)
+    tag, asset = select_release(releases, key)
     dest = runtime_root() / tag
     if find_server_binary(dest) if dest.is_dir() else None:
         raise EngineError(f"llama.cpp {tag} is already installed")
     url = asset.get("browser_download_url")
     size = asset.get("size")
-    digest = asset.get("digest")
-    sha256 = None
-    if isinstance(digest, str) and digest.lower().startswith("sha256:"):
-        sha256 = digest.split(":", 1)[1]
-    if sha256 is None or not downloads.SHA256_RE.fullmatch(sha256):
+    sha256 = _asset_sha256(asset)
+    if sha256 is None:
         raise EngineError(
             f"The llama.cpp release {tag} has no checksum – refusing to install an unverified program",
             HTTPStatus.BAD_GATEWAY,

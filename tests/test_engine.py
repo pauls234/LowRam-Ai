@@ -21,7 +21,7 @@ from tests.helpers import GIB, LowRAMTestCase, wait_until
 
 POSIX = os.name != "nt"
 SMALL = "qwen2.5-1.5b-instruct"
-RELEASE_KEY = "api.github.com/repos/ggml-org/llama.cpp/releases/latest"
+RELEASE_KEY = "api.github.com/repos/ggml-org/llama.cpp/releases"  # the list: ?per_page=10
 
 
 def gone(pid):
@@ -192,6 +192,36 @@ class RuntimeDiscoveryTests(EngineTestCase):
             engine.select_asset({"tag_name": "../x", "assets": []}, "linux-x64")
 
 
+    def test_select_release_skips_milestone_without_builds(self):
+        """November 2026: llama.cpp's "latest" (v1.0.0) only holds nightly-tag.txt; builds are pre-releases."""
+        def build(tag, when, digest=True, platforms=("macos-arm64", "ubuntu-x64"), **extra):
+            assets = [{"name": f"llama-{tag}-bin-{p}.tar.gz", **({"digest": "sha256:" + "ab" * 32} if digest else {})}
+                      for p in platforms]
+            return {"tag_name": tag, "published_at": when, "prerelease": True, "assets": assets, **extra}
+
+        milestone = {"tag_name": "v1.0.0", "published_at": "2026-11-13T10:20:21Z", "prerelease": False,
+                     "assets": [{"name": "nightly-tag.txt", "digest": "sha256:" + "cd" * 32}]}
+        releases = [build("b12406", "2026-11-15T09:27:00Z"), milestone, build("b12407", "2026-11-15T10:04:00Z"),
+                    build("b12408", "2026-11-15T11:00:00Z", draft=True)]
+        tag, asset = engine.select_release(releases, "macos-arm64")
+        self.assertEqual((tag, asset["name"]), ("b12407", "llama-b12407-bin-macos-arm64.tar.gz"))
+        # a newer build without checksum loses against an older verified one ...
+        releases.append(build("b12409", "2026-11-15T12:00:00Z", digest=False))
+        self.assertEqual(engine.select_release(releases, "macos-arm64")[0], "b12407")
+        # ... and a newer build without this platform is skipped
+        releases.append(build("b12410", "2026-11-15T13:00:00Z", platforms=("ubuntu-x64",)))
+        self.assertEqual(engine.select_release(releases, "macos-arm64")[0], "b12407")
+        self.assertEqual(engine.select_release(releases, "linux-x64")[0], "b12410")
+        # only unverified builds: returned, so that install_runtime refuses them with a clear message
+        self.assertEqual(engine.select_release([build("b1", "2026-01-01T00:00:00Z", digest=False)], "macos-arm64")[0], "b1")
+        with self.assertRaises(engine.EngineError) as ctx:
+            engine.select_release([milestone], "macos-arm64")
+        self.assertEqual(ctx.exception.status, 409)
+        with self.assertRaises(engine.EngineError) as ctx:
+            engine.select_release({"tag_name": "b1"}, "macos-arm64")  # the old /latest shape
+        self.assertEqual(ctx.exception.status, 502)
+
+
 class InstallTests(EngineTestCase):
     def setUp(self):
         super().setUp()
@@ -207,7 +237,7 @@ class InstallTests(EngineTestCase):
         digest = digest or "sha256:" + hashlib.sha256(archive).hexdigest()
         assets = [{"name": "llama-b9999-bin-macos-arm64.tar.gz", "browser_download_url": "https://github.com/x", "size": 1},
                   {"name": name, "browser_download_url": url, "size": len(archive), "digest": digest}]
-        self.hub.json[RELEASE_KEY] = ({"tag_name": "b9999", "assets": assets}, None)
+        self.hub.json[RELEASE_KEY] = ([{"tag_name": "b9999", "assets": assets}], None)
 
     @unittest.skipUnless(POSIX, "shebang scripts")
     def test_runtime_install_end_to_end(self):
@@ -218,6 +248,7 @@ class InstallTests(EngineTestCase):
         self.publish_release(archive)
         job = engine.install_runtime()
         self.assertEqual((job["id"], job["kind"]), (engine.RUNTIME_JOB_ID, "runtime"))
+        self.assertIn("per_page=10", [r["query"] for r in self.hub.requests if r["key"] == RELEASE_KEY][0])
         job = downloads.wait(job["id"], 15)
         self.assertEqual(job["state"], "done", job)
         info = engine.runtime_info()
@@ -244,7 +275,7 @@ class InstallTests(EngineTestCase):
         with self.assertRaises(engine.EngineError) as ctx:
             engine.install_runtime()  # 404 from the fake GitHub API
         self.assertEqual(ctx.exception.status, 502)
-        self.hub.json[RELEASE_KEY] = ({"tag_name": "b1", "assets": [{"name": "llama-b1-bin-win-cpu-x64.zip"}]}, None)
+        self.hub.json[RELEASE_KEY] = ([{"tag_name": "b1", "assets": [{"name": "llama-b1-bin-win-cpu-x64.zip"}]}], None)
         with self.assertRaises(engine.EngineError) as ctx:
             engine.install_runtime()
         self.assertEqual(ctx.exception.status, 409)
@@ -571,7 +602,7 @@ class HardeningTests(EngineTestCase):
         with mock.patch.object(engine, "platform_key", return_value="linux-x64"):
             url = "https://github.com/ggml-org/llama.cpp/releases/download/b1/llama-b1-bin-ubuntu-x64.tar.gz"
             asset = {"name": "llama-b1-bin-ubuntu-x64.tar.gz", "browser_download_url": url, "size": 10}
-            self.hub.json[RELEASE_KEY] = ({"tag_name": "b1", "assets": [asset]}, None)
+            self.hub.json[RELEASE_KEY] = ([{"tag_name": "b1", "assets": [asset]}], None)
             with self.assertRaises(engine.EngineError) as ctx:
                 engine.install_runtime()
             self.assertIn("unverified program", str(ctx.exception))

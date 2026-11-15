@@ -122,7 +122,9 @@ OUTPUT_NAME_RE = re.compile(r"(\d+)\.(png|mp4|webm|webp|avi)")
 RUNTIME_NAMES = ("sd-cli", "sd")  # sd-cli is the current name, sd the older one
 RUNTIME_DIR_NAME = "stable-diffusion.cpp"
 HOMEBREW_DIRS = ("/opt/homebrew/bin", "/usr/local/bin")
-RELEASES_URL = "https://api.github.com/repos/leejet/stable-diffusion.cpp/releases/latest"
+# The newest releases, not "/releases/latest": a project's "latest" release can lack builds (llama.cpp
+# v1.0.0 in November 2026 had none) – _pick_release() takes the newest one with a verified build.
+RELEASES_URL = "https://api.github.com/repos/leejet/stable-diffusion.cpp/releases?per_page=10"
 RELEASE_DOWNLOAD_PREFIX = "https://github.com/leejet/stable-diffusion.cpp/releases/download/"
 # Asset names come from the upstream release workflow (.github/workflows/build.yml):
 # sd-<branch>-<sha>-bin-<uname -s>-<OS name>-<OS version>-<arch>.zip and sd-…-bin-win-<build>-x64.zip
@@ -1831,6 +1833,36 @@ def _parse_digest(asset: dict) -> str | None:
     return None
 
 
+def _pick_release(releases: object) -> tuple[str, dict]:
+    """``(tag, asset)`` of the newest release with a SHA-256-verified build for this computer.
+
+    Drafts are skipped, pre-releases count. A matching build without digest is only returned when no
+    verified one exists, so that install_runtime() refuses it with a clear message.
+    """
+    if not isinstance(releases, list):
+        raise MediaSourceError("Unexpected answer from api.github.com")
+    candidates = [r for r in releases if isinstance(r, dict) and not r.get("draft")]
+    candidates.sort(key=lambda r: str(r.get("published_at") or r.get("created_at") or ""), reverse=True)
+    unverified: tuple[str, dict] | None = None
+    problem: MediaSourceError | None = None
+    for release in candidates:
+        tag = release.get("tag_name")
+        if not isinstance(tag, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}", tag):
+            problem = problem or MediaSourceError("The latest release has an unexpected tag name")
+            continue
+        try:
+            asset = pick_runtime_asset(release.get("assets"), *_platform_key())
+        except MediaSourceError as exc:
+            problem = problem or exc
+            continue
+        if _parse_digest(asset) is not None:
+            return tag, asset
+        unverified = unverified or (tag, asset)
+    if unverified is not None:
+        return unverified
+    raise problem or MediaSourceError("GitHub lists no stable-diffusion.cpp release")
+
+
 # --------------------------------------------------------------------------- installs
 
 
@@ -1850,13 +1882,7 @@ def install_runtime() -> dict:
     current = _download_state("media-runtime")
     if current and current.get("state") in ACTIVE_DOWNLOAD_STATES:
         return current
-    release = fetch_json(RELEASES_URL)
-    if not isinstance(release, dict):
-        raise MediaSourceError("Unexpected answer from api.github.com")
-    tag = release.get("tag_name")
-    if not isinstance(tag, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}", tag):
-        raise MediaSourceError("The latest release has an unexpected tag name")
-    asset = pick_runtime_asset(release.get("assets"), *_platform_key())
+    tag, asset = _pick_release(fetch_json(RELEASES_URL))
     name, url = asset["name"], asset.get("browser_download_url")
     if not isinstance(url, str) or not url.startswith(RELEASE_DOWNLOAD_PREFIX) or "/" in name or ".." in name:
         raise MediaSourceError("The release asset has an unexpected download URL")
