@@ -53,6 +53,35 @@ jobs:
           name: LowRAM-AI-macOS-arm64
           path: dist/LowRAM-AI-*-macOS-*.zip
           if-no-files-found: error
+      # After the upload on purpose: the app is available even if a download from Hugging Face or
+      # GitHub hiccups here – but the job (and a release) still fails until a real model works.
+      - name: Real model test (engine + model download, real chat answer, clean quit)
+        env:
+          LOWRAM_HOME: ${{ runner.temp }}/lowram-real
+        run: |
+          "dist/LowRAM AI.app/Contents/MacOS/LowRAM AI" --headless --port 8798 &
+          pid=$!
+          for _ in $(seq 1 60); do
+            curl -fsS -o /dev/null http://127.0.0.1:8798/api/status && break
+            sleep 1
+          done
+          python desktop/real_model_smoke.py http://127.0.0.1:8798 "$RUNNER_TEMP/llama.pid"
+          llama=$(cat "$RUNNER_TEMP/llama.pid")
+          ps -o pid,rss,nice,command -p "$llama" || true
+          kill -TERM "$pid"
+          wait "$pid"
+          sleep 1
+          if ps -p "$llama" > /dev/null; then
+            echo "llama-server ($llama) is still running after the app quit"
+            exit 1
+          fi
+          echo "llama-server ended together with the app"
+      - name: Show real-model logs
+        if: always()
+        env:
+          LOWRAM_HOME: ${{ runner.temp }}/lowram-real
+        run: |
+          for f in "$LOWRAM_HOME"/logs/*.log; do echo "== $f"; tail -n 80 "$f"; done || true
 
   windows:
     name: Windows app (x64)
