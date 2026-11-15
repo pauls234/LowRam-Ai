@@ -122,7 +122,9 @@ OUTPUT_NAME_RE = re.compile(r"(\d+)\.(png|mp4|webm|webp|avi)")
 RUNTIME_NAMES = ("sd-cli", "sd")  # sd-cli is the current name, sd the older one
 RUNTIME_DIR_NAME = "stable-diffusion.cpp"
 HOMEBREW_DIRS = ("/opt/homebrew/bin", "/usr/local/bin")
-RELEASES_URL = "https://api.github.com/repos/leejet/stable-diffusion.cpp/releases/latest"
+# The newest releases, not "/releases/latest": a project's "latest" release can lack builds (llama.cpp
+# v1.0.0 in November 2026 had none) – _pick_release() takes the newest one with a verified build.
+RELEASES_URL = "https://api.github.com/repos/leejet/stable-diffusion.cpp/releases?per_page=10"
 RELEASE_DOWNLOAD_PREFIX = "https://github.com/leejet/stable-diffusion.cpp/releases/download/"
 # Asset names come from the upstream release workflow (.github/workflows/build.yml):
 # sd-<branch>-<sha>-bin-<uname -s>-<OS name>-<OS version>-<arch>.zip and sd-…-bin-win-<build>-x64.zip
@@ -480,6 +482,10 @@ def _private_dir(path: Path) -> Path:
     return path
 
 
+MIN_FREE_DISK_IMAGE_BYTES = 1 * 2**30  # never fill the boot disk with generated media
+MIN_FREE_DISK_VIDEO_BYTES = 3 * 2**30
+
+
 def media_dir() -> Path:
     """Generated images/videos: ``<LOWRAM_HOME>/media/<job id>.<ext>``."""
     return _private_dir(config.home_dir() / "media")
@@ -773,6 +779,43 @@ def _probe_binary(path: Path) -> dict | None:
     return info
 
 
+SD_NICE = 10  # generation runs for minutes: lower priority keeps the desktop responsive (and cooler)
+_threads_cache: dict[tuple[str, int, int], bool] = {}
+
+
+def _sd_lists_threads(path: Path) -> bool:
+    """``sd-cli -h`` lists ``-t/--threads`` (cached per binary path, mtime and size)."""
+    try:
+        stat = path.stat()
+    except OSError:
+        return False
+    key = (str(path), stat.st_mtime_ns, stat.st_size)
+    with _probe_lock:
+        if key in _threads_cache:
+            return _threads_cache[key]
+    found = False
+    try:
+        result = subprocess.run(
+            [str(path), "-h"], cwd=str(media_tmp_dir()), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, timeout=PROBE_TIMEOUT_S, env=_child_env(path), check=False,
+        )
+        text = result.stdout[:262144].decode("utf-8", "replace")
+        found = re.search(r"(?m)^[ \t]{0,8}(?:-t\b|--threads\b)", text) is not None
+    except (OSError, subprocess.SubprocessError) as exc:
+        log.info("Could not read the options of %s: %s", path, exc)
+    with _probe_lock:
+        _threads_cache[key] = found
+    return found
+
+
+def _engine_attr(name: str) -> Any:
+    """A helper of ``backend.engine`` (thread count, priority), or ``None`` when it is not available."""
+    try:
+        return getattr(importlib.import_module(f"{__package__}.engine"), name, None)
+    except ImportError:
+        return None
+
+
 RUNTIME_CACHE_TTL_S = 30.0
 _runtime_cache: tuple[float, dict] | None = None
 
@@ -783,6 +826,7 @@ def invalidate_runtime_cache() -> None:
     with _probe_lock:
         _runtime_cache = None
         _probe_cache.clear()
+        _threads_cache.clear()
 
 
 def _runtime_installed(path: Path) -> None:
@@ -1292,10 +1336,13 @@ class MediaWorker:
             else:
                 argv = build_video_args(binary, model, files, job, tmp / "output.webm")
                 timeout = VIDEO_TIMEOUT_S
+            threads = _engine_attr("inference_threads")
+            if callable(threads) and _sd_lists_threads(binary):
+                argv[1:1] = ["-t", str(threads())]  # leave two performance cores for the desktop
             parser = ProgressParser(job["kind"], job["params"].get("steps"))
             _update_running(job_id, 0.01, "Loading the model… (this can take a minute)")
             code = self._run_process(job_id, argv, tmp, timeout, stop, _ProgressReporter(job_id, parser),
-                                     _child_env(binary))
+                                     _child_env(binary), nice=SD_NICE)
             if code != 0:
                 summary = parser.failure_summary()
                 raise MediaJobError(
@@ -1367,8 +1414,9 @@ class MediaWorker:
         stop: threading.Event,
         reporter: _ProgressReporter,
         env: dict[str, str],
+        nice: int | None = None,
     ) -> int:
-        """Run ``argv`` (no shell) in its own process group; cancellable, with a timeout."""
+        """Run ``argv`` (no shell) in its own process group; cancellable, with a timeout; ``nice``: lower priority."""
         self._check_cancel(job_id, stop)
         kwargs: dict[str, Any] = {}
         if os.name == "nt":
@@ -1382,6 +1430,9 @@ class MediaWorker:
             )
         except OSError as exc:
             raise MediaJobError(f"Could not start {Path(argv[0]).name}: {exc}") from exc
+        lower = _engine_attr("lower_priority") if nice is not None else None
+        if callable(lower):
+            lower(proc.pid, nice)  # never raises
         with self._lock:
             self._proc = proc
             cancelled_early = job_id in self._cancel
@@ -1572,6 +1623,14 @@ def submit_job(data: object) -> dict:
     spec = validate_job_request(data)
     if not find_runtime()["installed"]:
         raise HTTPError(HTTPStatus.CONFLICT, "stable-diffusion.cpp is not installed yet. Install the image runtime first.")
+    free = shutil.disk_usage(media_dir()).free
+    needed = MIN_FREE_DISK_VIDEO_BYTES if spec["kind"] == "video" else MIN_FREE_DISK_IMAGE_BYTES
+    if free < needed:
+        raise HTTPError(
+            HTTPStatus.CONFLICT,
+            f"Not enough free disk space: {free // 2**20} MiB free, at least {needed // 2**30} GiB needed "
+            "for this job. Free some space (or delete old images/videos) and try again.",
+        )
     with db.connect() as conn, db.transaction(conn):
         queued = conn.execute("SELECT COUNT(*) FROM media_jobs WHERE status = 'queued'").fetchone()[0]
         if queued >= MAX_QUEUED_JOBS:
@@ -1774,6 +1833,36 @@ def _parse_digest(asset: dict) -> str | None:
     return None
 
 
+def _pick_release(releases: object) -> tuple[str, dict]:
+    """``(tag, asset)`` of the newest release with a SHA-256-verified build for this computer.
+
+    Drafts are skipped, pre-releases count. A matching build without digest is only returned when no
+    verified one exists, so that install_runtime() refuses it with a clear message.
+    """
+    if not isinstance(releases, list):
+        raise MediaSourceError("Unexpected answer from api.github.com")
+    candidates = [r for r in releases if isinstance(r, dict) and not r.get("draft")]
+    candidates.sort(key=lambda r: str(r.get("published_at") or r.get("created_at") or ""), reverse=True)
+    unverified: tuple[str, dict] | None = None
+    problem: MediaSourceError | None = None
+    for release in candidates:
+        tag = release.get("tag_name")
+        if not isinstance(tag, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}", tag):
+            problem = problem or MediaSourceError("The latest release has an unexpected tag name")
+            continue
+        try:
+            asset = pick_runtime_asset(release.get("assets"), *_platform_key())
+        except MediaSourceError as exc:
+            problem = problem or exc
+            continue
+        if _parse_digest(asset) is not None:
+            return tag, asset
+        unverified = unverified or (tag, asset)
+    if unverified is not None:
+        return unverified
+    raise problem or MediaSourceError("GitHub lists no stable-diffusion.cpp release")
+
+
 # --------------------------------------------------------------------------- installs
 
 
@@ -1793,13 +1882,7 @@ def install_runtime() -> dict:
     current = _download_state("media-runtime")
     if current and current.get("state") in ACTIVE_DOWNLOAD_STATES:
         return current
-    release = fetch_json(RELEASES_URL)
-    if not isinstance(release, dict):
-        raise MediaSourceError("Unexpected answer from api.github.com")
-    tag = release.get("tag_name")
-    if not isinstance(tag, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}", tag):
-        raise MediaSourceError("The latest release has an unexpected tag name")
-    asset = pick_runtime_asset(release.get("assets"), *_platform_key())
+    tag, asset = _pick_release(fetch_json(RELEASES_URL))
     name, url = asset["name"], asset.get("browser_download_url")
     if not isinstance(url, str) or not url.startswith(RELEASE_DOWNLOAD_PREFIX) or "/" in name or ".." in name:
         raise MediaSourceError("The release asset has an unexpected download URL")

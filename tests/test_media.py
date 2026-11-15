@@ -7,7 +7,10 @@ from unittest import mock
 
 import psutil
 
+from http import HTTPStatus
+
 from backend import db, media, settings
+from backend.web import HTTPError
 from tests.helpers import wait_until
 from tests.media_helpers import FAKE_FFMPEG, MediaAppTestCase, MediaTestCase, write_script
 
@@ -216,6 +219,14 @@ class RuntimeDiscoveryTests(MediaTestCase):
 
 @unittest.skipUnless(POSIX, "fake executables are POSIX scripts")
 class WorkerTests(MediaTestCase):
+    def test_sd_gets_threads_and_low_priority(self):
+        self.engine.inference_threads = lambda: 6  # the engine's helpers (unit-tested in test_engine)
+        self.engine.lower_priority = mock.Mock()
+        job = self.wait_status(media.submit_job(image_job(prompt="a cat"))["id"])
+        self.assertEqual(job["status"], "done", job)
+        self.assertEqual(self.argv_calls()[-1]["argv"][:2], ["-t", "6"])  # the fake's -h lists -t/--threads
+        self.assertEqual(self.engine.lower_priority.call_args.args[1], 10)
+
     def test_image_job_end_to_end(self):
         job = media.submit_job(image_job(prompt=NASTY, seed=11))
         self.assertEqual(job["status"], "queued")
@@ -477,7 +488,7 @@ class ApiTests(MediaAppTestCase):
                  "browser_download_url": media.RELEASE_DOWNLOAD_PREFIX + "master-500-abcdef0/linux.zip"},
             ],
         }
-        with mock.patch.object(media, "fetch_json", return_value=release) as fetch, \
+        with mock.patch.object(media, "fetch_json", return_value=[release]) as fetch, \
                 mock.patch.object(media, "_platform_key", return_value=("linux", "x86_64")):
             status, data = self.api("POST", "/api/media/runtime/install")
         self.assertEqual(status, 202, data)
@@ -502,7 +513,7 @@ class ApiTests(MediaAppTestCase):
         for digest in (None, "sha1:" + "a" * 40, "sha256:xyz"):
             asset = dict(release["assets"][0], **({"digest": digest} if digest else {}))
             with self.subTest(digest=digest), \
-                    mock.patch.object(media, "fetch_json", return_value=dict(release, assets=[asset])), \
+                    mock.patch.object(media, "fetch_json", return_value=[dict(release, assets=[asset])]), \
                     mock.patch.object(media, "_platform_key", return_value=("linux", "x86_64")):
                 status, data = self.api("POST", "/api/media/runtime/install")
                 self.assertEqual(status, 502)
@@ -631,7 +642,7 @@ class RealDownloadsTests(MediaTestCase):
             "digest": "sha256:" + hashlib.sha256(archive).hexdigest()}]}
         self.sd.unlink()
         media.invalidate_runtime_cache()
-        with mock.patch.object(media, "fetch_json", return_value=release), \
+        with mock.patch.object(media, "fetch_json", return_value=[release]), \
                 mock.patch.object(media, "_platform_key", return_value=("linux", "x86_64")):
             download = media.install_runtime()
         final = self.real.wait(download["id"], 15)
@@ -674,6 +685,25 @@ class SourceSafetyTests(unittest.TestCase):
             with self.subTest(repo=repo, name=name), self.assertRaises(media.MediaSourceError):
                 media.hf_file_metadata(repo, name)
 
+    def test_pick_release_takes_newest_verified_build(self):
+        def rel(tag, when, *names, digest=True, **extra):
+            assets = [{"name": n, **({"digest": "sha256:" + "ab" * 32} if digest else {})} for n in names]
+            return {"tag_name": tag, "published_at": when, "assets": assets, **extra}
+
+        mac = "sd-master-{}-bin-Darwin-macOS-15.7-arm64.zip"
+        releases = [rel("master-1-aaa", "2026-11-01T00:00:00Z", mac.format("aaa")),
+                    rel("v1.0.0", "2026-11-14T00:00:00Z", "notes.txt"),  # milestone without builds
+                    rel("master-3-ccc", "2026-11-15T00:00:00Z", mac.format("ccc"), digest=False),
+                    rel("master-4-ddd", "2026-11-16T00:00:00Z", mac.format("ddd"), draft=True)]
+        with mock.patch.object(media, "_platform_key", return_value=("darwin", "arm64")):
+            tag, asset = media._pick_release(releases)
+            self.assertEqual((tag, asset["name"]), ("master-1-aaa", mac.format("aaa")))
+            self.assertEqual(media._pick_release(releases[2:3])[0], "master-3-ccc")  # unverified: install refuses it
+            with self.assertRaises(media.MediaSourceError):
+                media._pick_release(releases[1:2])
+            with self.assertRaises(media.MediaSourceError):
+                media._pick_release({"tag_name": "master-1-aaa"})  # the old /latest shape
+
     def test_pick_runtime_asset(self):
         names = [
             "sd-master-1-bin-Darwin-macOS-15.7.1-arm64.zip", "sd-master-1-bin-Linux-Ubuntu-24.04-x86_64.zip",
@@ -709,6 +739,19 @@ class SourceSafetyTests(unittest.TestCase):
                 self.assertEqual(media.sniff_media(path)[0], ext)
             path.write_bytes(b"<html>")
             self.assertIsNone(media.sniff_media(path))
+
+
+class DiskSpaceTests(MediaTestCase):
+    def test_job_refused_when_disk_is_nearly_full(self):
+        from collections import namedtuple
+        from unittest import mock
+
+        usage = namedtuple("usage", "total used free")(100 * 2**30, 99.5 * 2**30, 512 * 2**20)
+        with mock.patch.object(media.shutil, "disk_usage", return_value=usage):
+            with self.assertRaises(HTTPError) as ctx:
+                media.submit_job(image_job())
+        self.assertEqual(ctx.exception.status, HTTPStatus.CONFLICT)
+        self.assertIn("disk space", ctx.exception.message)
 
 
 if __name__ == "__main__":

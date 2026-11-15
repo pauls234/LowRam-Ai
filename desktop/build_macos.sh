@@ -30,7 +30,11 @@ mkdir -p "$ICONSET"
 for size in 16 32 128 256 512; do
   for scale in 1 2; do
     pixels=$((size * scale))
-    name="icon_${size}x${size}$([[ $scale == 2 ]] && echo @2x).png"
+    # (no `$([[ … ]] && echo …)` here: under `set -e` a failed test inside a
+    # command substitution makes the assignment fail and silently ends the build)
+    suffix=""
+    if [[ $scale == 2 ]]; then suffix="@2x"; fi
+    name="icon_${size}x${size}${suffix}.png"
     src="desktop/assets/icon-$pixels.png"
     if [[ -f "$src" ]]; then
       sips -s format png "$src" --out "$ICONSET/$name" >/dev/null

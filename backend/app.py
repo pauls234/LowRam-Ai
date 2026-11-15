@@ -17,6 +17,7 @@ import json
 import logging
 import re
 import secrets
+import signal
 import sys
 import threading
 from collections.abc import Iterator
@@ -30,7 +31,7 @@ from .web import FileResponse, HTTPError, StreamResponse
 
 # Feature modules register their routes/hooks on import. A module that does not
 # exist yet (built in parallel) is skipped; any other import error is raised.
-FEATURE_MODULES = ("api_coding", "chat", "engine", "media", "cluster", "power")
+FEATURE_MODULES = ("api_coding", "chat", "engine", "media", "cluster", "power", "diagnostics", "knowledge", "autosplit")
 LOADED_FEATURES: list[str] = []
 for _name in FEATURE_MODULES:
     try:
@@ -132,6 +133,9 @@ class LoopController:
         with self._lock:
             task = outcome.get("task") or {}
             status = outcome["status"]
+            if status == "waiting":  # RAM guard / model restart: show the wait, change no counters
+                self._state["last_message"] = str(outcome.get("reason") or "")[:500]
+                return
             if status == "done":
                 self._state["completed"] += 1
             elif status == "failed":
@@ -375,6 +379,17 @@ def main(argv: list[str] | None = None) -> int:
     host, port = server.server_address[:2]
     print(f"LowRAM AI: http://{host}:{port}  (model endpoint: {config.llm_url()})")
     print("Local use only - do not expose this port to the network. Press Ctrl+C to stop.")
+
+    def _terminate(signum, frame):  # SIGTERM / SIGHUP: same clean shutdown as Ctrl+C (stops llama-server)
+        raise KeyboardInterrupt
+
+    for name in ("SIGTERM", "SIGHUP"):
+        sig = getattr(signal, name, None)
+        if sig is not None:
+            try:
+                signal.signal(sig, _terminate)
+            except (ValueError, OSError):  # not in the main thread / unsupported here
+                pass
     try:
         server.serve_forever()
     except KeyboardInterrupt:

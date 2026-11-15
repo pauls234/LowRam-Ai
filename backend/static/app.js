@@ -28,6 +28,7 @@
     LR.state.settings = data.settings || {};
     const ui = LR.state.settings.ui || {};
     LR.setTheme(ui.theme || 'system');
+    if (typeof ui.language === 'string' && LR.applyLanguagePref) LR.applyLanguagePref(ui.language);
     LR.emit('settings', LR.state.settings);
     return LR.state.settings;
   };
@@ -91,6 +92,7 @@
     }
   }
 
+  LR.updateNav = () => updateNav();
   function updateNav() {
     for (const link of document.querySelectorAll('.nav-link')) {
       const route = link.dataset.route;
@@ -98,8 +100,9 @@
       else link.removeAttribute('aria-current');
       const feature = FEATURE_OF[route];
       const missing = Boolean(feature && LR.state.features && !LR.has(feature));
+      if (route === 'knowledge' || route === 'diagnostics') link.parentElement.hidden = LR[route + 'Available'] === false || !LR.mayHave(route);
       link.classList.toggle('is-unavailable', missing);
-      link.title = missing ? 'Not available in this build' : '';
+      link.title = missing ? LR.t('Not available in this build') : '';
     }
     const chatOk = !LR.state.features || LR.has('chat');
     LR.$('new-chat').hidden = !chatOk;
@@ -134,21 +137,30 @@
 
   function engineSummary() {
     const eng = LR.state.engine;
-    if (!LR.has('engine') || !eng) return { tone: 'ok', text: 'Local model' };
-    if (eng.external) return { tone: 'ok', text: 'External model' };
+    if (!LR.has('engine') || !eng) return { tone: 'ok', text: LR.t('Local model') };
+    if (eng.external) return { tone: 'ok', text: LR.t('External model') };
     const server = eng.server || {};
     const name = LR.modelName(server.model_id);
-    if (eng.paused) return { tone: 'warn', text: 'Paused for image generation' };
+    if (eng.paused) return { tone: 'warn', text: LR.t('Paused for image generation') };
     switch (server.state) {
-      case 'ready': return { tone: 'ok', text: name || 'Model ready' };
-      case 'starting': return { tone: 'warn', text: 'Starting ' + (name || 'model') + '…', pulse: true };
-      case 'error': return { tone: 'error', text: 'Model error' };
+      case 'ready': return { tone: 'ok', text: name || LR.t('Model ready') };
+      case 'starting': return { tone: 'warn', text: LR.t('Starting ') + (name || LR.t('the model')) + '…', pulse: true };
+      case 'error': return { tone: 'error', text: LR.t('Model error') };
       default: {
+        if (eng.unloaded_idle || server.unloaded_idle) return { tone: 'idle', text: LR.t('Model paused (loads with your next question)') };
         const anyInstalled = LR.state.catalog && Array.isArray(LR.state.catalog.models) && LR.state.catalog.models.some((m) => m.installed);
-        return { tone: 'idle', text: eng.runtime && eng.runtime.installed && anyInstalled ? 'Model stopped' : 'Set up a model' };
+        return { tone: 'idle', text: eng.runtime && eng.runtime.installed && anyInstalled ? LR.t('Model stopped') : LR.t('Set up a model') };
       }
     }
   }
+
+  const PRESSURE_TEXT = {
+    ok: LR.t('Memory is fine'),
+    warn: LR.t('Memory is tight – big tasks wait automatically'),
+    critical: LR.t('Memory is very tight – big tasks wait automatically; closing other apps helps'),
+  };
+
+  const diagTarget = () => (LR.views.has('diagnostics') && LR.diagnosticsAvailable !== false ? '#/diagnostics' : '#/settings');
 
   function renderPill() {
     const dot = LR.$('status-dot');
@@ -157,9 +169,10 @@
     const pill = LR.$('status-pill');
     if (LR.isBackendDown()) {
       dot.className = 'dot dot-error';
-      text.textContent = 'Offline';
+      text.textContent = LR.t('Offline');
       ram.textContent = '';
-      pill.setAttribute('aria-label', 'LowRAM AI is offline. Open Models and Settings');
+      pill.setAttribute('aria-label', LR.t('LowRAM AI is offline. Open Models and Settings'));
+      pill.dataset.target = diagTarget();
       return;
     }
     const s = engineSummary();
@@ -168,15 +181,24 @@
     dot.className = 'dot dot-' + (busy ? 'busy' : s.tone) + (s.pulse || busy ? ' is-pulsing' : '');
     text.textContent = s.text;
     const mem = LR.state.memory;
-    const free = mem && LR.isNum(mem.available_bytes) ? fmt.gb(mem.available_bytes) + ' free' : '';
-    ram.textContent = busy ? 'Busy: ' + busy : free;
+    const free = mem && LR.isNum(mem.available_bytes) ? fmt.gb(mem.available_bytes) + LR.t(' free') : '';
+    // RAM pressure from the backend sampler (v0.4): ok / warn / critical.
+    const level = mem && mem.pressure && ['ok', 'warn', 'critical'].includes(mem.pressure.level) ? mem.pressure.level : null;
+    const pressureText = level ? PRESSURE_TEXT[level] : '';
+    ram.replaceChildren(...[
+      level && !busy ? h('span', { class: 'pressure-dot is-' + level, 'aria-hidden': 'true' }) : null,
+      busy ? LR.t('Busy: ') + busy : free,
+    ].filter(Boolean));
     ram.classList.toggle('is-busy', Boolean(busy));
-    pill.title = [s.text, free ? 'RAM ' + free : '', busy ? 'Busy: ' + busy : ''].filter(Boolean).join(' · ');
-    pill.setAttribute('aria-label', 'Status: ' + pill.title + '. Open Models and Settings');
+    ram.classList.toggle('is-pressure', level === 'warn' || level === 'critical');
+    pill.title = [s.text, free ? 'RAM ' + free : '', level && level !== 'ok' ? pressureText : '', busy ? LR.t('Busy: ') + busy : ''].filter(Boolean).join(' · ');
+    pill.dataset.target = s.tone === 'error' ? diagTarget() : '#/settings';
+    pill.setAttribute('aria-label', LR.t('Status: ') + pill.title + (pill.dataset.target === '#/diagnostics' ? LR.t('. Open Diagnostics') : LR.t('. Open Models and Settings')));
   }
 
   /* ------------------------------------------------------------ banners */
 
+  LR.banner = (key, o) => banner(key, o);
   function banner(key, o) {
     const region = LR.$('banners');
     let el = region.querySelector('[data-key="' + key + '"]');
@@ -201,9 +223,9 @@
     if (app.tokenRejected) {
       banner('token', {
         tone: 'error',
-        title: 'This page is out of date.',
-        text: 'LowRAM AI was restarted, so this tab needs a reload to continue.',
-        actions: [LR.button({ text: 'Reload', icon: 'retry', size: 'sm', variant: 'primary', onclick: () => window.location.reload() })],
+        title: LR.t('This page is out of date.'),
+        text: LR.t('LowRAM AI was restarted, so this tab needs a reload to continue.'),
+        actions: [LR.button({ text: LR.t('Reload'), icon: 'retry', size: 'sm', variant: 'primary', onclick: () => window.location.reload() })],
       });
     } else banner('token', null);
 
@@ -212,9 +234,12 @@
       banner('down', {
         tone: 'error',
         icon: 'wifi',
-        title: 'LowRAM AI is not reachable.',
-        text: 'Is the app still running? Retrying automatically' + (secs ? ' in ' + secs + ' s' : '') + '…',
-        actions: [LR.button({ text: 'Retry now', size: 'sm', onclick: () => statusPoller.now() })],
+        title: LR.t('LowRAM AI is not reachable.'),
+        text: LR.t('Is the app still running? Retrying automatically') + (secs ? ' in ' + secs + ' s' : '') + '…',
+        actions: [
+          LR.button({ text: LR.t('Retry now'), size: 'sm', onclick: () => statusPoller.now() }),
+          diagTarget() === '#/diagnostics' ? LR.button({ text: LR.t('Open Diagnostics'), size: 'sm', variant: 'ghost', onclick: () => LR.go('#/diagnostics') }) : null,
+        ].filter(Boolean),
       });
     } else banner('down', null);
 
@@ -222,9 +247,10 @@
     if (errors.length && !app.startupDismissed) {
       banner('startup', {
         tone: 'warn',
-        title: 'Some parts did not start:',
+        title: LR.t('Some parts did not start:'),
         text: errors.join(' · '),
-        actions: [LR.button({ text: 'Dismiss', size: 'sm', variant: 'ghost', onclick: () => { app.startupDismissed = true; renderBanners(); } })],
+        actions: [
+          diagTarget() === '#/diagnostics' ? LR.button({ text: LR.t('Open Diagnostics'), size: 'sm', onclick: () => LR.go('#/diagnostics') }) : null,LR.button({ text: LR.t('Dismiss'), size: 'sm', variant: 'ghost', onclick: () => { app.startupDismissed = true; renderBanners(); } })],
       });
     } else banner('startup', null);
 
@@ -240,7 +266,7 @@
     if (badge) {
       badge.textContent = requests.length ? String(requests.length) : '';
       badge.hidden = !requests.length;
-      badge.setAttribute('aria-label', requests.length + ' pairing request' + (requests.length === 1 ? '' : 's'));
+      badge.setAttribute('aria-label', requests.length === 1 ? LR.t('1 pairing request') : LR.t('{n} pairing requests', { n: requests.length }));
     }
     const r = requests[0];
     if (r && app.route !== 'devices') {
@@ -250,11 +276,11 @@
         banner('pair', {
           tone: 'accent',
           icon: 'devices',
-          title: LR.str(r.name, 'A computer') + ' wants to help.',
-          text: r.verification_code ? 'Allow it only if it shows the number ' + LR.str(r.verification_code) + '.' : 'Waiting for its verification number…',
+          title: LR.str(r.name, LR.t('A computer')) + LR.t(' wants to help.'),
+          text: r.verification_code ? LR.t('Allow it only if it shows the number ') + LR.str(r.verification_code) + '.' : LR.t('Waiting for its verification number…'),
           actions: [
-            LR.button({ text: 'Deny', size: 'sm', variant: 'ghost', onclick: (ev) => LR.cluster.answerRequest(r, false, ev.currentTarget) }),
-            LR.button({ text: 'Allow', icon: 'check', size: 'sm', variant: 'primary', disabled: !r.verification_code, onclick: (ev) => LR.cluster.answerRequest(r, true, ev.currentTarget) }),
+            LR.button({ text: LR.t('Deny'), size: 'sm', variant: 'ghost', onclick: (ev) => LR.cluster.answerRequest(r, false, ev.currentTarget) }),
+            LR.button({ text: LR.t('Allow'), icon: 'check', size: 'sm', variant: 'primary', disabled: !r.verification_code, onclick: (ev) => LR.cluster.answerRequest(r, true, ev.currentTarget) }),
           ],
         });
       }
@@ -334,7 +360,7 @@
     LR.$('menu-btn').addEventListener('click', openDrawer);
     LR.$('sidebar-close').addEventListener('click', () => closeDrawer(true));
     LR.$('scrim').addEventListener('click', () => closeDrawer(true));
-    LR.$('status-pill').addEventListener('click', () => LR.go('#/settings'));
+    LR.$('status-pill').addEventListener('click', () => LR.go(LR.$('status-pill').dataset.target || '#/settings'));
     LR.$('new-chat').addEventListener('click', (ev) => {
       if (window.location.hash === '#/chat/new') {
         ev.preventDefault();

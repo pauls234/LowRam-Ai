@@ -45,7 +45,10 @@ def post_settings(req: Request) -> Response:
 
 @route("GET", r"/api/memory")
 def get_memory(req: Request) -> Response:
-    return Response(memory.plan(req.arg("percent", str(memory.DEFAULT_PERCENT))).to_dict())
+    """Memory plan for the RAM budget plus ``pressure`` (ok/warn/critical, swap growth) for the UI."""
+    data = memory.plan(req.arg("percent", str(memory.DEFAULT_PERCENT))).to_dict()
+    data["pressure"] = memory.pressure()
+    return Response(data)
 
 
 @route("GET", r"/api/projects")

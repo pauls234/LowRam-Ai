@@ -1,19 +1,46 @@
 """General task queue: run one task at a time, or a bounded loop of tasks.
 
 Every task outcome is recorded explicitly (``done`` with a result artifact, or
-``failed`` with an error). Nothing is retried automatically.
+``failed`` with an error). Resilience on weak hardware ("hold on instead of
+giving up"):
+
+* while a task streams, its partial answer is checkpointed (atomically, every
+  ~15 s, plus a final one on error) to ``task_ID.partial.md``; on success the
+  result file replaces it;
+* after a transient model error (engine crash/restart, dropped or stalled
+  connection) the task waits for the model (up to 10 min) and continues ONCE
+  from the checkpoint – if that fails too, it fails with the partial text kept;
+* a context overflow is retried once with half the carry-over context
+  (:func:`call_with_overflow_retry` offers the same to other modules);
+* :func:`run_loop` waits for free RAM between tasks (``memory.guard_wait``).
+
+Nothing else is retried automatically.
 """
 
 from __future__ import annotations
 
+import importlib
 import logging
+import math
+import os
 import threading
 import time
 from collections.abc import Callable
+from pathlib import Path
 
-from . import artifacts, config, db, llm, memory, power
+from . import artifacts, config, db, llm, memory, power, settings
 
 log = logging.getLogger("lowram.runner")
+
+CHECKPOINT_INTERVAL_S = 15.0  # spare the SSD; a final checkpoint is always written on error
+ENGINE_WAIT_S = 600.0  # how long a task waits for the model after a transient error
+ENGINE_STEP_S = 30.0  # one engine.ensure_running() call; the stop request is checked in between
+ENGINE_POLL_S = 5.0
+ENGINE_READY_POLL_S = 1.0  # the engine says "ready" but its URL does not answer yet (stale state after a crash)
+RESUME_PROMPT = (
+    "Deine Antwort oben wurde unterbrochen. Setze exakt dort fort, wo sie aufhört, ohne Wiederholung."
+)
+WAITING_FOR_MODEL = "Warte auf das Modell (Verbindung unterbrochen, es wird neu geladen)…"
 
 MAX_TASKS_PER_PROJECT = 200
 MAX_TASK_CHARS = 2000
@@ -179,12 +206,252 @@ def record_failure(task_id: int, message: str, cause: BaseException | None = Non
         ) from (cause or exc)
 
 
-def run_next(project_id: int, percent: object = memory.DEFAULT_PERCENT) -> dict:
+# --------------------------------------------------------------------------- resilience
+
+
+def resilience() -> dict:
+    """``settings.resilience`` with the defaults for anything missing or invalid."""
+    defaults = settings.DEFAULTS["resilience"]
+    try:
+        stored = settings.get("resilience")
+    except Exception:  # noqa: BLE001 - a broken settings file must not stop the queue
+        log.warning("Could not read the resilience settings; using defaults", exc_info=True)
+        stored = {}
+    values = dict(defaults)
+    for key, default in defaults.items():
+        value = stored.get(key, default) if isinstance(stored, dict) else default
+        if isinstance(default, bool):
+            values[key] = value if isinstance(value, bool) else default
+        elif (isinstance(value, (int, float)) and not isinstance(value, bool)
+              and math.isfinite(value) and value >= 0):
+            values[key] = value
+    return values
+
+
+def partial_path(project_id: int, task_id: int) -> Path:
+    """Checkpoint of a task's streaming answer: ``artifacts/project_N/task_ID.partial.md``."""
+    return artifacts.project_dir(project_id) / f"task_{int(task_id)}.partial.md"
+
+
+def join_continuation(prefix: str, continuation: str) -> str:
+    """``prefix`` (an interrupted answer) followed by the model's continuation of it."""
+    if not prefix.strip():
+        return continuation
+    if not continuation:
+        return prefix
+    if prefix[-1].isspace() or continuation[0].isspace():
+        return prefix + continuation
+    if prefix[-1] in ".!?:;,)" and continuation[0].isalnum():
+        return f"{prefix} {continuation}"
+    return prefix + continuation
+
+
+def resume_messages(messages: list[dict], partial: str) -> list[dict]:
+    """The original request plus the interrupted answer and the instruction to continue it."""
+    return [*messages, {"role": "assistant", "content": partial}, {"role": "user", "content": RESUME_PROMPT}]
+
+
+class Checkpoint:
+    """Keeps a streaming answer in ``task_ID.partial.md`` (atomic writes, at most every ~15 s).
+
+    ``prefix`` is the answer saved before a resume, ``current`` the visible
+    text of the request that is running now; :attr:`text` combines both.
+    Write errors are logged, never raised: a checkpoint must not fail a task.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.prefix = ""
+        self.current = ""
+        self.saved = False
+        self._last_write = time.monotonic()
+
+    @property
+    def text(self) -> str:
+        return join_continuation(self.prefix, self.current)
+
+    def on_text(self, visible: str) -> None:
+        """``llm.chat(on_text=…)`` callback: remember the text, write it every CHECKPOINT_INTERVAL_S."""
+        self.current = visible
+        if time.monotonic() - self._last_write >= CHECKPOINT_INTERVAL_S:
+            self.flush()
+
+    def flush(self) -> bool:
+        """Write the current text now; True if a checkpoint with text exists afterwards."""
+        self._last_write = time.monotonic()
+        text = self.text
+        if not text.strip():
+            return self.saved
+        try:
+            artifacts.write_text_atomic(self.path, text)
+            self.saved = True
+        except (OSError, artifacts.ArtifactError) as exc:
+            log.warning("Could not write the checkpoint %s: %s", self.path.name, exc)
+        return self.saved
+
+    def interrupted(self, partial: str = "") -> None:
+        """The running request failed: everything received so far becomes the prefix."""
+        if partial:
+            self.current = partial
+        self.prefix, self.current = self.text, ""
+        self.flush()
+
+    def remove(self) -> None:
+        try:
+            self.path.unlink(missing_ok=True)
+        except OSError as exc:
+            log.warning("Could not remove the checkpoint %s: %s", self.path.name, exc)
+        self.saved = False
+
+
+def _managed_engine():
+    """``backend.engine`` (lazy, optional) when LowRAM AI runs llama-server itself, else ``None``."""
+    if os.environ.get("LOWRAM_LLM_URL", "").strip():
+        return None
+    name = f"{__package__}.engine"
+    try:
+        return importlib.import_module(name)
+    except ModuleNotFoundError as exc:
+        if exc.name != name:
+            log.warning("The engine module could not be loaded: %s", exc)
+        return None
+
+
+def await_model(timeout: float | None = None, *, stop_event: threading.Event | None = None,
+                on_wait: Callable[[str], None] | None = None) -> tuple[str | None, str | None]:
+    """Wait until the model endpoint answers again after a transient error.
+
+    Returns ``(url, None)`` with the URL to use from now on, or ``(None,
+    reason)`` after ``ENGINE_WAIT_S`` or when ``stop_event`` is set (checked
+    at least every ``ENGINE_STEP_S``). Managed engine: the URL returned by
+    ``engine.ensure_running`` (restarts/loads it if needed) is only trusted
+    once ``llm.endpoint_ready`` confirms it – right after a crash the engine
+    may still report the old, dead port as ready; then it is asked again
+    every ``ENGINE_READY_POLL_S``. External endpoint or no engine module: the
+    configured URL is polled.
+    """
+    limit = ENGINE_WAIT_S if timeout is None else max(0.0, float(timeout))
+    deadline = time.monotonic() + limit
+    engine = _managed_engine()
+    if on_wait is not None:
+        on_wait(WAITING_FOR_MODEL)
+    while True:
+        if stop_event is not None and stop_event.is_set():
+            return None, "stopped while waiting for the model"
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None, f"the model was not ready again within {limit / 60:g} min"
+        pause = ENGINE_POLL_S
+        if engine is not None:
+            try:
+                url = engine.ensure_running(timeout=min(remaining, ENGINE_STEP_S))
+            except Exception as exc:  # noqa: BLE001 - EngineError (loading, paused, …): keep waiting
+                log.info("Waiting for the model: %s", exc)
+            else:
+                url = url if isinstance(url, str) and url else config.llm_url()
+                if llm.endpoint_ready(url, timeout=min(5.0, max(0.1, deadline - time.monotonic()))):
+                    return url, None
+                log.info("The engine reports %s as ready, but it does not answer yet", llm.redact_url(url))
+                pause = ENGINE_READY_POLL_S
+        else:
+            url = config.llm_url()
+            if llm.endpoint_ready(url, timeout=min(5.0, remaining)):
+                return url, None
+        pause = min(pause, max(0.0, deadline - time.monotonic()))
+        if stop_event is not None:
+            stop_event.wait(pause)
+        else:
+            time.sleep(pause)
+
+
+def wait_for_model(timeout: float | None = None, *, stop_event: threading.Event | None = None,
+                   on_wait: Callable[[str], None] | None = None) -> str | None:
+    """Like :func:`await_model`; returns ``None`` when the model answers again, else the reason."""
+    return await_model(timeout, stop_event=stop_event, on_wait=on_wait)[1]
+
+
+def call_with_overflow_retry(
+    build_messages: Callable[[int], list[dict]],
+    context_chars: int,
+    *,
+    info: dict | None = None,
+    **chat_kwargs,
+) -> str:
+    """``llm.chat(build_messages(context_chars), **chat_kwargs)`` with ONE retry on a context overflow.
+
+    ``build_messages(budget)`` must build the request with at most ``budget``
+    characters of carry-over context; after an ``LLMError`` with
+    ``context_overflow`` it is called again with half the budget. Other errors
+    (and a second overflow) are raised unchanged. ``info`` (optional dict)
+    receives ``attempts``, ``context_retry`` and ``context_chars`` (the budget
+    of the last request).
+    """
+    budget = max(0, int(context_chars))
+    attempts = 0
+    while True:
+        attempts += 1
+        if info is not None:
+            info.update(attempts=attempts, context_retry=attempts > 1, context_chars=budget)
+        try:
+            return llm.chat(build_messages(budget), **chat_kwargs)
+        except llm.LLMError as exc:
+            if not exc.context_overflow or attempts > 1 or budget <= 0:
+                raise
+            log.info("Context overflow (%s); retrying once with %s instead of %s characters of context",
+                     exc, budget // 2, budget)
+            budget //= 2
+
+
+def _generate(project_id: int, task: dict, mem: memory.MemoryPlan, checkpoint: Checkpoint, skipped: list[int],
+              info: dict, stop_event: threading.Event | None, on_wait: Callable[[str], None] | None) -> str:
+    """The task's answer: checkpointed, resumed once after a transient error, overflow retried once."""
+    rules = resilience()
+    budget = mem.context_chars
+    context = build_context(project_id, task, budget, skipped)
+    info.update(attempts=0, resumed_from_checkpoint=False, transient_retries=0, context_retry=False,
+                context_chars=len(context))
+    url: str | None = None  # None = the configured URL at call time; after a crash: the one confirmed ready
+    while True:
+        messages = _messages(task, context)
+        if checkpoint.prefix:
+            messages = resume_messages(messages, checkpoint.prefix)
+        info["attempts"] += 1
+        checkpoint.current = ""
+        try:
+            answer = llm.chat(messages, max_tokens=mem.max_tokens, url=url, on_text=checkpoint.on_text)
+        except llm.LLMError as exc:
+            if exc.context_overflow and not info["context_retry"] and context:
+                info["context_retry"] = True
+                budget //= 2
+                skipped.clear()
+                context = build_context(project_id, task, budget, skipped)
+                info["context_chars"] = len(context)
+                log.info("Task #%s: context overflow, retrying with %s characters of context", task["id"], budget)
+                continue
+            checkpoint.interrupted(exc.partial)
+            if not (exc.transient and rules["retry_transient"] and not info["transient_retries"]):
+                raise
+            info["transient_retries"] = 1
+            log.warning("Task #%s: transient model error (%s); waiting for the model", task["id"], exc)
+            url, problem = await_model(stop_event=stop_event, on_wait=on_wait)
+            if problem is not None:
+                raise llm.LLMError(f"{exc} ({problem})") from exc
+            info["url"] = url  # never the URL from before the crash: the engine may have a new port
+            info["resumed_from_checkpoint"] = bool(checkpoint.prefix.strip())
+            continue
+        return join_continuation(checkpoint.prefix, answer).strip()
+
+
+def run_next(project_id: int, percent: object = memory.DEFAULT_PERCENT, *,
+             stop_event: threading.Event | None = None,
+             on_wait: Callable[[str], None] | None = None) -> dict:
     """Run the next pending task of a general project.
 
     Returns a dict with ``status`` one of ``done``, ``failed``, ``paused``
     (not enough free RAM) or ``empty`` (no pending task). Raises ``db.Busy``
-    when another inference is in progress.
+    when another inference is in progress. ``on_wait(message)`` reports
+    waits for the model after a transient error; ``stop_event`` ends such a
+    wait early (the task then fails, its partial answer kept).
     """
     pct = memory.validate_percent(percent)
     require_general(project_id)
@@ -202,35 +469,71 @@ def run_next(project_id: int, percent: object = memory.DEFAULT_PERCENT) -> dict:
         return {**outcome, "status": "empty", "reason": "No pending tasks in this project."}
     started = time.monotonic()
     skipped: list[int] = []
+    info: dict = {}
+    checkpoint = Checkpoint(partial_path(project_id, task["id"]))
     try:
-        context = build_context(project_id, task, mem.context_chars, skipped)
-        answer = llm.chat(_messages(task, context), max_tokens=mem.max_tokens)
+        checkpoint.remove()  # a fresh run never mixes with leftovers of an earlier one
+        answer = _generate(project_id, task, mem, checkpoint, skipped, info, stop_event, on_wait)
         metadata = {
             "project_id": project_id,
             "task_id": task["id"],
             "position": task["position"],
             "title": task["title"],
             "model": config.llm_model(),
-            "endpoint": llm.redact_url(config.llm_url()),
+            "endpoint": llm.redact_url(info.get("url") or config.llm_url()),
             "percent": pct,
             "max_tokens": mem.max_tokens,
-            "context_chars": len(context),
+            "context_chars": info.get("context_chars", 0),
             "context_skipped_task_ids": skipped,
+            "attempts": info.get("attempts", 1),
+            "resumed_from_checkpoint": info.get("resumed_from_checkpoint", False),
+            "transient_retries": info.get("transient_retries", 0),
+            "context_retry": info.get("context_retry", False),
             "duration_s": round(time.monotonic() - started, 2),
             "created_at": db.utcnow(),
         }
         path = artifacts.write_task_result(project_id, task["id"], answer, metadata)
+        checkpoint.prefix = checkpoint.current = ""
+        checkpoint.remove()  # the result file replaces the checkpoint
         done = db.finish_task(task["id"], "done", result_path=str(path))
         return {**outcome, "status": "done", "task": done, "result": answer}
     except Exception as exc:  # every failure is recorded on the task, never swallowed
-        failed = record_failure(task["id"], describe_error(exc), exc)
+        message = describe_error(exc)
+        if checkpoint.flush():
+            message += (f" The partial answer ({len(checkpoint.text.strip())} characters) was kept in "
+                        f"{checkpoint.path.name}.")
+        failed = record_failure(task["id"], message, exc)
         return {**outcome, "status": "failed", "task": failed, "error": failed["error"]}
     except BaseException:
+        checkpoint.flush()
         try:
             db.finish_task(task["id"], "failed", error="Interrupted before the task finished")
         except Exception:  # keep the original KeyboardInterrupt/SystemExit
             log.exception("Could not record the interruption of task #%s", task["id"])
         raise
+
+
+def _emit_waiting(on_step: Callable[[dict], None] | None, message: str) -> None:
+    """Report a wait (RAM, model restart) as a ``waiting`` step: shown as the loop's status text."""
+    if on_step is not None:
+        on_step({"status": "waiting", "task": None, "result": None, "error": None, "reason": message,
+                 "memory": None})
+
+
+def _hold_for_ram(stop_event: threading.Event | None,
+                  on_step: Callable[[dict], None] | None) -> tuple[str, str] | None:
+    """Between tasks: wait up to ``wait_for_ram_minutes`` for free RAM.
+
+    ``None`` = go on; else ``(stopped_because, message)``.
+    """
+    if memory.plan().can_run:
+        return None
+    minutes = resilience()["wait_for_ram_minutes"]
+    if memory.guard_wait("task loop", minutes * 60, stop_event, lambda message: _emit_waiting(on_step, message)):
+        return None
+    if stop_event is not None and stop_event.is_set():
+        return "stop_requested", "Stopped on request."
+    return "paused_low_ram", f"{memory.plan().reason} (Waited {minutes:g} min for free RAM.)"
 
 
 def run_loop(
@@ -249,6 +552,14 @@ def run_loop(
     (``power.battery_block_reason``), another inference busy, or
     ``stop_event`` set (checked between tasks; a running inference is never
     killed mid-way).
+
+    RAM: too little free RAM before the first task stops the loop at once
+    (``paused_low_ram``, the user just started it); between tasks the loop
+    waits up to ``settings.resilience.wait_for_ram_minutes`` for RAM to
+    recover (``memory.guard_wait``), reporting ``{"status": "waiting",
+    "reason": "Warte auf freien Arbeitsspeicher (… MB frei)…"}`` through
+    ``on_step``; ``stop_event`` ends the wait promptly. Waits for the model
+    after a transient error are reported the same way.
     """
     pct = memory.validate_percent(percent)
     limit = validate_max_tasks(max_tasks)
@@ -275,8 +586,14 @@ def run_loop(
             if battery:
                 summary.update(stopped_because="on_battery", message=battery)
                 break
+            if summary["steps"]:  # between tasks: hold on instead of giving up while RAM is short
+                held = _hold_for_ram(stop_event, on_step)
+                if held is not None:
+                    summary.update(stopped_because=held[0], message=held[1])
+                    break
             try:
-                outcome = run_next(project_id, pct)
+                outcome = run_next(project_id, pct, stop_event=stop_event,
+                                   on_wait=lambda message: _emit_waiting(on_step, message))
             except db.Busy as exc:
                 summary.update(stopped_because="busy", message=str(exc))
                 break

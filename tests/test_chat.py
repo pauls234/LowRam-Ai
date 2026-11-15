@@ -317,6 +317,28 @@ class ConversationApiTests(ChatApiTestCase):
         self.assertIn("Interrupted", message["error"])
         self.assertIn(chat.recover_interrupted, __import__("backend.web").web.STARTUP_HOOKS)
 
+    def test_startup_settles_an_interrupted_regenerate(self):
+        cid = self.new_chat()
+
+        def add(content, role="assistant", status="streaming"):
+            with db.connect() as conn:
+                conn.execute(
+                    "INSERT INTO messages (conversation_id, role, content, status, created_at) VALUES (?, ?, ?, ?, ?)",
+                    (cid, role, content, status, db.utcnow()),
+                )
+
+        add("q", "user", "complete")
+        add("old", status="complete")
+        add("")  # no text yet: the previous answer stays
+        with self.assertLogs("lowram.chat", "WARNING"):
+            self.assertEqual(chat.recover_interrupted(None), 1)
+        self.assertEqual([(m["content"], m["status"]) for m in self.messages(cid)], [("q", "complete"), ("old", "complete")])
+        add("new text")  # with text: it replaces the previous answer
+        with self.assertLogs("lowram.chat", "WARNING"):
+            chat.recover_interrupted(None)
+        self.assertEqual([(m["content"], m["status"]) for m in self.messages(cid)], [("q", "complete"), ("new text", "stopped")])
+        self.assertEqual(chat.get_conversation(cid)["message_count"], 2)
+
 
 class StreamingApiTests(ChatApiTestCase):
     def test_full_answer_events_and_persistence(self):
@@ -823,6 +845,36 @@ class SmartChatApiTests(ChatApiTestCase):
         self.send(cid, "And again?").rest()
         self.assertIn("remember the milk", self.sent()[1]["content"])
 
+    def test_knowledge_sources_in_prompt_and_stored(self):
+        from backend import knowledge
+
+        coll = knowledge.create_collection("Handbuch")
+        knowledge.add_document(coll["id"], "auto.txt", "Der Ölwechsel ist alle 15000 Kilometer fällig.")
+        knowledge.add_document(coll["id"], "garten.md", "Tomaten brauchen Sonne.")
+        cid = self.new_chat()
+        events = self.send(cid, "Wann ist der Ölwechsel fällig?", collection_id=coll["id"]).rest()
+        expected = [{"document": "auto.txt", "document_id": 1, "snippet": "Der Ölwechsel ist alle 15000 Kilometer fällig."}]
+        self.assertEqual(events[0]["assistant_message"]["sources"], expected)
+        self.assertEqual(events[-1]["message"]["sources"], expected)
+        prompt = self.sent()[-1]["content"]
+        self.assertTrue(prompt.startswith("Wann ist der Ölwechsel fällig?"))
+        self.assertIn("Quellen", prompt)
+        self.assertIn("[1] auto.txt\nDer Ölwechsel ist alle 15000 Kilometer fällig.", prompt)
+        self.assertIn("[1], [2]", prompt)
+        self.assertNotIn("Tomaten", prompt)
+        stored = self.messages(cid)
+        self.assertEqual((stored[0]["sources"], stored[1]["sources"]), ([], expected))
+        # regenerate with the collection keeps sources; without one there are none
+        self.assertEqual(self.api("GET", f"/api/chats/{cid}")[0], 200)
+        events = SSEClient(self.port, f"/api/chats/{cid}/regenerate", {"collection_id": coll["id"]}).rest()
+        self.assertEqual(events[-1]["message"]["sources"], expected)
+        self.send(cid, "Danke").rest()
+        self.assertEqual(self.messages(cid)[-1]["sources"], [])
+        # errors before streaming
+        self.assertEqual(self.send(cid, "hi", collection_id=999).status, 404)
+        for bad in ("1", 0, True, 1.5):
+            self.assertEqual(self.send(cid, "hi", collection_id=bad).status, 400, bad)
+
     def test_attachment_only_message_large_body_and_errors(self):
         cid = self.new_chat()
         big = [{"name": f"f{i}.txt", "content": "z" * (200 * 1024)} for i in range(5)]  # > 1 MiB body
@@ -901,6 +953,46 @@ class SmartChatApiTests(ChatApiTestCase):
         with db.inference_slot("image job"):
             self.assertEqual(SSEClient(self.port, f"/api/chats/{cid}/regenerate", {}).status, 409)
 
+    def test_failed_or_stopped_regenerate_keeps_previous_answer(self):
+        cid = self.new_chat()
+        self.fake.push(Stream(["first"]), HttpError(500, "boom"))
+        old = self.send(cid, "q1").rest()[-1]["message"]
+        error = SSEClient(self.port, f"/api/chats/{cid}/regenerate", {}).rest()[-1]
+        self.assertEqual((error["type"], error["kept_previous"]), ("error", True))
+        self.assertEqual((error["message"]["id"], error["message"]["content"]), (old["id"], "first"))
+        stored = self.messages(cid)
+        self.assertEqual([(m["id"], m["content"], m["status"]) for m in stored[1:]], [(old["id"], "first", "complete")])
+        # Stopped before the first token: kept too; meanwhile only the new answer is listed.
+        release = threading.Event()
+        self.addCleanup(release.set)
+        self.fake.push(Hold(release))
+        client = SSEClient(self.port, f"/api/chats/{cid}/regenerate", {})
+        self.assertEqual(client.next()["type"], "start")
+        self.assertEqual([m["status"] for m in self.messages(cid)], ["complete", "streaming"])
+        self.assertTrue(self.api("POST", f"/api/chats/{cid}/stop", {})[1]["stopped"])
+        done = client.rest()[-1]
+        client.close()
+        self.assertEqual((done["type"], done["kept_previous"], done["message"]["id"]), ("done", True, old["id"]))
+        self.assertEqual([(m["id"], m["status"]) for m in self.messages(cid)], [(stored[0]["id"], "complete"), (old["id"], "complete")])
+        self.assertEqual(chat.get_conversation(cid)["message_count"], 2)
+        self.assertIsNone(db.busy_reason())
+
+    def test_answer_setup_failure_never_leaves_streaming(self):
+        cid = self.new_chat()
+        self.fake.push(Stream(["Partial"], finish_reason="length"))
+        self.send(cid, "q1").rest()
+        with mock.patch.object(chat, "_Answer", side_effect=RuntimeError("kaputt")), self.assertLogs(level="ERROR"):
+            for path, body in (("continue", {}), ("regenerate", {}), ("messages", {"content": "q2"})):
+                with self.subTest(path=path):
+                    self.assertEqual(self.api("POST", f"/api/chats/{cid}/{path}", body)[0], 500)
+        stored = self.messages(cid)
+        self.assertEqual([(m["content"], m["status"]) for m in stored],
+                         [("q1", "complete"), ("Partial", "complete"), ("q2", "complete"), ("", "error")])
+        self.assertTrue(stored[1]["truncated"])
+        self.assertIn("could not be started", stored[3]["error"])
+        self.assertIsNone(db.busy_reason())
+        self.assertFalse(chat._ACTIVE)
+
     def test_search(self):
         apples = self.new_chat(title="Äpfel und Birnen")
         rates = self.new_chat(title="Rates")
@@ -946,6 +1038,96 @@ class SmartChatApiTests(ChatApiTestCase):
         self.assertEqual(self.api("GET", "/api/chats/999/export")[0], 404)
 
 
+class MemoryApiTests(ChatApiTestCase):
+    """Long-chat memory: older turns are summarised instead of dropped."""
+
+    def setUp(self):
+        super().setUp()
+        limits = mock.patch.object(chat, "context_limits", return_value=(3000, 512))
+        limits.start()
+        self.addCleanup(limits.stop)
+
+    def sent(self, index=-1):
+        return self.fake.requests[index]["json"]["messages"]
+
+    def test_older_turns_are_summarised_stored_and_reused(self):
+        cid = self.new_chat()
+        q1, a1, q2, q3 = "Q1 " + "a" * 800, "A1 " + "b" * 800, "Q2 " + "c" * 800, "Q3 " + "d" * 800
+        self.fake.push(Stream([a1]), Stream(["<think>hm</think>Nutzer fragte Q1, Antwort A1.\x07"]), Stream(["A2"]))
+        self.send(cid, q1).rest()
+        events = self.send(cid, q2).rest()
+        self.assertEqual([e["type"] for e in events], ["start", "status", "token", "done"])
+        self.assertEqual(events[1]["text"], "Fasse ältere Nachrichten zusammen…")
+        self.assertEqual(events[-1]["message"]["content"], "A2")
+        summary_call = self.fake.requests[1]["json"]
+        self.assertEqual((summary_call["max_tokens"], summary_call["temperature"]), (350, 0.2))
+        self.assertEqual(summary_call["messages"][0]["content"], chat.SUMMARY_SYSTEM_PROMPT)
+        self.assertIn("User: Q1", summary_call["messages"][1]["content"])
+        self.assertIn("Assistant: A1", summary_call["messages"][1]["content"])
+        answer = self.sent(2)
+        self.assertTrue(answer[0]["content"].endswith(chat.SUMMARY_HEADER + "Nutzer fragte Q1, Antwort A1."))
+        self.assertEqual([m["content"] for m in answer[1:]], [q2])
+        status, data = self.api("GET", f"/api/chats/{cid}")
+        self.assertEqual(status, 200)
+        self.assertEqual(data["summary"], "Nutzer fragte Q1, Antwort A1.")
+        self.assertEqual(data["summarized_until"], data["messages"][1]["id"])
+        self.assertIsNone(db.busy_reason())
+        # The next turn fits next to the summary: no new summary call, summarised turns are not resent.
+        self.fake.push(Stream(["A3"]))
+        events = self.send(cid, q3).rest()
+        self.assertNotIn("status", [e["type"] for e in events])
+        self.assertEqual(len(self.fake.requests), 4)
+        answer = self.sent()
+        self.assertIn("Nutzer fragte Q1", answer[0]["content"])
+        self.assertEqual([m["content"] for m in answer[1:]], [q2, "A2", q3])
+
+    def test_failed_summary_falls_back_to_dropping(self):
+        cid = self.new_chat()
+        q1, a1, q2 = "Q1 " + "a" * 800, "A1 " + "b" * 800, "Q2 " + "c" * 800
+        self.fake.push(Stream([a1]), HttpError(500, "boom"), Stream(["A2"]))
+        self.send(cid, q1).rest()
+        events = self.send(cid, q2).rest()
+        self.assertEqual([e["type"] for e in events], ["start", "status", "token", "done"])
+        self.assertEqual(events[-1]["message"]["status"], "complete")
+        answer = self.sent()
+        self.assertEqual(answer[0]["content"], chat.CHAT_SYSTEM_PROMPT)
+        self.assertEqual([m["content"] for m in answer[1:]], [chat.OMITTED_NOTE, a1, q2])
+        data = self.api("GET", f"/api/chats/{cid}")[1]
+        self.assertEqual((data["summary"], data["summarized_until"]), (None, None))
+        self.assertIsNone(db.busy_reason())
+
+    def test_short_chats_need_no_summary(self):
+        cid = self.new_chat()
+        self.fake.push(Stream(["one"]), Stream(["two"]))
+        self.send(cid, "first").rest()
+        events = self.send(cid, "second").rest()
+        self.assertEqual([e["type"] for e in events], ["start", "token", "done"])
+        self.assertEqual(len(self.fake.requests), 2)
+
+
+class SummaryHelperTests(unittest.TestCase):
+    def test_clean_summary_strips_reasoning_controls_and_caps_length(self):
+        self.assertEqual(chat.clean_summary("<think>x</think> Kurz\x1b gesagt.\n\n\n\nEnde "), "Kurz gesagt.\n\nEnde")
+        self.assertEqual(chat.clean_summary("<think>still thinking"), "")
+        long = chat.clean_summary("wort " * 600)
+        self.assertLessEqual(len(long), chat.MAX_SUMMARY_CHARS)
+        self.assertTrue(long.endswith("wort…"))
+
+    def test_summary_request_oldest_first_and_bounded(self):
+        dropped = [
+            {"role": "user", "content": "old q", "_text": "old q", "_files": [{"name": "a.txt"}], "_id": 1},
+            {"role": "assistant", "content": "old a", "_id": 2},
+            {"role": "user", "content": "x" * 5000, "_text": "x" * 5000, "_files": [], "_id": 3},
+        ]
+        request, covered = chat.summary_request("Vorher.", dropped, 2500)
+        self.assertEqual(covered, 2)
+        prompt = request[1]["content"]
+        self.assertIn("Earlier summary:\nVorher.", prompt)
+        self.assertIn("User: old q\n[Attached files: a.txt]", prompt)
+        self.assertNotIn("xxx", prompt)
+        self.assertEqual(chat.summary_request("", dropped, 600), (None, None))
+
+
 class MigrationTests(LowRAMTestCase):
     def test_v03_database_gets_new_columns(self):
         import sqlite3
@@ -965,9 +1147,10 @@ class MigrationTests(LowRAMTestCase):
         conn.close()
         chat._MIGRATED.discard(str(config.db_path()))
         message = chat.list_messages(1)[0]
-        self.assertEqual((message["content"], message["tokens"], message["truncated"], message["attachments"]),
-                         ("hi", None, False, []))
+        self.assertEqual((message["content"], message["tokens"], message["truncated"], message["attachments"],
+                          message["sources"]), ("hi", None, False, [], []))
         self.assertEqual(chat.list_conversations("HI")[0]["title"], "old")
+        self.assertEqual(chat.get_summary(1), ("", None))
 
 
 if __name__ == "__main__":

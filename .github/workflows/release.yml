@@ -37,6 +37,7 @@ jobs:
           # every feature module must be in the bundle (they are imported by name)
           curl -fsS http://127.0.0.1:8799/api/status | python -c "import json, sys; from backend import app; s = json.load(sys.stdin); missing = set(app.FEATURE_MODULES) - set(s['features']); sys.exit(f'missing in the bundle: {sorted(missing)}' if missing else 0)"
           curl -fsS -o /dev/null http://127.0.0.1:8799/api/power
+          curl -fsS http://127.0.0.1:8799/api/diagnostics | python -c "import json, sys; d = json.load(sys.stdin); assert isinstance(d['checks'], list) and d['checks'] and isinstance(d['report'], str), d"
           curl -fsS http://127.0.0.1:8799/ | grep -q '<title>LowRAM AI'
           curl -fsS -o /dev/null http://127.0.0.1:8799/static/app.js
           kill -TERM "$pid"
@@ -52,6 +53,35 @@ jobs:
           name: LowRAM-AI-macOS-arm64
           path: dist/LowRAM-AI-*-macOS-*.zip
           if-no-files-found: error
+      # After the upload on purpose: the app is available even if a download from Hugging Face or
+      # GitHub hiccups here – but the job (and a release) still fails until a real model works.
+      - name: Real model test (engine + model download, real chat answer, clean quit)
+        env:
+          LOWRAM_HOME: ${{ runner.temp }}/lowram-real
+        run: |
+          "dist/LowRAM AI.app/Contents/MacOS/LowRAM AI" --headless --port 8798 &
+          pid=$!
+          for _ in $(seq 1 60); do
+            curl -fsS -o /dev/null http://127.0.0.1:8798/api/status && break
+            sleep 1
+          done
+          python desktop/real_model_smoke.py http://127.0.0.1:8798 "$RUNNER_TEMP/llama.pid"
+          llama=$(cat "$RUNNER_TEMP/llama.pid")
+          ps -o pid,rss,nice,command -p "$llama" || true
+          kill -TERM "$pid"
+          wait "$pid"
+          sleep 1
+          if ps -p "$llama" > /dev/null; then
+            echo "llama-server ($llama) is still running after the app quit"
+            exit 1
+          fi
+          echo "llama-server ended together with the app"
+      - name: Show real-model logs
+        if: always()
+        env:
+          LOWRAM_HOME: ${{ runner.temp }}/lowram-real
+        run: |
+          for f in "$LOWRAM_HOME"/logs/*.log; do echo "== $f"; tail -n 80 "$f"; done || true
 
   windows:
     name: Windows app (x64)
@@ -87,6 +117,8 @@ jobs:
           $missing = $expected | Where-Object { $status.features -notcontains $_ }
           if ($missing) { Stop-Process -Id $proc.Id -Force; throw "Missing in the bundle: $missing" }
           Invoke-WebRequest -Uri http://127.0.0.1:8799/api/power -UseBasicParsing | Out-Null
+          $diag = Invoke-RestMethod -Uri http://127.0.0.1:8799/api/diagnostics -TimeoutSec 30
+          if (-not $diag.checks -or -not $diag.report) { Stop-Process -Id $proc.Id -Force; throw "Unexpected /api/diagnostics answer" }
           $index = Invoke-WebRequest -Uri http://127.0.0.1:8799/ -UseBasicParsing
           if ($index.Content -notmatch "<title>LowRAM AI") { throw "Unexpected index page" }
           Invoke-WebRequest -Uri http://127.0.0.1:8799/static/app.js -UseBasicParsing | Out-Null

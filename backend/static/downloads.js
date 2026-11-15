@@ -9,13 +9,13 @@
   const fmt = LR.fmt;
   const ACTIVE = new Set(['queued', 'downloading', 'verifying', 'extracting']);
   const STATE_LABEL = {
-    queued: ['Waiting', 'neutral'],
-    downloading: ['Downloading', 'accent'],
-    verifying: ['Verifying', 'accent'],
-    extracting: ['Unpacking', 'accent'],
-    done: ['Done', 'ok'],
-    failed: ['Failed', 'error'],
-    cancelled: ['Cancelled', 'neutral'],
+    queued: [LR.t('Waiting'), 'neutral'],
+    downloading: [LR.t('Downloading'), 'accent'],
+    verifying: [LR.t('Verifying'), 'accent'],
+    extracting: [LR.t('Unpacking'), 'accent'],
+    done: [LR.t('Done'), 'ok'],
+    failed: [LR.t('Failed'), 'error'],
+    cancelled: [LR.t('Cancelled'), 'neutral'],
   };
 
   const samples = new Map();
@@ -85,13 +85,13 @@
     const parts = [];
     const total = LR.isNum(d.bytes_total) && d.bytes_total > 0 ? d.bytes_total : null;
     const done = LR.isNum(d.bytes_done) ? d.bytes_done : 0;
-    if (d.state === 'done') return total ? fmt.bytes(total) + ' downloaded' : 'Finished';
-    if (d.state === 'failed') return d.error ? String(d.error) : 'The download failed.';
-    if (d.state === 'cancelled') return 'Cancelled';
-    if (d.state === 'queued') return 'Waiting to start…';
-    if (d.state === 'verifying') return 'Checking the file…';
-    if (d.state === 'extracting') return 'Unpacking…';
-    parts.push(total ? fmt.bytes(done) + ' of ' + fmt.bytes(total) : fmt.bytes(done));
+    if (d.state === 'done') return total ? fmt.bytes(total) + LR.t(' downloaded') : LR.t('Finished');
+    if (d.state === 'failed') return d.error ? String(d.error) : LR.t('The download failed.');
+    if (d.state === 'cancelled') return LR.t('Cancelled');
+    if (d.state === 'queued') return LR.t('Waiting to start…');
+    if (d.state === 'verifying') return LR.t('Checking the file…');
+    if (d.state === 'extracting') return LR.t('Unpacking…');
+    parts.push(total ? fmt.bytes(done) + LR.t(' of ') + fmt.bytes(total) : fmt.bytes(done));
     const bps = speed(d.id);
     if (bps > 0) {
       parts.push(fmt.speed(bps));
@@ -111,9 +111,9 @@
     LR.setBusy(btn, true);
     try {
       await LR.post('/api/downloads/' + encodeURIComponent(id) + '/cancel', {});
-      LR.toast('Download cancelled', 'info');
+      LR.toast(LR.t('Download cancelled'), 'info');
     } catch (err) {
-      LR.toast('Could not cancel: ' + err.message, 'error');
+      LR.toast(LR.t('Could not cancel: ') + err.message, 'error');
     } finally {
       if (btn && btn.isConnected) LR.setBusy(btn, false);
       poller.now();
@@ -125,7 +125,7 @@
     const o = opts || {};
     const label = h('span', { class: 'dl-label' });
     const badge = h('span', { class: 'badge' });
-    const cancelBtn = LR.button({ icon: 'x', variant: 'ghost', size: 'sm', cls: 'btn-icon', label: 'Cancel download' });
+    const cancelBtn = LR.button({ icon: 'x', variant: 'ghost', size: 'sm', cls: 'btn-icon', label: LR.t('Cancel download') });
     const bar = LR.progress({ size: 'sm' });
     const meta = h('p', { class: 'dl-meta' });
     const el = h('div', { class: 'dl-row', dataset: { id: d.id } }, [
@@ -144,7 +144,7 @@
       cancelBtn.hidden = !isActive(next);
       const f = fraction(next);
       bar.set(f, summary(next));
-      bar.el.setAttribute('aria-label', (next.label || 'Download') + ' progress');
+      bar.el.setAttribute('aria-label', (next.label || LR.t('Download')) + LR.t(' progress'));
       bar.el.classList.toggle('is-error', next.state === 'failed');
       bar.el.classList.toggle('is-done', next.state === 'done');
       meta.textContent = summary(next);
@@ -207,7 +207,7 @@
           resolve(d);
         } else if (d.state === 'failed' || d.state === 'cancelled') {
           unsubscribe();
-          const err = new Error(d.state === 'cancelled' ? 'The download was cancelled.' : d.error || 'The download failed.');
+          const err = new Error(d.state === 'cancelled' ? LR.t('The download was cancelled.') : d.error || LR.t('The download failed.'));
           err.download = d;
           reject(err);
         }

@@ -201,6 +201,9 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 args = sys.argv[1:]
 mode = os.environ.get("FAKE_LLAMA_MODE", "ok")
+# FAKE_LLAMA_HELP: "new" (flash attention takes on|off|auto), "old" (bare -fa switch),
+# "minimal" (an old build without flash attention, -ub, --cache-reuse, --jinja), "fail" (--help errors out)
+variant = os.environ.get("FAKE_LLAMA_HELP", "new")
 if "--version" in args:
     if mode == "hang_version":
         time.sleep(60)
@@ -208,12 +211,68 @@ if "--version" in args:
     print("built with fake compiler for testing", file=sys.stderr)
     sys.exit(0)
 
+OPTIONS = {"-h": 0, "--help": 0, "-m": 1, "-c": 1, "--host": 1, "--port": 1, "--api-key": 1, "-np": 1, "-t": 1, "--threads": 1,
+           "--parallel": 1, "-b": 1, "--batch-size": 1, "-ctk": 1, "--cache-type-k": 1, "-ctv": 1, "--cache-type-v": 1}
+HELP = [
+    "----- common params -----", "",
+    "-h,    --help, --usage                  print usage and exit",
+    "-t,    --threads N                      number of threads to use during generation (default: -1)",
+    "-c,    --ctx-size N                     size of the prompt context (default: 4096, 0 = loaded from model)",
+    "                                        (env: LLAMA_ARG_CTX_SIZE)",
+    "-b,    --batch-size N                   logical maximum batch size (default: 2048)",
+    "-ctk,  --cache-type-k TYPE              KV cache data type for K",
+    "                                        allowed values: f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1",
+    "-ctv,  --cache-type-v TYPE              KV cache data type for V",
+    "-np,   --parallel N                     number of parallel sequences to decode (default: 1)",
+    "-m,    --model FNAME                    model path (default: `models/$filename` with filename from `--hf-file`)",
+    "", "----- example-specific params -----", "",
+    "--host HOST                             ip address to listen, or bind to an UNIX socket (default: 127.0.0.1)",
+    "--port PORT                             port to listen (default: 8080)",
+    "--api-key KEY                           API key to use for authentication (default: none)",
+]
+if variant in ("new", "old"):
+    OPTIONS.update({"-ub": 1, "--ubatch-size": 1, "--cache-reuse": 1, "--jinja": 0,
+                    "-fa": int(variant == "new"), "--flash-attn": int(variant == "new")})
+    HELP[7:7] = [
+        "-ub,   --ubatch-size N                  physical maximum batch size (default: 512)",
+        "-fa,   --flash-attn [on|off|auto]       set Flash Attention use ('on', 'off', or 'auto', default: 'auto')"
+        if variant == "new" else "-fa,   --flash-attn                     enable Flash Attention (default: disabled)",
+        "                                        (env: LLAMA_ARG_FLASH_ATTN)",
+    ]
+    HELP += ["--cache-reuse N                         min chunk size to attempt reusing from the cache via KV shifting",
+             "--jinja                                 use jinja template for chat (default: disabled)"]
+if "--help" in args or "-h" in args:
+    if os.environ.get("FAKE_LLAMA_HELP_COUNT"):
+        with open(os.environ["FAKE_LLAMA_HELP_COUNT"], "a") as fh:
+            fh.write("help\n")
+    if variant == "fail":
+        print("error: this build cannot print its options", file=sys.stderr)
+        sys.exit(1)
+    print("\n".join(HELP))
+    sys.exit(0)
+
+i = 0
+while i < len(args):  # like llama.cpp: an unknown option (or a stray value) is fatal
+    name = args[i]
+    if name not in OPTIONS or (OPTIONS[name] and i + 1 >= len(args)):
+        print(f"error: invalid argument: {name}", flush=True)
+        sys.exit(1)
+    if name in ("-fa", "--flash-attn") and OPTIONS[name] and args[i + 1] not in ("on", "off", "auto"):
+        print(f"error: invalid value for {name}: {args[i + 1]}", flush=True)
+        sys.exit(1)
+    i += 1 + OPTIONS[name]
+
 def opt(name):
     return args[args.index(name) + 1] if name in args else None
 
 host, port = opt("--host"), int(opt("--port"))
+print("argv=" + json.dumps(["***" if j and args[j - 1] == "--api-key" else a for j, a in enumerate(args)]), flush=True)
 print(f"fake llama-server model={opt('-m')} host={host} port={port} ctx={opt('-c')} parallel={opt('--parallel')} "
       f"secret_env={sorted(k for k in os.environ if 'SECRET' in k or 'TOKEN' in k)}", flush=True)
+if mode == "crash_once_after_ready":  # crash after ready on the first run only (marker file)
+    marker = os.environ["FAKE_LLAMA_MARKER"]
+    mode = "ok" if os.path.exists(marker) else "crash_after_ready"
+    open(marker, "a").close()
 if mode == "crash":
     print("error: failed to load model: fake corrupt file", flush=True)
     sys.exit(3)
