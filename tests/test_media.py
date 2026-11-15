@@ -282,7 +282,10 @@ class WorkerTests(MediaTestCase):
 
         def check():
             nonlocal max_running
-            jobs = [media.get_job(i) for i in ids]
+            # one query = one consistent snapshot; three get_job() calls could see job 0 still "running"
+            # and job 1 already "running" when the worker switches between the reads
+            by_id = {j["id"]: j for j in media.list_jobs()}
+            jobs = [by_id[i] for i in ids]
             max_running = max(max_running, sum(j["status"] == "running" for j in jobs))
             return all(j["status"] == "done" for j in jobs)
 
@@ -290,6 +293,8 @@ class WorkerTests(MediaTestCase):
         self.assertEqual(max_running, 1)
         jobs = [media.get_job(i) for i in ids]
         self.assertEqual([j["started_at"] for j in jobs], sorted(j["started_at"] for j in jobs))
+        for earlier, later in zip(jobs, jobs[1:]):  # each job finished before the next one started
+            self.assertLessEqual(earlier["finished_at"], later["started_at"])
         prompts = [c["argv"][c["argv"].index("-p") + 1] for c in self.argv_calls()]
         self.assertEqual(prompts, ["SLOW 0", "SLOW 1", "SLOW 2"])
 
