@@ -1017,12 +1017,17 @@ def _engine_module():
 
 
 def _configured_model() -> str | None:
-    return os.environ.get("LOWRAM_LLM_MODEL", "").strip() or None
+    server = config.local_server()
+    return os.environ.get("LOWRAM_LLM_MODEL", "").strip() or (server["model"] if server else None)
 
 
 def _managed_engine():
-    """The engine module when LowRAM AI manages llama-server itself (no ``LOWRAM_LLM_URL``)."""
-    if os.environ.get("LOWRAM_LLM_URL", "").strip():
+    """The engine module when LowRAM AI manages llama-server itself.
+
+    ``None`` with ``LOWRAM_LLM_URL`` or a chosen local AI server (Ollama, LM Studio, …): then the
+    configured URL is used as is and the built-in engine is never started for a chat.
+    """
+    if os.environ.get("LOWRAM_LLM_URL", "").strip() or config.local_server() is not None:
         return None
     return _engine_module()
 

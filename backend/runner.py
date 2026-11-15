@@ -305,8 +305,9 @@ class Checkpoint:
 
 
 def _managed_engine():
-    """``backend.engine`` (lazy, optional) when LowRAM AI runs llama-server itself, else ``None``."""
-    if os.environ.get("LOWRAM_LLM_URL", "").strip():
+    """``backend.engine`` (lazy, optional) when LowRAM AI runs llama-server itself, else ``None``
+    (``LOWRAM_LLM_URL`` or a chosen local AI server)."""
+    if os.environ.get("LOWRAM_LLM_URL", "").strip() or config.local_server() is not None:
         return None
     name = f"{__package__}.engine"
     try:

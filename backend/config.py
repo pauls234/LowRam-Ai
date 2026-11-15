@@ -7,6 +7,7 @@ processes always see the current environment.
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
 DEFAULT_LLM_URL = "http://127.0.0.1:8080/v1/chat/completions"
@@ -73,9 +74,45 @@ def set_runtime_llm_url(url: str | None) -> None:
     _runtime_llm_url = url
 
 
+# path segments of letters, digits and ._~- – but never "." or ".."
+LOCAL_SERVER_URL_RE = re.compile(r"http://127\.0\.0\.1:([0-9]{1,5})(?:/(?!\.{1,2}/)[A-Za-z0-9._~-]+)*/chat/completions")
+MAX_LOCAL_MODEL_CHARS = 200
+
+
+def local_server() -> dict | None:
+    """The AI server already running on this computer that the user chose in the Studio, or ``None``.
+
+    Stored as ``settings.engine.local_server`` = ``{"name", "url", "model"}`` (e.g. Ollama). Whatever
+    the settings file says, only ``http://127.0.0.1:<port>/…/chat/completions`` is accepted, so this
+    can never send anything to another computer. ``LOWRAM_LLM_URL`` wins over it.
+    """
+    if os.environ.get("LOWRAM_LLM_URL", "").strip():
+        return None
+    try:
+        from . import settings  # lazy: settings imports this module
+
+        value = settings.get("engine", "local_server")
+    except Exception:  # settings unreadable or an old file: the built-in engine
+        return None
+    if not isinstance(value, dict):
+        return None
+    url, model, name = value.get("url"), value.get("model"), value.get("name")
+    match = LOCAL_SERVER_URL_RE.fullmatch(url) if isinstance(url, str) else None
+    if match is None or not 1 <= int(match.group(1)) <= 65535:
+        return None
+    if not isinstance(model, str) or not 0 < len(model) <= MAX_LOCAL_MODEL_CHARS or not model.isprintable():
+        return None
+    label = name.strip()[:60] if isinstance(name, str) and name.strip().isprintable() and name.strip() else "Local AI"
+    return {"name": label, "url": url, "model": model}
+
+
 def llm_url() -> str:
-    """``LOWRAM_LLM_URL`` wins, then the managed engine, then the llama-server default."""
-    return os.environ.get("LOWRAM_LLM_URL", "").strip() or _runtime_llm_url or DEFAULT_LLM_URL
+    """``LOWRAM_LLM_URL`` wins, then a chosen local AI server, the managed engine, the llama-server default."""
+    env = os.environ.get("LOWRAM_LLM_URL", "").strip()
+    if env:
+        return env
+    server = local_server()
+    return server["url"] if server else _runtime_llm_url or DEFAULT_LLM_URL
 
 
 def default_models_dir() -> Path:
@@ -108,7 +145,11 @@ def bin_dir() -> Path:
 
 
 def llm_model() -> str:
-    return os.environ.get("LOWRAM_LLM_MODEL", "").strip() or DEFAULT_MODEL
+    env = os.environ.get("LOWRAM_LLM_MODEL", "").strip()
+    if env:
+        return env
+    server = local_server()
+    return server["model"] if server else DEFAULT_MODEL
 
 
 _runtime_llm_api_key: str | None = None
@@ -124,12 +165,12 @@ def llm_api_key() -> str | None:
     """Bearer token for the model endpoint (never logged).
 
     ``LOWRAM_LLM_API_KEY`` wins. The managed engine's random key is only sent
-    to the managed engine, never to an external ``LOWRAM_LLM_URL``.
+    to the managed engine, never to an external ``LOWRAM_LLM_URL`` or a chosen local server.
     """
     env_key = os.environ.get("LOWRAM_LLM_API_KEY")
     if env_key:
         return env_key
-    if not os.environ.get("LOWRAM_LLM_URL", "").strip() and _runtime_llm_url:
+    if not os.environ.get("LOWRAM_LLM_URL", "").strip() and _runtime_llm_url and local_server() is None:
         return _runtime_llm_api_key
     return None
 

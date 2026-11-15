@@ -15,7 +15,12 @@ Built for Macs with little RAM (Apple Silicon), also runs on Windows and Linux.
 > Eigene Modelle per Hugging-Face-Link, Modelle auf externer Festplatte,
 > Bilder/Videos und mehrere Geräte im WLAN koppeln (wie Bluetooth: gleiche
 > 6-stellige Zahl auf beiden Bildschirmen, „Erlauben“ klicken).
-> Erster Start der nicht signierten Mac-App: Rechtsklick → „Öffnen“.
+> Schon eine lokale KI (Ollama, LM Studio, Jan, GPT4All …)? LowRAM AI findet
+> ihre Modelle und laufende KI-Programme selbst – direkt verwenden, ohne neuen
+> Download.
+> Erster Start der nicht signierten Mac-App: Systemeinstellungen →
+> Datenschutz & Sicherheit → „Dennoch öffnen“ – oder im Terminal
+> `xattr -dr com.apple.quarantine "/Applications/LowRAM AI.app"`.
 
 ---
 
@@ -47,6 +52,7 @@ internet afterwards – only model/engine downloads you start yourself.
 | **Task queue** | One task per line; run one, or a bounded loop that stops by itself (queue empty, limit, failure, low RAM, no model, stop button). |
 | **Devices** | Let other computers on your Wi-Fi help with a project: they take tasks in parallel with their own local model, and the host combines the results. |
 | **Your models** | Pick from a curated catalog with RAM-based recommendations, paste any Hugging Face GGUF repo/link, or use a `.gguf` file you already have. |
+| **Already have a local AI?** | LowRAM AI finds models that Ollama, LM Studio, Jan, GPT4All, llama.cpp or the Hugging Face cache already downloaded and uses them in place (nothing copied or deleted) – or chats directly through an AI program that is running (Ollama, LM Studio, Jan, Docker Model Runner, …), so no model sits in RAM twice. Only folders of these apps are read, only 127.0.0.1 is asked. |
 | **External drive** | Keep models on an external SSD; LowRAM AI runs them from there and says so clearly when the drive is unplugged. |
 | **Turbo for little RAM** | Compressed KV cache (q8_0), flash attention and prompt-cache reuse are switched on automatically when your llama.cpp supports them; the context size is derived from your free RAM; profiles *Automatisch / Sparsam / Schnell*. |
 | **Holds on instead of giving up** | No fixed time limits on slow Macs (answers stream token by token), progress is saved while a task runs, an interrupted task continues after an engine crash, a RAM guard waits for memory instead of failing, and the model is unloaded when idle to free RAM. |

@@ -138,6 +138,7 @@
   function engineSummary() {
     const eng = LR.state.engine;
     if (!LR.has('engine') || !eng) return { tone: 'ok', text: LR.t('Local model') };
+    if (eng.external && eng.local_server && eng.local_server.name) return { tone: 'ok', text: LR.str(eng.local_server.name) };
     if (eng.external) return { tone: 'ok', text: LR.t('External model') };
     const server = eng.server || {};
     const name = LR.modelName(server.model_id);

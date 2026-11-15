@@ -57,7 +57,26 @@
     const runtime = eng.runtime || {};
     const out = [];
     if (eng.external) {
-      out.push(LR.callout({ tone: 'info', title: LR.t('Using an external model server'), text: LR.t('LOWRAM_LLM_URL is set, so LowRAM AI does not start its own engine. Endpoint: ') + LR.str(eng.llm_url) }));
+      const ls = eng.local_server;
+      if (ls) {
+        const back = LR.button({ text: LR.t('Use the built-in engine again'), variant: 'secondary', onclick: async () => {
+          LR.setBusy(back, true);
+          try {
+            await LR.post('/api/localai/server', { id: null });
+            if (LR.localAI) LR.localAI.reset();
+            if (ui.found && ui.found.refresh) ui.found.refresh(true);
+          } catch (err) {
+            LR.toast(err.message, 'error');
+          } finally {
+            await reloadEngine();
+          }
+        } });
+        out.push(LR.callout({ tone: 'ok', title: LR.t('Using {name} on this computer', { name: LR.str(ls.name) }),
+          text: LR.t('Answers come from {name} ({model}). {name} manages memory and speed itself; the built-in engine is off.', { name: LR.str(ls.name), model: LR.str(ls.model) }),
+          actions: [back] }));
+      } else {
+        out.push(LR.callout({ tone: 'info', title: LR.t('Using an external model server'), text: LR.t('LOWRAM_LLM_URL is set, so LowRAM AI does not start its own engine. Endpoint: ') + LR.str(eng.llm_url) }));
+      }
       body.replaceChildren(...out);
       return;
     }
@@ -118,6 +137,18 @@
     } finally {
       if (btn.isConnected) LR.setBusy(btn, false);
     }
+  }
+
+  /** Fresh engine status after switching between the built-in engine and a local AI server. */
+  async function reloadEngine() {
+    try {
+      const eng = await LR.get('/api/engine/status');
+      LR.state.engine = eng;
+      LR.emit('engine', eng);
+    } catch (_) { /* the regular status poll catches up */ }
+    renderEngine();
+    renderModels();
+    LR.refreshStatus();
   }
 
   async function startEngine(modelId, btn) {
@@ -1158,6 +1189,29 @@
 
   /* ------------------------------------------------------------ view */
 
+  /** "Already on this computer": models of other apps and running AI servers (localai.js). */
+  function showFound() {
+    if (!LR.localAI || !LR.has('engine')) return;
+    if (ui.found) {
+      ui.found.refresh(false);
+      return;
+    }
+    ui.found = LR.localAI.card({
+      context: 'settings',
+      onModel: async (model) => {
+        await LR.loadCatalog().catch(() => {});
+        renderModels();
+        await startEngine(model.id);
+        ui.found.refresh(false);
+      },
+      onServer: async () => {
+        await reloadEngine();
+        ui.found.refresh(false);
+      },
+    });
+    ui.foundSlot.replaceChildren(ui.found);
+  }
+
   function create() {
     const root = h('section', { class: 'view view-page', 'aria-labelledby': 'settings-title' });
     const page = h('div', { class: 'page' });
@@ -1170,12 +1224,13 @@
     ui.downloads.body.append(ui.downloadsList);
     ui.about = section(LR.t('About this build'));
     const own = buildOwnModels();
+    ui.foundSlot = h('div', { class: 'found-slot' });
     const storage = buildStorage();
     own.hidden = true;
     storage.hidden = true;
     const perf = buildPerf();
     perf.hidden = true;
-    page.append(head, ui.engine.el, perf, ui.models.el, own, ui.downloads.el, storage, buildMemory(), buildResilience(), buildInstructions(), buildPrefs(), buildPower(), ui.about.el);
+    page.append(head, ui.engine.el, perf, ui.models.el, ui.foundSlot, own, ui.downloads.el, storage, buildMemory(), buildResilience(), buildInstructions(), buildPrefs(), buildPower(), ui.about.el);
     root.append(page);
     return root;
   }
@@ -1192,6 +1247,7 @@
       renderPerf();
       syncResilience(true);
       renderModels();
+      showFound();
       renderAbout();
       syncPrefs();
       ui.storage.el.hidden = true;

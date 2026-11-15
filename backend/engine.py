@@ -327,8 +327,8 @@ def catalog(purpose: str | None = None) -> list[dict]:
 
 
 def external() -> bool:
-    """``LOWRAM_LLM_URL`` is set: the user runs their own server; never start ours."""
-    return bool(os.environ.get("LOWRAM_LLM_URL", "").strip())
+    """``LOWRAM_LLM_URL`` is set or a local AI server was chosen: never start our own server."""
+    return bool(os.environ.get("LOWRAM_LLM_URL", "").strip()) or config.local_server() is not None
 
 
 def runtime_root() -> Path:
@@ -1233,8 +1233,13 @@ def install_custom(repo: object, filename: object, name: object = None, purpose:
     return first, model_id
 
 
-def import_local(path: object, name: object = None, purpose: object = None) -> dict:
-    """Register an existing .gguf file (e.g. on an external drive) without copying it."""
+def import_local(path: object, name: object = None, purpose: object = None, *, family: str = "Local file",
+                 any_suffix: bool = False) -> dict:
+    """Register an existing .gguf file (e.g. on an external drive) without copying it.
+
+    ``any_suffix``: also a GGUF file without the .gguf ending (Ollama stores models as ``sha256-…``);
+    only for paths the local-AI scan found, never for a path typed into the Studio.
+    """
     if not isinstance(path, str) or not path.strip() or len(path) > 4096 or "\x00" in path:
         raise EngineError("path must be the full path of a .gguf file", HTTPStatus.BAD_REQUEST)
     raw = Path(path.strip())
@@ -1246,7 +1251,7 @@ def import_local(path: object, name: object = None, purpose: object = None) -> d
         raise EngineError(f"File not found: {raw}", HTTPStatus.BAD_REQUEST) from None
     if not resolved.is_file():
         raise EngineError(f"{resolved} is not a regular file", HTTPStatus.BAD_REQUEST)
-    if resolved.suffix.lower() != ".gguf":
+    if resolved.suffix.lower() != ".gguf" and not any_suffix:
         raise EngineError("Only .gguf model files can be imported", HTTPStatus.BAD_REQUEST)
     try:
         with open(resolved, "rb") as handle:
@@ -1256,14 +1261,17 @@ def import_local(path: object, name: object = None, purpose: object = None) -> d
         raise EngineError(f"{resolved} cannot be read: {exc.strerror or exc}", HTTPStatus.BAD_REQUEST) from None
     if magic != b"GGUF":
         raise EngineError(f"{resolved.name} is not a GGUF model (wrong file header)", HTTPStatus.BAD_REQUEST)
-    model_id = _custom_id("local", _stem(resolved.name), str(resolved))
+    # a hash-named file (Ollama) is described by its name; a .gguf file by its file name, as before
+    label = resolved.name if resolved.suffix.lower() == ".gguf" or not isinstance(name, str) else name
+    model_id = _custom_id("local", _stem(label), str(resolved))
     existing = find_entry(model_id)
     if existing is not None:
         return model_dict(existing)
+    origin = f"Imported from {resolved.parent}" if family == "Local file" else f"Found in {family} ({resolved.parent})"
     entry = CatalogEntry(
-        model_id, _clean_name(name, _stem(resolved.name)), "Local file", _clean_purpose(purpose, resolved.name),
-        parse_params(resolved.name), parse_quant(resolved.name) or "", "", resolved.name, size, _min_ram_gb(size),
-        "see the model's source", f"Imported from {resolved.parent}", 0, source="local",
+        model_id, _clean_name(name, _stem(label)), str(family)[:40], _clean_purpose(purpose, label),
+        parse_params(label), parse_quant(label) or "", "", resolved.name, size, _min_ram_gb(size),
+        "see the model's source", origin, 0, source="local",
         files=(resolved.name,), local_path=str(resolved),
     )
     _register(entry)
@@ -2453,6 +2461,7 @@ def status() -> dict:
         "runtime": runtime_info(),
         "server": _manager.snapshot(),
         "external": external(),
+        "local_server": config.local_server(),
         "llm_url": llm.redact_url(config.llm_url()),
         "paused": _manager.paused,
     }

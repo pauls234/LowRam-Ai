@@ -1696,8 +1696,8 @@ def distributed_projects() -> list[dict]:
 
 
 def local_llm_url(timeout: float = LLM_START_TIMEOUT_S) -> str:
-    """URL of this machine's model: LOWRAM_LLM_URL, else the managed engine, else the default."""
-    if os.environ.get("LOWRAM_LLM_URL", "").strip():
+    """URL of this machine's model: LOWRAM_LLM_URL or a chosen local AI server, else the managed engine."""
+    if os.environ.get("LOWRAM_LLM_URL", "").strip() or config.local_server() is not None:
         return config.llm_url()
     try:
         from . import engine  # built in parallel; optional

@@ -180,12 +180,27 @@
       LR.store.set('lowram.setupSkipped', '1');
       LR.go('#/chat/new');
     } });
+    const found = LR.localAI ? LR.localAI.card({
+      context: 'setup',
+      onModel: async (model) => {
+        const fresh = await LR.loadCatalog();
+        st.data.cat = fresh;
+        st.selected = model.id;
+        st.userPicked = true;
+        LR.toast(LR.t('Added ') + (model.name || model.id));
+        run(Array.isArray(fresh.models) ? fresh.models : []);
+      },
+      onServer: async () => {
+        st.data = null;
+        await render();
+      },
+    }) : null;
     const pick = h('fieldset', { class: 'card setup-card choices' }, [
       h('legend', { class: 'card-title', text: LR.t('All models') }),
       h('p', { class: 'card-sub', text: LR.t('The recommendation is only a suggestion – pick whichever model you like.') + ' ' + LR.t('You can add or switch models later in Models & Settings.') }),
       models.length ? h('div', { class: 'choice-list' }, choices) : LR.empty({ icon: 'cpu', title: LR.t('No models available'), text: LR.t('The catalog of this build is empty.') }),
     ]);
-    ui.inner.replaceChildren(...[hero(), machine, purposeCard, pick, hfBox(models), ownModelBox(models), h('div', { class: 'setup-actions' }, [ui.go, skip]),
+    ui.inner.replaceChildren(...[hero(), machine, found, purposeCard, pick, hfBox(models), ownModelBox(models), h('div', { class: 'setup-actions' }, [ui.go, skip]),
       h('p', { class: 'setup-note' }, [icon('shield'), h('span', { text: LR.t('Downloads come only from trusted sources over HTTPS and are verified before use.') })])].filter(Boolean));
   }
 
