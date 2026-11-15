@@ -53,8 +53,9 @@ class _HubHandler(BaseHTTPRequestHandler):
             data = hub.files.get(key)
             drops = hub.drops.get(key)
             drop_after = drops.pop(0) if drops else None
-        if status:
-            return self._send(status, b"error")
+        if status:  # an int, or (code, extra headers)
+            code, extra = status if isinstance(status, tuple) else (status, None)
+            return self._send(code, b"error", extra)
         if redirect:
             self.send_response(302)
             self.send_header("Location", redirect)

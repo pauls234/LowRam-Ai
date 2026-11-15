@@ -103,11 +103,42 @@ class DownloadError(RuntimeError):
 
 
 class HTTPStatusError(DownloadError):
-    """The server answered with a non-success HTTP status."""
+    """The server answered with a non-success HTTP status.
 
-    def __init__(self, code: int, message: str):
+    ``reset_at``: the answer was GitHub's limit for requests without login – when it resets (epoch s).
+    """
+
+    def __init__(self, code: int, message: str, *, reset_at: float | None = None):
         super().__init__(message, transient=code >= 500 or code in (408, 429))
         self.code = code
+        self.reset_at = reset_at
+
+
+def rate_limit_reset(code: int, headers: Any) -> float | None:
+    """When a "too many requests" refusal ends (epoch seconds), else ``None``.
+
+    api.github.com allows 60 requests per hour and IP address without login (shared office, school or
+    cloud addresses can use that up) and says so with ``X-RateLimit-Remaining: 0`` or ``Retry-After``.
+    """
+    if code not in (403, 429) or headers is None:
+        return None
+    if str(headers.get("X-RateLimit-Remaining") or "").strip() == "0":
+        try:
+            return float(headers.get("X-RateLimit-Reset"))
+        except (TypeError, ValueError):
+            return time.time() + 3600
+    retry = str(headers.get("Retry-After") or "").strip()
+    if retry.isdigit():
+        return time.time() + min(int(retry), 24 * 3600)
+    return None
+
+
+def rate_limit_message(reset_at: float) -> str:
+    """The text the Studio shows when GitHub's request limit is used up."""
+    when = time.strftime("%H:%M", time.localtime(max(reset_at, time.time())))
+    return ("GitHub nimmt von deiner Internetverbindung gerade keine weiteren Abfragen an (Limit ohne Anmeldung: "
+            f"60 pro Stunde – das passiert, wenn sich viele Geräte eine Adresse teilen). Bitte versuche es ab {when} Uhr "
+            "erneut.")
 
 
 class UnsafeArchiveError(DownloadError):
@@ -267,13 +298,14 @@ def open_url(
             response = open_fn(request, timeout)
         except urllib.error.HTTPError as exc:
             code, location = exc.code, (exc.headers.get("Location") if exc.headers else None)
+            reset_at = rate_limit_reset(code, exc.headers)
             _close_quietly(exc)
             if code in REDIRECT_CODES:
                 if not location:
                     raise DownloadError(f"{redact(current)} redirected without a target") from None
                 current = check_url(urljoin(current, location.strip()))
                 continue
-            raise HTTPStatusError(code, f"{redact(current)} answered HTTP {code}") from None
+            raise HTTPStatusError(code, f"{redact(current)} answered HTTP {code}", reset_at=reset_at) from None
         except urllib.error.URLError as exc:
             transient = not isinstance(exc.reason, ssl.SSLCertVerificationError)
             raise DownloadError(_describe_network_error(exc, current), transient=transient) from None
@@ -288,8 +320,9 @@ def open_url(
             current = check_url(urljoin(current, location.strip()))
             continue
         if not 200 <= status < 300:
+            reset_at = rate_limit_reset(status, getattr(response, "headers", None))
             _close_quietly(response)
-            raise HTTPStatusError(status, f"{redact(current)} answered HTTP {status}")
+            raise HTTPStatusError(status, f"{redact(current)} answered HTTP {status}", reset_at=reset_at)
         return response, current
     raise DownloadError(f"Too many redirects (more than {MAX_REDIRECTS}) for {redact(url)}")
 

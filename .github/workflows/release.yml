@@ -65,7 +65,14 @@ jobs:
             curl -fsS -o /dev/null http://127.0.0.1:8798/api/status && break
             sleep 1
           done
-          python desktop/real_model_smoke.py http://127.0.0.1:8798 "$RUNNER_TEMP/llama.pid"
+          code=0
+          python desktop/real_model_smoke.py http://127.0.0.1:8798 "$RUNNER_TEMP/llama.pid" || code=$?
+          if [ "$code" -eq 78 ]; then  # GitHub's request limit for the runner's shared IP: skipped, see the warning
+            kill -TERM "$pid"
+            wait "$pid"
+            exit 0
+          fi
+          [ "$code" -eq 0 ] || exit "$code"
           llama=$(cat "$RUNNER_TEMP/llama.pid")
           ps -o pid,rss,nice,command -p "$llama" || true
           kill -TERM "$pid"

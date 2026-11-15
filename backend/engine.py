@@ -677,6 +677,9 @@ def install_runtime() -> dict:
     try:
         releases = downloads.fetch_json(RELEASES_URL, headers={"Accept": "application/vnd.github+json"})
     except downloads.DownloadError as exc:
+        reset_at = getattr(exc, "reset_at", None)
+        if reset_at:
+            raise EngineError(downloads.rate_limit_message(reset_at), HTTPStatus.SERVICE_UNAVAILABLE) from None
         raise EngineError(f"Could not read the latest llama.cpp release from GitHub: {exc}", HTTPStatus.BAD_GATEWAY) from None
     tag, asset = select_release(releases, key)
     dest = runtime_root() / tag

@@ -22,6 +22,8 @@ MODEL_ID = "qwen2.5-0.5b-instruct"  # smallest catalog model (~0.4 GB)
 HF_REPO = "Qwen/Qwen2.5-0.5B-Instruct-GGUF"
 PROMPT = "Antworte mit einem kurzen Satz: Wie heißt die Hauptstadt von Frankreich?"
 LOCAL = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # the app on 127.0.0.1, never via a proxy
+SKIPPED = 78  # exit code: GitHub's request limit for the runner's shared IP – nothing learned about the app
+MAX_LIMIT_WAIT_S = 600  # wait at most 10 minutes for that limit to reset (macOS runner minutes are dear)
 
 
 def log(message: str) -> None:
@@ -55,6 +57,24 @@ class App:
         except urllib.error.HTTPError as exc:
             detail = exc.read()[:3000].decode("utf-8", "replace")
             fail(f"{method} {path} -> HTTP {exc.code}: {detail}")
+        except (urllib.error.URLError, OSError) as exc:
+            fail(f"{method} {path}: the app does not answer ({exc})")
+
+    def try_call(self, method: str, path: str, body: dict | None = None) -> tuple[int, dict]:
+        """Like :meth:`call`, but an HTTP error is returned as ``(status, body)`` instead of failing."""
+        data = None if body is None else json.dumps(body).encode("utf-8")
+        request = urllib.request.Request(self.base + path, data=data, method=method)
+        request.add_header("Content-Type", "application/json")
+        request.add_header("X-LowRAM-Token", self.token)
+        try:
+            with LOCAL.open(request, timeout=120.0) as response:
+                return response.status, json.loads(response.read() or b"{}")
+        except urllib.error.HTTPError as exc:
+            raw = exc.read()[:3000]
+            try:
+                return exc.code, json.loads(raw)
+            except ValueError:
+                return exc.code, {"error": raw.decode("utf-8", "replace")}
         except (urllib.error.URLError, OSError) as exc:
             fail(f"{method} {path}: the app does not answer ({exc})")
 
@@ -113,6 +133,36 @@ class App:
         fail("the answer stream ended without a 'done' event")
 
 
+def github_reset_in() -> float | None:
+    """Seconds until GitHub's request limit for this machine resets (the /rate_limit query itself is free)."""
+    try:
+        with urllib.request.urlopen("https://api.github.com/rate_limit", timeout=20) as response:
+            core = json.loads(response.read())["resources"]["core"]
+        return 0.0 if int(core.get("remaining", 1)) > 0 else max(0.0, float(core["reset"]) - time.time())
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        log(f"   could not read GitHub's request limit: {exc}")
+        return None
+
+
+def install_engine(app: App) -> None:
+    """Install llama.cpp; GitHub's request limit (shared CI addresses) is waited out briefly or skipped."""
+    for attempt in (1, 2):
+        status, body = app.try_call("POST", "/api/engine/runtime/install", {})
+        if status == 202:
+            app.wait_download(body["download"])
+            return
+        error = str(body.get("error") or body)
+        if status != 503 or "Limit ohne Anmeldung" not in error:
+            fail(f"POST /api/engine/runtime/install -> HTTP {status}: {error}")
+        wait = github_reset_in() if attempt == 1 else None  # still limited after the wait: skip as well
+        if wait is None or wait > MAX_LIMIT_WAIT_S:
+            log("::warning title=Real-model test skipped::GitHub's request limit for this runner's shared IP address "
+                f"is used up ({error}). The app is fine; the real-model test could not run this time.")
+            sys.exit(SKIPPED)
+        log(f"   GitHub's request limit for this runner is used up – waiting {wait:.0f} s for the reset")
+        time.sleep(wait + 5)
+
+
 def main() -> None:
     base = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8798"
     pid_file = Path(sys.argv[2]) if len(sys.argv) > 2 else None
@@ -121,7 +171,7 @@ def main() -> None:
 
     log("1. llama.cpp engine (official GitHub release, SHA-256 verified)")
     if not app.call("GET", "/api/engine/status")["runtime"]["installed"]:
-        app.wait_download(app.call("POST", "/api/engine/runtime/install", {})["download"])
+        install_engine(app)
     runtime = app.call("GET", "/api/engine/status")["runtime"]
     if not runtime["installed"]:
         fail(f"no engine after the download: {runtime}")

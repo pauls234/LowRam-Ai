@@ -1741,6 +1741,16 @@ class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
+def _limit_message(exc: urllib.error.HTTPError) -> str | None:
+    """The Studio's text when ``exc`` is GitHub's request limit (see downloads.rate_limit_reset)."""
+    try:
+        downloads = _downloads_module()
+        reset_at = downloads.rate_limit_reset(exc.code, exc.headers)
+        return None if reset_at is None else downloads.rate_limit_message(reset_at)
+    except Exception:  # noqa: BLE001 - a build without backend.downloads: the generic message applies
+        return None
+
+
 def fetch_json(url: str) -> Any:
     """GET a small JSON document over HTTPS from an allow-listed host."""
     _check_metadata_url(url)
@@ -1751,6 +1761,9 @@ def fetch_json(url: str) -> Any:
             data = response.read(METADATA_MAX_BYTES + 1)
     except urllib.error.HTTPError as exc:
         host = urllib.parse.urlsplit(url).hostname
+        limited = _limit_message(exc)
+        if limited:  # GitHub's limit for requests without login, not a missing licence
+            raise MediaSourceError(limited) from exc
         if exc.code in (401, 403):
             raise MediaSourceError(
                 f"{host} refused access (HTTP {exc.code}). The file may need a login or licence acceptance; "

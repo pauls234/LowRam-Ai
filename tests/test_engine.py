@@ -271,6 +271,21 @@ class InstallTests(EngineTestCase):
         self.assertIn("does not contain", job["error"])
         self.assertFalse((engine.runtime_root() / "b9999").exists())
 
+    def test_github_request_limit_is_explained(self):
+        reset = int(time.time()) + 1800
+        self.hub.status[RELEASE_KEY] = (403, {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": str(reset)})
+        with self.assertRaises(engine.EngineError) as ctx:
+            engine.install_runtime()
+        self.assertEqual(ctx.exception.status, 503)
+        self.assertIn("Limit ohne Anmeldung", str(ctx.exception))
+        self.assertIn(time.strftime("%H:%M", time.localtime(reset)), str(ctx.exception))
+        self.hub.status[RELEASE_KEY] = 403  # any other refusal keeps the plain message
+        with self.assertRaises(engine.EngineError) as ctx:
+            engine.install_runtime()
+        self.assertEqual(ctx.exception.status, 502)
+        self.assertIn("answered HTTP 403", str(ctx.exception))
+        self.assertEqual(downloads.list_jobs(), [])
+
     def test_runtime_metadata_failures(self):
         with self.assertRaises(engine.EngineError) as ctx:
             engine.install_runtime()  # 404 from the fake GitHub API
