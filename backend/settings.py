@@ -22,6 +22,7 @@ DEFAULTS: dict[str, Any] = {
         "auto_start": True,  # start llama-server with the selected model when the app starts
         "model_id": None,  # catalog id of the chat model
         "code_model_id": None,  # optional separate model for the Code mode
+        "local_server": None,  # {"name", "url", "model"}: an AI server already running on this computer
         "port": None,  # None = pick a free port
         "ctx_size": None,  # None = derive from the RAM budget
         "models_dir": None,  # None = <home>/models; or an absolute folder, e.g. on an external SSD

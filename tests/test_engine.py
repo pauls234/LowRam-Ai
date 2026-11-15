@@ -557,7 +557,7 @@ class EngineRouteTests(EngineTestCase):
     def test_status_and_catalog(self):
         status, data = self.api("GET", "/api/engine/status")
         self.assertEqual(status, 200)
-        self.assertEqual(set(data), {"runtime", "server", "external", "llm_url", "paused"})
+        self.assertEqual(set(data), {"runtime", "server", "external", "local_server", "llm_url", "paused"})
         self.assertEqual(set(data["server"]), {"state", "model_id", "port", "pid", "ctx_size", "error", "started_at",
                                                "tuning", "restarts", "unloaded_idle"})
         self.assertEqual(set(data["runtime"]), {"installed", "path", "version", "source"})

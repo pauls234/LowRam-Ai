@@ -122,6 +122,10 @@ def check_runtime() -> dict:
     if engine is None:
         return _check("runtime", title, "fail", "Engine-Modul nicht verfügbar", "Installiere die App neu.")
     if engine.external():
+        server = config.local_server()
+        if server:
+            return _check("runtime", title, "ok", f"Verwendet {server['name']} ({server['model']}) auf diesem Computer "
+                                                  "(eigene Engine wird nicht genutzt)")
         return _check("runtime", title, "ok", "Externer Server über LOWRAM_LLM_URL (eigene Engine wird nicht genutzt)")
     info = engine.runtime_info()
     if not info.get("installed"):

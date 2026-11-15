@@ -95,7 +95,7 @@ EngineServer = {state: "stopped"|"starting"|"ready"|"error", model_id: str|null,
                 started_at: str|null}
 ```
 
-* `GET /api/engine/status` → `{runtime: {installed, path, version, source: "path"|"homebrew"|"managed"|null}, server: EngineServer, external: bool, llm_url: str}`
+* `GET /api/engine/status` → `{runtime: {installed, path, version, source: "path"|"homebrew"|"managed"|null}, server: EngineServer, external: bool, local_server: {name, url, model}|null, llm_url: str, paused: int}`
   (`external` = `LOWRAM_LLM_URL` is set; the app then never starts its own server)
 * `GET /api/engine/catalog` → `{models: [CatalogModel], ram_total_bytes}`
 * `POST /api/engine/runtime/install {}` → 202 `{download}`
@@ -287,6 +287,16 @@ Settings `resilience`: `wait_for_ram_minutes` (30), `idle_unload_minutes` (15, 0
 * **Checkpoints (`runner.py`)**: while a task streams, the partial answer is written every ~5 s (atomic) to `artifacts/project_N/task_ID.partial.md`. On success it is replaced by the result file. On a transient error with `retry_transient`, the runner waits for the engine to be ready again (`engine.ensure_running`, up to 10 min) and continues ONCE from the checkpoint (prompt: previous messages + partial answer + "setze exakt dort fort, ohne Wiederholung"), recording `resumed_from_checkpoint` in the metadata; if that fails too, the task fails with the partial text kept and the error says so. On a context overflow the carry-over context is halved and the request retried once. The coding agent and autosplit get the same overflow retry.
 * **RAM guard (`memory.py`)**: `memory.guard_wait(reason, max_wait_s, stop_event, on_wait)` – waits (checking every 5 s) until `plan().can_run`; returns False on timeout/stop. `runner.run_loop` uses it between tasks instead of stopping immediately (`paused_low_ram` only after `wait_for_ram_minutes`), reporting "Warte auf freien Arbeitsspeicher (… MB frei)…" through `on_step`/loop status. A background sampler (every 3 s, started from an on_startup hook) keeps `memory.pressure()` → `{level: "ok"|"warn"|"critical", available_bytes, swap_used_bytes, swap_growth_mb_per_min}` for the UI (`GET /api/memory` includes `pressure`). On macOS `kern.memorystatus_vm_pressure_level` (via `sysctl -n`, cached 3 s) is used when available.
 * **Free RAM when idle (`engine.py`)**: the managed llama-server is stopped after `idle_unload_minutes` without any inference (track last use in `ensure_running`/llm calls through a small `engine.touch()`), state `stopped` with `unloaded_idle: true`; the next request loads it again automatically (chat shows the loading status).
+
+### Local AI already on this computer (`localai.py`, v0.4.1)
+
+* `GET /api/localai[?refresh=1]` → `{models: [Found], servers: [Server], local_server: {name, url, model}|null, truncated: bool, scanned_at: iso}`.
+  `Found = {id: 16 hex (sha256 of the resolved path), name, source: "Ollama"|"LM Studio"|"Jan"|"GPT4All"|"llama.cpp"|"Hugging Face", path, size_bytes, params, quant, purpose, fits_ram, model_id|null}`.
+  `Server = {id: "<name>-<port>", name, port, models: [str], loaded: [{name, size_bytes|null}], url, in_use}`.
+* Model files: only the known folders of those apps (Ollama manifests → `sha256-…` blobs, `~/.lmstudio/models`, Jan, GPT4All, the llama.cpp `-hf` cache, `HF_HUB_CACHE`), depth ≤ 6, ≤ 20 000 entries, ≤ 3 s (`truncated` says the scan stopped), folder symlinks not followed, dot folders skipped, only the 4-byte `GGUF` signature is read; ≥ 50 MiB, no `mmproj`, no split parts, never LowRAM AI's own models folder. Cached 30 s, one scan at a time.
+* Servers: Ollama 11434 (`/api/tags`, `/api/ps` for what is loaded), LM Studio 1234 (`/v1/models`, `/api/v0/models`), Jan 1337, Docker Model Runner 12434 (`/engines/v1/…`), GPT4All 4891, llama.cpp/llamafile 8080, KoboldCpp 5001 – asked in parallel on 127.0.0.1 only, 0.6 s timeout, no proxy, redirects never followed, ≤ 512 KiB, embedding models left out.
+* `POST /api/localai/use {id}` → 201 `{model}`: `engine.import_local(path, name, purpose, family=source, any_suffix=True)` (an Ollama blob has no `.gguf` ending; a typed path still needs one). Only ids of the last scan, never a path from the request. Clears a chosen local server (a file runs in the built-in engine).
+* `POST /api/localai/server {id, model}` → `{local_server}`; `{id: null}` switches back. Stored as `settings.engine.local_server`; `config.local_server()` accepts only `http://127.0.0.1:<port>/…/chat/completions` (no `.`/`..` segments) and a printable model ≤ 200 chars – whatever the settings file says, nothing leaves the computer. `LOWRAM_LLM_URL` wins. While set, `engine.external()` is true (no auto-start, no idle unload), `config.llm_url()/llm_model()` point to it, the managed engine's API key is never sent there, chat/runner/cluster use it as is, and the built-in engine is stopped when switching so no model is held twice.
 
 ### Desktop (`desktop/launcher.py`)
 
