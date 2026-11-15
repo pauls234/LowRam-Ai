@@ -2,6 +2,7 @@ import hashlib
 import logging
 import os
 import threading
+import time
 import unittest
 from collections import namedtuple
 from unittest import mock
@@ -439,3 +440,22 @@ class DownloadRouteTests(DownloadTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RateLimitTests(unittest.TestCase):
+    """GitHub allows 60 requests per hour and IP without login – a refusal must say so, with the time."""
+
+    def test_rate_limit_reset(self):
+        now = time.time()
+        limited = {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "2000000000"}
+        self.assertEqual(downloads.rate_limit_reset(403, limited), 2_000_000_000)
+        self.assertEqual(downloads.rate_limit_reset(429, limited), 2_000_000_000)
+        self.assertIsNone(downloads.rate_limit_reset(403, {"X-RateLimit-Remaining": "12"}))  # another refusal
+        self.assertIsNone(downloads.rate_limit_reset(404, limited))
+        self.assertIsNone(downloads.rate_limit_reset(403, None))
+        self.assertAlmostEqual(downloads.rate_limit_reset(429, {"Retry-After": "30"}), now + 30, delta=5)
+        self.assertGreater(downloads.rate_limit_reset(403, {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "x"}),
+                           now + 3000)
+        message = downloads.rate_limit_message(now + 600)
+        self.assertIn(time.strftime("%H:%M", time.localtime(now + 600)), message)
+        self.assertIn("Limit ohne Anmeldung", message)

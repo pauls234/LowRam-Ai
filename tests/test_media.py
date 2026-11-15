@@ -680,6 +680,26 @@ class SourceSafetyTests(unittest.TestCase):
             with self.subTest(url=url), self.assertRaises(media.MediaSourceError):
                 media.fetch_json(url)
 
+    def test_github_request_limit_is_explained(self):
+        import urllib.error
+        from email.message import Message
+
+        def refuse(headers):
+            hdrs = Message()
+            for key, value in headers.items():
+                hdrs[key] = value
+            opener = mock.Mock()
+            opener.open.side_effect = urllib.error.HTTPError(media.RELEASES_URL, 403, "Forbidden", hdrs, None)
+            return mock.patch.object(media.urllib.request, "build_opener", return_value=opener)
+
+        reset = int(time.time()) + 1800
+        with refuse({"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": str(reset)}):
+            with self.assertRaisesRegex(media.MediaSourceError, "Limit ohne Anmeldung") as ctx:
+                media.fetch_json(media.RELEASES_URL)
+        self.assertIn(time.strftime("%H:%M", time.localtime(reset)), str(ctx.exception))
+        with refuse({}), self.assertRaisesRegex(media.MediaSourceError, "refused access"):
+            media.fetch_json(media.RELEASES_URL)
+
     def test_hf_reference_validation(self):
         for repo, name in (("a/b", "../x"), ("../b", "x"), ("a", "x"), ("a/b", "/abs")):
             with self.subTest(repo=repo, name=name), self.assertRaises(media.MediaSourceError):
