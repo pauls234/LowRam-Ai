@@ -191,6 +191,32 @@ def check_ram() -> dict:
     return _check("ram", "Arbeitsspeicher", "ok", detail)
 
 
+def check_heat() -> dict:
+    """macOS' own heat judgement and whether long jobs take cooling breaks (power.py)."""
+    title = "Temperatur"
+    try:
+        from . import power
+    except Exception:
+        return _check("heat", title, "warn", "Energie-Modul nicht verfügbar")
+    state = power.thermal_state()
+    pausing = power._setting("pause_when_hot", True) is not False
+    if state is None:
+        if power._platform() != "darwin":
+            return _check("heat", title, "ok", "Wird nur auf dem Mac gemessen")
+        return _check("heat", title, "warn", "macOS meldet die Temperatur nicht – Abkühlpausen sind nicht möglich",
+                      "Nutze die App-Version von LowRAM AI (sie enthält die nötige macOS-Komponente).")
+    if state in ("nominal", "fair"):
+        detail = "Normal" if state == "nominal" else "Leicht erhöht (unter Last normal)"
+        return _check("heat", title, "ok", detail + (" · Abkühlpausen an" if pausing else " · Abkühlpausen aus"))
+    hot = "Überhitzt" if state == "critical" else "Sehr warm"
+    if not pausing:
+        return _check("heat", title, "fail" if state == "critical" else "warn", f"{hot} – Abkühlpausen sind aus",
+                      "Schalte unter Einstellungen → „MacBook & Energie“ die Abkühlpausen ein.")
+    return _check("heat", title, "fail" if state == "critical" else "warn",
+                  f"{hot} – lange Arbeiten machen gerade eine Abkühlpause",
+                  "Lüftungsschlitze frei lassen und den Mac nicht auf eine weiche Unterlage stellen.")
+
+
 def _models_dir() -> Path:
     return Path(config.models_dir())
 
@@ -267,6 +293,7 @@ CHECKS: tuple[tuple[str, str, Callable[[], dict]], ...] = (
     ("model", "Ausgewähltes Modell", check_model),
     ("server", "Modell-Server", check_server),
     ("ram", "Arbeitsspeicher", check_ram),
+    ("heat", "Temperatur", check_heat),
     ("disk", "Freier Speicherplatz", check_disk),
     ("models_folder", "Modell-Ordner", check_models_folder),
     ("media_runtime", "Bild/Video-Engine", check_media),

@@ -703,6 +703,11 @@ class Worker:
                 self._set(state="idle", message=on_battery)
                 self._wait(self.idle_max_s)
                 continue
+            too_hot = power.heat_block_reason()  # very warm: no new work until it has cooled down
+            if too_hot:
+                self._set(state="idle", message=too_hot)
+                self._wait(self.idle_max_s)
+                continue
             busy = self.busy_check()  # do not even claim while this computer is busy
             if busy:
                 self._set(state="idle", message=f"Waiting: {busy}")

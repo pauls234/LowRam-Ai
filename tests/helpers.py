@@ -190,6 +190,17 @@ class LowRAMTestCase(unittest.TestCase):
         for key in ("LOWRAM_LLM_API_KEY", "LOWRAM_LLM_MODEL", "LOWRAM_PORT"):
             os.environ.pop(key, None)
         self.set_memory()
+        self._no_heat_sensor()
+
+    def _no_heat_sensor(self) -> None:
+        """A warm CI Mac (real pyobjc) must never pause a test's loop; heat tests fake the sensor themselves."""
+        from backend import power
+
+        sensor = mock.patch.object(power, "_thermal_value", side_effect=ImportError("no heat sensor in tests"))
+        sensor.start()
+        self.addCleanup(sensor.stop)
+        power._thermal_cache = (float("-inf"), None)
+        self.addCleanup(setattr, power, "_thermal_cache", (float("-inf"), None))
 
     def set_memory(self, total_gib: float = 16, available_mib: float = 8192) -> None:
         patcher = mock.patch("backend.memory.psutil.virtual_memory", return_value=fake_vm(total_gib, available_mib))

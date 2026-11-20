@@ -52,7 +52,7 @@ from urllib.parse import quote, unquote, urlencode, urlparse
 
 import psutil
 
-from . import artifacts, config, db, downloads, llm, progress, settings, web
+from . import artifacts, config, db, downloads, gguf, llm, progress, settings, web
 from .web import HTTPError, Request, Response, route
 
 log = logging.getLogger("lowram.engine")
@@ -1743,16 +1743,33 @@ def effective_profile() -> tuple[str, list[str]]:
     return profile, []
 
 
-def kv_cache_bytes(params_b: float, ctx: int, *, kv_q8: bool) -> int:
-    """Rough KV cache size (see :data:`KV_F16_MIB_PER_1K_TOKENS_PER_B`)."""
-    return int(KV_F16_MIB_PER_1K_TOKENS_PER_B * MIB * max(params_b, 0.1) * (0.5 if kv_q8 else 1.0) * ctx / 1024)
+def _kv_bytes_per_1k(params_b: float, *, kv_q8: bool, layout: gguf.KVLayout | None) -> float:
+    if layout is not None:  # exact: from the attention layout in the model file
+        return layout.bytes_per_token(kv_q8=kv_q8) * 1024
+    return KV_F16_MIB_PER_1K_TOKENS_PER_B * MIB * max(params_b, 0.1) * (0.5 if kv_q8 else 1.0)
 
 
-def fit_ctx_to_ram(ctx: int, params_b: float, model_bytes: int, available: int, *, kv_q8: bool) -> int:
+def kv_cache_bytes(params_b: float, ctx: int, *, kv_q8: bool, layout: gguf.KVLayout | None = None) -> int:
+    """KV cache size: exact for a known ``layout``, else rough (see :data:`KV_F16_MIB_PER_1K_TOKENS_PER_B`)."""
+    return int(_kv_bytes_per_1k(params_b, kv_q8=kv_q8, layout=layout) * ctx / 1024)
+
+
+def fit_ctx_to_ram(ctx: int, params_b: float, model_bytes: int, available: int, *, kv_q8: bool,
+                   layout: gguf.KVLayout | None = None) -> int:
     """Lower ``ctx`` in 1024 steps (not below :data:`CTX_FLOOR`) until model + KV cache fit 85 % of ``available``."""
-    while ctx > CTX_FLOOR and model_bytes + kv_cache_bytes(params_b, ctx, kv_q8=kv_q8) > available * RAM_SAFETY:
+    while ctx > CTX_FLOOR and (model_bytes + kv_cache_bytes(params_b, ctx, kv_q8=kv_q8, layout=layout)
+                               > available * RAM_SAFETY):
         ctx = max(CTX_FLOOR, (ctx - 1) // 1024 * 1024)
     return ctx
+
+
+def model_kv_layout(entry: CatalogEntry) -> gguf.KVLayout | None:
+    """The exact KV-cache layout from the model file's header (``None``: unreadable or another cache design)."""
+    try:
+        return gguf.kv_layout(model_path(entry))
+    except Exception:  # kv_layout never raises; an odd entry without files must not break a start either
+        log.debug("No KV layout for %s", entry.id, exc_info=True)
+        return None
 
 
 def check_model_fits(entry: CatalogEntry) -> int:
@@ -1781,21 +1798,24 @@ def _params_billions(entry: CatalogEntry, model_bytes: int) -> float:
 
 
 def estimate_ctx_size(params_b: float, model_bytes: int, available: int, *, kv_q8: bool,
-                      profile: str = "auto") -> int:
+                      profile: str = "auto", layout: gguf.KVLayout | None = None) -> int:
     """Largest context (multiple of 1024) whose KV cache fits the free RAM after the model.
 
-    KV cache ≈ :data:`KV_F16_MIB_PER_1K_TOKENS_PER_B` MiB per 1024 tokens per billion parameters
-    (f16; q8_0 half), using at most :data:`KV_RAM_SHARE` of ``available - model_bytes``;
-    clamped to 4096..32768 (saver: ..8192).
+    The KV cache per token is exact for a known ``layout`` (read from the model file), else
+    ≈ :data:`KV_F16_MIB_PER_1K_TOKENS_PER_B` MiB per 1024 tokens per billion parameters (f16;
+    q8_0 half). At most :data:`KV_RAM_SHARE` of ``available - model_bytes`` is used; clamped to
+    4096..32768 (saver: ..8192) and never beyond the context the model was trained for.
     """
-    per_1k = KV_F16_MIB_PER_1K_TOKENS_PER_B * MIB * max(params_b, 0.1) * (0.5 if kv_q8 else 1.0)
+    per_1k = _kv_bytes_per_1k(params_b, kv_q8=kv_q8, layout=layout)
     budget = max(0, available - model_bytes) * KV_RAM_SHARE
     upper = CTX_MAX_SAVER if profile == "saver" else CTX_MAX
-    return max(CTX_MIN, min(upper, int(budget // per_1k) * 1024))
+    if layout is not None and layout.context_length:  # more than it was trained for only makes it worse
+        upper = min(upper, layout.context_length)
+    return max(min(CTX_MIN, upper), min(upper, int(budget // per_1k) * 1024))
 
 
 def ctx_size(entry: CatalogEntry | None = None, *, profile: str | None = None, kv_q8: bool = False,
-             available: int | None = None) -> int:
+             available: int | None = None, layout: gguf.KVLayout | None = None) -> int:
     """Context size for ``entry`` (default: the selected model); ``settings.engine.ctx_size`` wins."""
     configured = settings.get("engine", "ctx_size")
     if isinstance(configured, int) and not isinstance(configured, bool) and 512 <= configured <= 131072:
@@ -1807,7 +1827,8 @@ def ctx_size(entry: CatalogEntry | None = None, *, profile: str | None = None, k
         return max(CTX_MIN, min(upper, default_ctx_size()))
     model_bytes = _model_bytes(entry)
     free = int(psutil.virtual_memory().available) if available is None else available
-    return estimate_ctx_size(_params_billions(entry, model_bytes), model_bytes, free, kv_q8=kv_q8, profile=profile)
+    return estimate_ctx_size(_params_billions(entry, model_bytes), model_bytes, free, kv_q8=kv_q8, profile=profile,
+                             layout=layout)
 
 
 def server_args(entry: CatalogEntry, binary: Path) -> tuple[list[str], dict]:
@@ -1817,7 +1838,9 @@ def server_args(entry: CatalogEntry, binary: Path) -> tuple[list[str], dict]:
     fast (16 GB RAM and more): flash attention, f16 KV cache, larger batches. Threads: all performance
     cores but two. Unknown options (``--help`` failed): only ``--parallel 1`` like every earlier version.
     The context shrinks (down to 2048) until model + KV cache fit 85 % of the available RAM; a model
-    larger than 80 % of the total RAM is refused (409).
+    larger than 80 % of the total RAM is refused (409). With flash attention the KV cache is computed
+    exactly from the model file's header (``kv_exact``) and the context stays within the one the model
+    was trained for (``ctx_train``); without it, or for other cache designs, the generous estimate is used.
     """
     model_bytes = check_model_fits(entry)
     flags = supported_flags(binary)
@@ -1850,14 +1873,19 @@ def server_args(entry: CatalogEntry, binary: Path) -> tuple[list[str], dict]:
                 args += [opt, str(FAST_UBATCH)]
         if opt := flags.get("jinja"):
             args.append(opt)
+    # exact only with flash attention: without it the attention scores need memory that grows with the context
+    layout = model_kv_layout(entry) if flash else None
     available = int(psutil.virtual_memory().available)
-    wanted = ctx_size(entry, profile=profile, kv_q8=kv_q8, available=available)
-    ctx = fit_ctx_to_ram(wanted, _params_billions(entry, model_bytes), model_bytes, available, kv_q8=kv_q8)
+    params_b = _params_billions(entry, model_bytes)
+    wanted = ctx_size(entry, profile=profile, kv_q8=kv_q8, available=available, layout=layout)
+    ctx = fit_ctx_to_ram(wanted, params_b, model_bytes, available, kv_q8=kv_q8, layout=layout)
     if ctx < wanted:
         log.warning("Context %s does not fit the free RAM (%.1f GiB) next to the model; using %s",
                     wanted, available / GIB, ctx)
         notes.append(f"Kontext wegen knappem Arbeitsspeicher auf {ctx} Token verkleinert.")
     tuning = {"profile": profile, "flash_attn": flash, "kv_cache": "q8_0" if kv_q8 else "f16", "ctx_size": ctx,
+              "kv_exact": layout is not None, "ctx_train": layout.context_length if layout else None,
+              "kv_cache_mib": round(kv_cache_bytes(params_b, ctx, kv_q8=kv_q8, layout=layout) / MIB),
               "cache_reuse": reuse, "threads": threads, "note": " ".join(notes) or None}
     return ["-c", str(ctx), *args], tuning
 
@@ -2199,8 +2227,9 @@ class EngineManager:
         except (psutil.Error, OSError):
             pass
         log.info("Starting llama-server (pid %s) with %s on port %s: profile %s, context %s, flash attention %s, "
-                 "KV cache %s", proc.pid, entry.id, port, tuning["profile"], tuning["ctx_size"],
-                 "on" if tuning["flash_attn"] else "off", tuning["kv_cache"])
+                 "KV cache %s (%s MiB, %s)", proc.pid, entry.id, port, tuning["profile"], tuning["ctx_size"],
+                 "on" if tuning["flash_attn"] else "off", tuning["kv_cache"], tuning["kv_cache_mib"],
+                 "exact from the model file" if tuning["kv_exact"] else "estimated")
         threading.Thread(target=self._watch, args=(proc, gen, port, path), name="lowram-engine-watch",
                          daemon=True).start()
         return self.snapshot()

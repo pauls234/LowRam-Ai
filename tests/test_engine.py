@@ -1,3 +1,4 @@
+import dataclasses
 import hashlib
 import http.client
 import json
@@ -15,9 +16,11 @@ from unittest import mock
 
 import psutil
 
-from backend import app, config, db, downloads, engine, llm, settings
+from backend import app, config, db, downloads, engine, gguf, llm, settings
 from tests.engine_helpers import FakeHub, fake_path_env, make_tar_gz, quiet_logger, write_fake_llama_server
-from tests.helpers import GIB, LowRAMTestCase, wait_until
+from tests.helpers import GIB, MIB, LowRAMTestCase, wait_until
+from tests.test_gguf import QWEN25_7B
+from tests.test_gguf import header as gguf_header
 
 POSIX = os.name != "nt"
 SMALL = "qwen2.5-1.5b-instruct"
@@ -362,7 +365,9 @@ class ServerTests(EngineTestCase):
         # 8 GiB free, tiny file, 1.5B params, q8_0 KV: the RAM allows more than the 32768 cap
         self.assertEqual((server["state"], server["model_id"], server["ctx_size"]), ("starting", SMALL, 32768))
         self.assertEqual(server["tuning"], {"profile": "auto", "flash_attn": True, "kv_cache": "q8_0",
-                                            "ctx_size": 32768, "cache_reuse": 256, "threads": 6, "note": None})
+                                            "ctx_size": 32768, "kv_exact": False, "ctx_train": None,
+                                            "kv_cache_mib": 1536,  # estimated: the fake file has no GGUF header
+                                            "cache_reuse": 256, "threads": 6, "note": None})
         self.assertEqual((server["restarts"], server["unloaded_idle"]), (0, False))
         server = self.wait_state("ready")
         url = f"http://127.0.0.1:{server['port']}/v1/chat/completions"
@@ -1186,6 +1191,38 @@ class ContextEstimateTests(LowRAMTestCase):
         self.assertEqual(est(1.5, GIB, 16 * GIB, kv_q8=True, profile="saver"), 8192)
         self.assertEqual(est(14, 9 * GIB, 6 * GIB, kv_q8=True), 4096)  # model larger than the free RAM: minimum
 
+    def test_exact_kv_cache_from_the_model_file(self):
+        """Qwen2.5 7B (Q4_K_M, 4.4 GiB) on a 16 GB Mac with 8 GiB free: 32768 instead of 8192 tokens."""
+        layout = gguf.KVLayout("qwen2", 28, 28 * 4 * 256, 32768)  # 29.75 KiB per token with q8_0
+        est, fit = engine.estimate_ctx_size, engine.fit_ctx_to_ram
+        model = int(4.4 * GIB)
+        self.assertEqual(est(7, model, 8 * GIB, kv_q8=True), 8192)  # the old, generous estimate
+        self.assertEqual(est(7, model, 7 * GIB, kv_q8=True), 5120)
+        self.assertEqual(est(7, model, 8 * GIB, kv_q8=True, layout=layout), 32768)
+        self.assertEqual(engine.kv_cache_bytes(7, 32768, kv_q8=True, layout=layout), 952 * MIB)
+        self.assertEqual(engine.kv_cache_bytes(7, 32768, kv_q8=False, layout=layout), 1792 * MIB)
+        # the same safety rules: at most half of the RAM left next to the model, and 85 % in total
+        self.assertEqual(est(7, model, 5 * GIB, kv_q8=True, layout=layout), 10240)
+        self.assertEqual(fit(32768, 7, model, 6 * GIB, kv_q8=True, layout=layout), 24576)
+        self.assertEqual(fit(32768, 7, model, 6 * GIB, kv_q8=True), 3072)
+        # never beyond the context the model was trained for (but a small one is not raised to 4096)
+        for trained, expected in ((16384, 16384), (4096, 4096), (2048, 2048), (None, 32768)):
+            short = gguf.KVLayout("llama", 28, 28 * 4 * 256, trained)
+            self.assertEqual(est(7, model, 16 * GIB, kv_q8=True, layout=short), expected)
+        self.assertEqual(est(7, model, 16 * GIB, kv_q8=True, profile="saver", layout=layout), 8192)
+
+    def test_layout_of_a_model(self):
+        entry = engine.get_entry("qwen2.5-7b-instruct")
+        path = engine.model_path(entry)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.assertIsNone(engine.model_kv_layout(entry))  # not downloaded
+        path.write_bytes(gguf_header(QWEN25_7B) + b"\0" * 64)
+        self.assertEqual(engine.model_kv_layout(entry).values_per_token, 28 * 4 * 256)
+        folder = dataclasses.replace(entry, id="folder", filename="", files=())  # the models folder itself
+        self.assertIsNone(engine.model_kv_layout(folder))
+        with mock.patch.object(engine, "model_path", side_effect=IndexError("no files")):
+            self.assertIsNone(engine.model_kv_layout(entry))  # an odd entry: no crash either
+
     def test_ctx_size_for_a_model(self):
         entry = engine.get_entry("qwen2.5-7b-instruct")  # not downloaded: the catalog size is used
         self.assertEqual(engine.ctx_size(entry, kv_q8=True, available=12 * GIB),
@@ -1228,9 +1265,23 @@ class TurboServerTests(EngineTestCase):
                 server, args = self.launch(FAKE_LLAMA_HELP=variant)
                 self.assertEqual(args, [*expected, "--api-key", "***"])
                 self.assertEqual(server["tuning"], {"profile": "auto", "flash_attn": flash, "kv_cache": kv,
-                                                    "ctx_size": ctx, "cache_reuse": reuse, "threads": threads,
+                                                    "ctx_size": ctx, "kv_exact": False, "ctx_train": None,
+                                                    "kv_cache_mib": 480, "cache_reuse": reuse, "threads": threads,
                                                     "note": None})
                 self.assertEqual(server["ctx_size"], ctx)
+
+    def test_exact_context_from_the_model_file(self):
+        """A real GGUF header: the KV cache is computed exactly – a larger context from the same RAM."""
+        self.add_model(data=gguf_header(QWEN25_7B) + b"\0" * 64)
+        self.set_memory(16, 1024)  # 1 GiB free: at most half of it for the KV cache
+        server, args = self.launch()
+        tuning = server["tuning"]
+        self.assertEqual((args[:2], tuning["kv_exact"], tuning["ctx_train"]), (["-c", "17408"], True, 32768))
+        self.assertEqual(tuning["kv_cache_mib"], 506)  # 17408 tokens × 29.75 KiB (q8_0)
+        self.assertEqual(server["ctx_size"], 17408)
+        engine._flags_cache.clear()
+        server, args = self.launch(FAKE_LLAMA_HELP="minimal")  # no flash attention: the generous estimate
+        self.assertEqual((args[:2], server["tuning"]["kv_exact"]), (["-c", "5120"], False))
 
     def test_profiles_and_ctx_setting(self):
         self.set_memory(16, 1024)

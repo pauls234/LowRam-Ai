@@ -7,12 +7,12 @@ import urllib.error
 from pathlib import Path
 from unittest import mock
 
-from backend import app, diagnostics, downloads, settings
+from backend import app, diagnostics, downloads, power, settings
 from tests.engine_helpers import quiet_logger
 from tests.helpers import LowRAMTestCase, closed_port_url
 
 RELEASE = "https://api.github.com/repos/pauls234/LowRam-Ai/releases/latest"
-IDS = {"app", "runtime", "model", "server", "ram", "disk", "models_folder", "media_runtime", "lan"}
+IDS = {"app", "runtime", "model", "server", "ram", "heat", "disk", "models_folder", "media_runtime", "lan"}
 
 
 class FakeResponse:
@@ -86,6 +86,24 @@ class CheckTests(DiagnosticsTestCase):
         with mock.patch.object(diagnostics, "_engine", return_value=None):
             data = diagnostics.diagnostics()
         self.assertEqual({c["id"] for c in data["checks"]}, IDS)
+
+    def test_heat(self):
+        with mock.patch("backend.power._platform", return_value="linux"):
+            self.assertEqual(diagnostics.check_heat()["status"], "ok")
+        with mock.patch("backend.power._platform", return_value="darwin"), \
+                mock.patch.object(power, "THERMAL_CACHE_S", 0.0):
+            self.assertEqual(diagnostics.check_heat()["status"], "warn")  # macOS without the sensor component
+            for level, status, word in ((0, "ok", "Normal"), (1, "ok", "Leicht erhöht"),
+                                        (2, "warn", "Abkühlpause"), (3, "fail", "Überhitzt")):
+                with self.subTest(level=level), mock.patch.object(power, "_thermal_value", return_value=level):
+                    check = diagnostics.check_heat()
+                    self.assertEqual(check["status"], status)
+                    self.assertIn(word, check["detail"])
+            settings.update("power", {"pause_when_hot": False})
+            with mock.patch.object(power, "_thermal_value", return_value=2):
+                check = diagnostics.check_heat()
+            self.assertEqual((check["status"], check["detail"]), ("warn", "Sehr warm – Abkühlpausen sind aus"))
+            self.assertIn("MacBook & Energie", check["hint"])
 
     def test_missing_models_folder_and_model(self):
         os.environ.pop("LOWRAM_LLM_URL", None)

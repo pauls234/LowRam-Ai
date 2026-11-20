@@ -42,6 +42,11 @@ MAX_TITLE_CHARS = 80
 MAX_BODY_CHARS = 240
 MAX_REASON_CHARS = 120
 DEFAULT_MIN_PERCENT = 20
+THERMAL_STATES = ("nominal", "fair", "serious", "critical")  # NSProcessInfo.ThermalState 0..3
+HOT_STATES = ("serious", "critical")
+THERMAL_CACHE_S = 5.0
+COOL_CHECK_S = 20.0
+DEFAULT_COOL_WAIT_MINUTES = 15
 ES_CONTINUOUS = 0x80000000
 ES_SYSTEM_REQUIRED = 0x00000001
 # Control characters, zero-width and bidi overrides: never shown in a notification.
@@ -259,6 +264,94 @@ def battery_block_reason() -> str | None:
         return None
 
 
+# --------------------------------------------------------------------------- heat
+
+_thermal_lock = threading.Lock()
+_thermal_cache: tuple[float, str | None] = (-THERMAL_CACHE_S, None)
+
+
+def _thermal_value() -> int:
+    """``NSProcessInfo.thermalState()``: 0 nominal … 3 critical. Raises without pyobjc."""
+    from Foundation import NSProcessInfo  # pyobjc: part of the desktop app (pywebview)
+
+    return int(NSProcessInfo.processInfo().thermalState())
+
+
+def _read_thermal_state() -> str | None:
+    """macOS' own judgement of the heat; ``None`` elsewhere, without pyobjc or for unknown values."""
+    if _platform() != "darwin":
+        return None
+    try:
+        value = _thermal_value()
+    except Exception:  # plain Python without pyobjc: no heat information
+        return None
+    return THERMAL_STATES[value] if 0 <= value < len(THERMAL_STATES) else None
+
+
+def thermal_state() -> str | None:
+    """``nominal``, ``fair``, ``serious``, ``critical`` or ``None`` (unknown); cached a few seconds."""
+    global _thermal_cache
+    with _thermal_lock:
+        at, state = _thermal_cache
+        if time.monotonic() - at < THERMAL_CACHE_S:
+            return state
+    state = _read_thermal_state()
+    with _thermal_lock:
+        _thermal_cache = (time.monotonic(), state)
+    return state
+
+
+def heat_block_reason() -> str | None:
+    """Why long jobs should pause right now (the Mac is very warm), else None."""
+    try:
+        if _setting("pause_when_hot", True) is False:
+            return None
+        state = thermal_state()
+    except Exception:
+        log.warning("Heat check failed", exc_info=True)
+        return None
+    if state == "critical":
+        return "Der Mac ist überhitzt – LowRAM AI macht eine Abkühlpause und arbeitet danach weiter."
+    if state == "serious":
+        return "Der Mac ist sehr warm – LowRAM AI macht eine kurze Abkühlpause und arbeitet danach weiter."
+    return None
+
+
+def cool_wait_seconds() -> float:
+    value = _setting("cool_wait_minutes", DEFAULT_COOL_WAIT_MINUTES)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= 24 * 60:
+        value = DEFAULT_COOL_WAIT_MINUTES
+    return float(value) * 60
+
+
+def wait_until_cool(stop_event: threading.Event | None = None, on_wait: Any = None,
+                    max_wait_s: float | None = None) -> bool:
+    """Wait while the Mac is very warm. True: cool (or unknown) – go on; False: stopped or still hot.
+
+    ``on_wait(message)`` is called on every check, so the wait shows up in progress displays.
+    """
+    deadline = time.monotonic() + (cool_wait_seconds() if max_wait_s is None else max(0.0, max_wait_s))
+    while True:
+        reason = heat_block_reason()
+        if reason is None:
+            return True
+        if stop_event is not None and stop_event.is_set():
+            return False
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        if on_wait is not None:
+            try:
+                on_wait(reason)
+            except Exception:  # a display must never break the wait
+                log.debug("on_wait failed", exc_info=True)
+        if stop_event is not None:
+            if stop_event.wait(min(COOL_CHECK_S, remaining)):
+                return False
+        else:
+            time.sleep(min(COOL_CHECK_S, remaining))
+
+
 # --------------------------------------------------------------------------- notifications
 
 _notify_lock = threading.Lock()
@@ -324,6 +417,7 @@ def notify(title: object, body: object = "") -> bool:
 def status() -> dict:
     return {
         "battery": battery(),
+        "thermal": thermal_state(),
         "keep_awake": {"enabled": bool(_setting("keep_awake", True)), "active": active_reasons()},
         "settings": _setting_section(),
     }

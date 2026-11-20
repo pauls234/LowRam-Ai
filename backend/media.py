@@ -1283,6 +1283,10 @@ class MediaWorker:
         if on_battery:  # the job stays queued and shows why
             _set_queued_message(job["id"], on_battery)
             return BATTERY_RETRY_S
+        too_hot = power.heat_block_reason()
+        if too_hot:  # image/video generation heats the Mac most: wait until it has cooled down
+            _set_queued_message(job["id"], too_hot)
+            return power.COOL_CHECK_S
         with contextlib.ExitStack() as stack:
             try:
                 stack.enter_context(db.inference_slot(f"{job['kind']} generation #{job['id']}"))
