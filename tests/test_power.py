@@ -2,7 +2,9 @@
 
 import contextlib
 import os
+import sys
 import threading
+import types
 import unittest
 from collections import namedtuple
 from unittest import mock
@@ -15,6 +17,22 @@ from tests.test_app import AppTestCase
 
 Battery = namedtuple("Battery", "percent secsleft power_plugged")
 LOW = "On battery at 15 % – long jobs pause below 20 %. Plug in to continue."
+REAL_THERMAL_VALUE = power._thermal_value  # the tests' base class swaps it for "no sensor"
+
+
+@contextlib.contextmanager
+def only_module(name, module):
+    """Put one entry into sys.modules and restore just that one (patch.dict would drop every import made meanwhile)."""
+    missing = object()
+    old = sys.modules.get(name, missing)
+    sys.modules[name] = module
+    try:
+        yield
+    finally:
+        if old is missing:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = old
 
 
 class FakeInhibitor:
@@ -135,6 +153,100 @@ class KeepAwakeTests(PowerTestCase):
             with power.keep_awake("forgotten"):
                 power._release_on_shutdown(None)
                 self.assertEqual((power.active_reasons(), FakeInhibitor.stopped), ([], 1))
+
+
+class HeatTests(PowerTestCase):
+    """macOS' own heat judgement (NSProcessInfo.thermalState) pauses long jobs – the MacBook must not suffer."""
+
+    def setUp(self):
+        super().setUp()  # LowRAMTestCase: no real heat sensor, fresh heat cache
+        self.platform("darwin")
+        self.level = 0  # 0 nominal, 1 fair, 2 serious, 3 critical
+        sensor = mock.patch("backend.power._thermal_value", side_effect=lambda: self.level)
+        sensor.start()
+        self.addCleanup(sensor.stop)
+        for name, value in (("THERMAL_CACHE_S", 0.0), ("COOL_CHECK_S", 0.02)):
+            patcher = mock.patch.object(power, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_reads_macos_own_judgement(self):
+        info = types.SimpleNamespace(thermalState=lambda: 2)
+        fake = types.ModuleType("Foundation")
+        fake.NSProcessInfo = types.SimpleNamespace(processInfo=lambda: info)
+        with only_module("Foundation", fake):
+            self.assertEqual(REAL_THERMAL_VALUE(), 2)
+        with only_module("Foundation", None), self.assertRaises(ImportError):  # plain Python: no pyobjc
+            REAL_THERMAL_VALUE()
+
+    def test_states_and_reasons(self):
+        for level, state in enumerate(power.THERMAL_STATES):
+            self.level = level
+            self.assertEqual(power.thermal_state(), state)
+        self.level = 1
+        self.assertIsNone(power.heat_block_reason())  # "fair" is normal under load
+        self.level = 2
+        self.assertIn("sehr warm", power.heat_block_reason())
+        self.level = 3
+        self.assertIn("überhitzt", power.heat_block_reason())
+        settings.update("power", {"pause_when_hot": False})
+        self.assertIsNone(power.heat_block_reason())
+        self.assertEqual(power.status()["thermal"], "critical")
+
+    def test_unknown_without_pyobjc_or_on_other_systems(self):
+        with mock.patch("backend.power._thermal_value", side_effect=ImportError("No module named 'Foundation'")):
+            self.assertIsNone(power.thermal_state())
+        self.level = 7  # a value a future macOS might add
+        self.assertIsNone(power.thermal_state())
+        self.platform("linux")
+        self.level = 3
+        self.assertIsNone(power.thermal_state())
+        self.assertIsNone(power.heat_block_reason())
+
+    def test_wait_until_cool(self):
+        self.level = 2
+        seen = []
+
+        def cools_down(message):
+            seen.append(message)
+            self.level = 1
+
+        self.assertTrue(power.wait_until_cool(on_wait=cools_down, max_wait_s=5))
+        self.assertEqual(len(seen), 1)
+        self.level = 3
+        self.assertFalse(power.wait_until_cool(max_wait_s=0.1))  # stays hot: give up after the limit
+        stop = threading.Event()
+        stop.set()
+        self.assertFalse(power.wait_until_cool(stop, max_wait_s=5))
+
+    def test_loop_pauses_while_hot_and_continues(self):
+        pid = runner.create_project("p", "a\nb")
+        seen = []
+
+        def on_step(outcome):
+            seen.append((outcome["status"], outcome["reason"]))
+            if outcome["status"] == "done" and [status for status, _ in seen].count("done") == 1:
+                self.level = 2  # gets very warm after the first step …
+                threading.Timer(0.1, lambda: setattr(self, "level", 0)).start()  # … and cools down
+
+        summary = runner.run_loop(pid, on_step=on_step)
+        self.assertEqual((summary["stopped_because"], summary["completed"]), ("queue_empty", 2))
+        waits = [reason for status, reason in seen if status == "waiting"]
+        self.assertTrue(waits and "Abkühlpause" in waits[0], seen)
+
+    def test_loop_stops_when_it_stays_hot(self):
+        settings.update("power", {"cool_wait_minutes": 0.002})  # 0.12 s
+        pid = runner.create_project("p", "a\nb")
+
+        def on_step(outcome):
+            if outcome["status"] == "done":
+                self.level = 3
+
+        summary = runner.run_loop(pid, on_step=on_step)
+        self.assertEqual((summary["stopped_because"], summary["completed"]), ("too_hot", 1))
+        self.assertEqual(summary["message"], "Der Mac blieb sehr warm – der Durchlauf wurde angehalten, damit er "
+                                             "abkühlen kann. Du kannst ihn später fortsetzen.")  # no "0 Minuten"
+        self.assertEqual([t["status"] for t in db.list_tasks(pid)], ["done", "pending"])  # nothing lost
 
 
 class BatteryTests(PowerTestCase):

@@ -856,7 +856,7 @@
   let powerTimer = 0;
 
   function buildPower() {
-    const sec = section(LR.t('MacBook & power'), LR.t('Long jobs keep your Mac awake and can pause when the battery runs low.'));
+    const sec = section(LR.t('MacBook & power'), LR.t('Long jobs keep your Mac awake and pause when the battery runs low or the Mac gets very hot.'));
     ui.power = sec;
     sec.el.hidden = true;
     return sec.el;
@@ -887,7 +887,8 @@
 
   function renderPower(p) {
     const sig = JSON.stringify(p);
-    if (sig === ui.powerSig || (ui.powerRange && document.activeElement === ui.powerRange)) return;
+    const editing = [ui.powerRange, ui.coolSelect].some((el) => el && document.activeElement === el);
+    if (sig === ui.powerSig || editing) return;
     ui.powerSig = sig;
     const bat = p.battery || {};
     const awake = p.keep_awake || {};
@@ -949,7 +950,50 @@
       h('div', { class: 'range-scale', 'aria-hidden': 'true' }, [h('span', { text: LR.t('Never') }), h('span', { text: '25 %' }), h('span', { text: '50 %' })]),
       h('p', { class: 'help', id: id + '-help', text: LR.t('When your Mac runs on battery below this level, task loops stop and image jobs wait until you plug in.') }),
     ]));
+    out.push(...heatControls(p.thermal, cfg));
     ui.power.body.replaceChildren(...out);
+  }
+
+  // macOS' own heat judgement (NSProcessInfo.thermalState); unknown elsewhere – then nothing is shown
+  const HEAT_STATE = {
+    nominal: ['ok', 'Temperature: normal'],
+    fair: ['ok', 'Temperature: slightly raised (normal under load)'],
+    serious: ['warn', 'Temperature: very warm – long jobs take a cooling break'],
+    critical: ['error', 'Temperature: overheated – long jobs take a cooling break'],
+  };
+  const COOL_WAIT_CHOICES = [5, 15, 30, 60];
+
+  function heatControls(thermal, cfg) {
+    ui.coolSelect = null;
+    const heat = HEAT_STATE[thermal];
+    if (!heat) return [];
+    const pausing = cfg.pause_when_hot !== false;
+    const hot = thermal === 'serious' || thermal === 'critical';
+    const text = hot && !pausing ? LR.t('Temperature: very warm – cooling breaks are off') : LR.t(heat[1]);
+    const minutes = LR.isNum(cfg.cool_wait_minutes) && cfg.cool_wait_minutes > 0 ? cfg.cool_wait_minutes : 15;
+    const choices = COOL_WAIT_CHOICES.includes(minutes) ? COOL_WAIT_CHOICES : [...COOL_WAIT_CHOICES, minutes].sort((a, b) => a - b);
+    const select = h('select', { class: 'input select' }, choices.map((m) => h('option', { value: String(m), text: LR.t('{n} min', { n: m }) })));
+    select.value = String(minutes);
+    select.disabled = !pausing;
+    select.addEventListener('change', () => {
+      const v = Number(select.value);
+      saveSetting('power', { cool_wait_minutes: v }, LR.t('A task loop that stays very warm stops after {n} min', { n: v })).then(() => { ui.powerSig = ''; });
+    });
+    ui.coolSelect = select;
+    return [
+      h('p', { class: 'awake-note heat-note' + (heat[0] === 'ok' ? '' : ' is-' + heat[0]), role: hot ? 'status' : null }, [LR.dot(heat[0]), h('span', { text })]),
+      LR.switchRow({
+        label: LR.t('Cooling breaks when my Mac gets very hot'),
+        description: LR.t('Long jobs pause between two steps until macOS reports a normal temperature again – easier on your Mac, its battery and the fans.'),
+        checked: pausing,
+        onChange: (on, input) => saveSetting('power', { pause_when_hot: on }, on ? LR.t('Cooling breaks on') : LR.t('Cooling breaks off')).then((ok) => { if (!ok) input.checked = !on; ui.powerSig = ''; }),
+      }).el,
+      LR.field({
+        label: LR.t('Stop a task loop that stays very warm after'),
+        control: select,
+        hint: LR.t('The loop stops so your Mac can cool down – you can continue it later. Images and videos simply wait.'),
+      }).el,
+    ];
   }
 
   /* ------------------------------------------------------------ performance (v0.4) */
@@ -1012,8 +1056,8 @@
       const reuse = tun.cache_reuse;
       out.push(h('dl', { class: 'facts' }, [
         h('div', null, [h('dt', { text: LR.t('Active profile') }), h('dd', { text: tun.profile && PROFILES.includes(tun.profile) ? LR.t(PROFILE_NAME[tun.profile]) : LR.str(tun.profile, '—') })]),
-        h('div', null, [h('dt', { text: LR.t('Context') }), h('dd', { text: LR.isNum(tun.ctx_size) ? fmt.int(tun.ctx_size) + LR.t(' tokens') : '—' })]),
-        h('div', null, [h('dt', { text: LR.t('KV cache') }), h('dd', { text: tun.kv_cache ? LR.str(tun.kv_cache) + (/^q/i.test(String(tun.kv_cache)) ? LR.t(' (saves memory)') : '') : '—' })]),
+        h('div', null, [h('dt', { text: LR.t('Context') }), h('dd', { text: ctxText(tun) })]),
+        h('div', null, [h('dt', { text: LR.t('KV cache') }), h('dd', { text: kvText(tun) })]),
         h('div', null, [h('dt', { text: 'Flash Attention' }), h('dd', { text: onOff(tun.flash_attn) })]),
         h('div', null, [h('dt', { text: LR.t('Prompt cache') }), h('dd', { text: reuse ? LR.t('on') + (LR.isNum(reuse) ? ' (' + reuse + LR.t(' tokens') + ')' : '') : LR.t('off') })]),
         LR.isNum(server.restarts) ? h('div', null, [h('dt', { text: LR.t('Automatic restarts') }), h('dd', { text: String(server.restarts) })]) : null,
@@ -1032,6 +1076,22 @@
     ui.perfFacts.replaceChildren(...out);
   }
   const PROFILE_NAME = { auto: 'Automatic', saver: 'Saver', fast: 'Fast' };
+
+  function ctxText(tun) {
+    if (!LR.isNum(tun.ctx_size)) return '—';
+    const most = LR.isNum(tun.ctx_train) && tun.ctx_size >= tun.ctx_train;
+    return fmt.int(tun.ctx_size) + LR.t(' tokens') + (most ? LR.t(' (the most this model handles)') : '');
+  }
+
+  function kvText(tun) {
+    if (!tun.kv_cache) return '—';
+    let text = LR.str(tun.kv_cache) + (/^q/i.test(String(tun.kv_cache)) ? LR.t(' (saves memory)') : '');
+    if (LR.isNum(tun.kv_cache_mib)) {
+      const size = { n: fmt.int(tun.kv_cache_mib) };
+      text += ' · ' + (tun.kv_exact ? LR.t('{n} MB, exactly from the model file', size) : LR.t('about {n} MB (estimated)', size));
+    }
+    return text;
+  }
 
   async function restartEngine(modelId, btn) {
     LR.setBusy(btn, true, LR.t('Restarting…'));

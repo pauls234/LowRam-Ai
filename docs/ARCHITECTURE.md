@@ -239,7 +239,7 @@ would have a different certificate and therefore a different number.
 * `power.keep_awake(reason)` – context manager; macOS: `caffeinate -i -w <pid>` while any long job runs (reference-counted), Windows: `SetThreadExecutionState`, Linux: best effort; respects `settings.power.keep_awake`.
 * `power.battery()` → `{available, percent, plugged}`; `power.battery_block_reason()` → text when on battery below `settings.power.battery_min_percent`, else `None`.
 * `power.notify(title, body)` – system notification (macOS via `osascript` with arguments, never string-built scripts), respects `settings.power.notifications`; never raises.
-* `GET /api/power` → `{battery, keep_awake: {enabled, active: [reasons]}, settings}`.
+* `GET /api/power` → `{battery, thermal, keep_awake: {enabled, active: [reasons]}, settings}` (`thermal` see v0.5 below).
 * Integration: task loop (stop reason `"on_battery"`, notification when finished), media jobs (wait while on low battery, notification when done), device worker (no claims on low battery), cluster host (notification on pairing request and when a merged result is ready).
 
 ### Polish round v0.3.1 (binding)
@@ -305,6 +305,19 @@ Settings `resilience`: `wait_for_ram_minutes` (30), `idle_unload_minutes` (15, 0
 * Servers: Ollama 11434 (`/api/tags`, `/api/ps` for what is loaded), LM Studio 1234 (`/v1/models`, `/api/v0/models`), Jan 1337, Docker Model Runner 12434 (`/engines/v1/…`), GPT4All 4891, llama.cpp/llamafile 8080, KoboldCpp 5001 – asked in parallel on 127.0.0.1 only, 0.6 s timeout, no proxy, redirects never followed, ≤ 512 KiB, embedding models left out.
 * `POST /api/localai/use {id}` → 201 `{model}`: `engine.import_local(path, name, purpose, family=source, any_suffix=True)` (an Ollama blob has no `.gguf` ending; a typed path still needs one). Only ids of the last scan, never a path from the request. Clears a chosen local server (a file runs in the built-in engine).
 * `POST /api/localai/server {id, model}` → `{local_server}`; `{id: null}` switches back. Stored as `settings.engine.local_server`; `config.local_server()` accepts only `http://127.0.0.1:<port>/…/chat/completions` (no `.`/`..` segments) and a printable model ≤ 200 chars – whatever the settings file says, nothing leaves the computer. `LOWRAM_LLM_URL` wins. While set, `engine.external()` is true (no auto-start, no idle unload), `config.llm_url()/llm_model()` point to it, the managed engine's API key is never sent there, chat/runner/cluster use it as is, and the built-in engine is stopped when switching so no model is held twice.
+
+### Heat protection and exact KV cache (v0.5)
+
+**Cooling breaks (`power.py`)**
+* `power.thermal_state()` → `"nominal"|"fair"|"serious"|"critical"|None`: macOS' own judgement (`NSProcessInfo.processInfo().thermalState()` via pyobjc's `Foundation`, which the app bundles with pywebview), cached 5 s; `None` on other systems or without pyobjc (then nothing pauses).
+* Settings `power.pause_when_hot` (true) and `power.cool_wait_minutes` (15, 0..1440). `power.heat_block_reason()` → German text at `serious`/`critical` while `pause_when_hot` is on, else `None`. `power.wait_until_cool(stop_event, on_wait, max_wait_s)` checks every 20 s → True (cool or unknown) / False (stopped or still hot after `cool_wait_minutes`).
+* Integration: task loop – before every task; the wait is a `waiting` step (shown in the loop timeline), still hot after `cool_wait_minutes` → stop reason `"too_hot"` (pending tasks stay pending); media jobs stay queued with the heat text and retry every 20 s; the device worker claims nothing while hot. A running inference is never interrupted.
+* Diagnostics check `heat` ("Temperatur"): ok at nominal/fair, warn at serious (or macOS without the sensor component), fail at critical.
+
+**Exact KV cache from the model file (`gguf.py`)**
+* `gguf.read_metadata(path, want)` reads only the GGUF v2/v3 header: regular files only (opened non-blocking), ≤ 64 MiB read, ≤ 100 000 keys, keys ≤ 64 KiB, texts ≤ 16 MiB, arrays ≤ 32 M items, ≤ 4 M texts stepped over (vocabularies), nested arrays refused like llama.cpp does; anything else → `GGUFError`. Long arrays and vocabularies are skipped, not stored.
+* `gguf.kv_layout(path)` → `KVLayout(architecture, layers, values_per_token, context_length)` or `None`; cached per (real path, size, mtime); never raises. values_per_token = Σ layers KV heads × (key + value length) (per-layer arrays supported; lengths default to embedding/heads like llama.cpp). `None` for other cache designs (MLA `kv_lora_rank`, `.ssm.`, `.wkv.`, `.shortconv.`, rwkv/mamba) – the generous estimate stays in charge there.
+* Engine: with flash attention the context uses `layout.bytes_per_token` (f16 2 bytes, q8_0 34/32 bytes per value) instead of the 64 MiB/1k-tokens/B estimate; the same rules stay (≤ half of the RAM left after the model, model + KV ≤ 85 % of the available RAM, 4096..32768, saver ≤ 8192) and the context never exceeds `context_length`. Without flash attention the estimate is kept (the attention scores would grow with the context too). `server.tuning` adds `kv_exact`, `ctx_train`, `kv_cache_mib`.
 
 ### Desktop (`desktop/launcher.py`)
 

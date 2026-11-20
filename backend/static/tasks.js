@@ -27,6 +27,7 @@
     error: ['error', LR.t('Stopped because of an unexpected error.')],
     no_model: ['warn', LR.t('Stopped: no model is running.')],
     on_battery: ['warn', LR.t('Paused: your Mac is on battery.')],
+    too_hot: ['warn', LR.t('Paused: your Mac got very warm – it can cool down now. Continue the loop later.')],
   };
   const MERGE_TEXT = { waiting: LR.t('Waiting for all tasks before combining the results…'), running: LR.t('Combining the results on this computer…'), failed: LR.t('Combining the results failed.') };
   const ERROR_PREVIEW = 240;

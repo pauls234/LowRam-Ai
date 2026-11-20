@@ -1228,6 +1228,8 @@ p.small .icon, p.muted .icon { width: 15px; height: 15px; vertical-align: -3px; 
 .battery-row { display: flex; align-items: center; gap: 14px; }
 .battery-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 6px; max-width: 360px; }
 .awake-note { display: flex; align-items: center; gap: 8px; font-size: 14px; color: var(--text-2); padding: 8px 12px; border-radius: var(--radius); background: var(--ok-soft); }
+.heat-note.is-warn { background: var(--warn-soft); color: var(--text); }
+.heat-note.is-error { background: var(--error-soft); color: var(--text); }
 .loop-hint { display: flex; align-items: center; gap: 6px; color: var(--warn); }
 .loop-hint .icon { width: 15px; height: 15px; }
 

@@ -196,6 +196,22 @@ def main() -> None:
     app.call("POST", "/api/engine/start", {"model_id": MODEL_ID})
     server = app.wait_ready()
     log(f"   ready on port {server['port']}, tuning: {json.dumps(server.get('tuning'), sort_keys=True)}")
+    tuning = server.get("tuning") or {}
+    if tuning.get("flash_attn") and not tuning.get("kv_exact"):
+        fail(f"the KV cache was not computed from the model file's header: {tuning}")
+    trained = tuning.get("ctx_train")
+    if tuning.get("kv_exact") and not (isinstance(trained, int) and trained >= 4096):
+        fail(f"implausible trained context read from the model file: {tuning}")
+    if tuning.get("kv_exact"):
+        log(f"   KV cache exact from the GGUF header: {tuning.get('kv_cache_mib')} MiB for "
+            f"{tuning.get('ctx_size')} tokens (trained for {trained})")
+
+    if sys.platform == "darwin":
+        log("4b. Heat protection: the app reads the Mac's thermal state")
+        thermal = app.call("GET", "/api/power").get("thermal")
+        if thermal not in ("nominal", "fair", "serious", "critical"):
+            fail(f"the app cannot read the thermal state – the heat protection would not work: {thermal!r}")
+        log(f"   thermal state: {thermal}")
 
     log("5. Chat: a real, streamed answer")
     chat = app.call("POST", "/api/chats", {"title": "Echt-Modell-Test", "mode": "chat"})["chat"]

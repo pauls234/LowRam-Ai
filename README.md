@@ -21,6 +21,9 @@ Built for Macs with little RAM (Apple Silicon), also runs on Windows and Linux.
 > Schon eine lokale KI (Ollama, LM Studio, Jan, GPT4All …)? LowRAM AI findet
 > ihre Modelle und laufende KI-Programme selbst – direkt verwenden, ohne neuen
 > Download.
+> Wird der Mac sehr warm, machen lange Arbeiten eine Abkühlpause. Den Speicherbedarf
+> des Modells liest LowRAM AI genau aus der Modelldatei – so passt bei gleicher
+> Sicherheitsgrenze oft ein mehrfach größerer Kontext in den Arbeitsspeicher.
 > Erster Start der nicht signierten Mac-App: Systemeinstellungen →
 > Datenschutz & Sicherheit → „Dennoch öffnen“ – oder im Terminal
 > `xattr -dr com.apple.quarantine "/Applications/LowRAM AI.app"`.
@@ -49,7 +52,7 @@ internet afterwards – only model/engine downloads you start yourself.
 | | |
 | --- | --- |
 | **Chat** | Claude-like conversations with streamed answers, Markdown and code blocks, a collapsible "thinking" section for reasoning models, stop, regenerate and *continue* (when an answer was cut off), speed shown per answer (tokens/s), custom instructions, text/code file attachments, chat search and Markdown export. |
-| **MacBook-friendly** | Long jobs keep the Mac awake, pause on battery below a threshold you choose (default 20 %), and a notification tells you when a loop, an image or a merged result is ready – start it, do something else, come back later. |
+| **MacBook-friendly** | Long jobs keep the Mac awake, pause on battery below a threshold you choose (default 20 %), take a cooling break when macOS reports the Mac as very warm (and continue once it has cooled down), and a notification tells you when a loop, an image or a merged result is ready – start it, do something else, come back later. |
 | **Code** | A code chat mode, plus the coding agent: point it at a project folder, it plans small steps and proposes complete file changes as a diff. **Nothing changes on disk until you click Approve.** The model can never run commands. |
 | **Images & video** | Local generation with [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) (SD-Turbo, SD 1.5, SDXL-Turbo, Wan 2.1 video). Jobs queue up, show progress and can be cancelled. Video is very slow on small machines. |
 | **Task queue** | One task per line; run one, or a bounded loop that stops by itself (queue empty, limit, failure, low RAM, no model, stop button). |
@@ -58,7 +61,7 @@ internet afterwards – only model/engine downloads you start yourself.
 | **Progress you can follow** | Long work says how far it is and roughly how long it still takes: task loops and big jobs show "Schritt 2 von 4: …", percent, time left and a step history with times; the chat shows percent and time left while the model loads and while it reads a long message; planning a big job, images/videos and downloads show the time left. Estimates come from what this computer measured before ("Pi mal Daumen") and say so when something takes longer than usual. |
 | **Already have a local AI?** | LowRAM AI finds models that Ollama, LM Studio, Jan, GPT4All, llama.cpp or the Hugging Face cache already downloaded and uses them in place (nothing copied or deleted) – or chats directly through an AI program that is running (Ollama, LM Studio, Jan, Docker Model Runner, …), so no model sits in RAM twice. Only folders of these apps are read, only 127.0.0.1 is asked. |
 | **External drive** | Keep models on an external SSD; LowRAM AI runs them from there and says so clearly when the drive is unplugged. |
-| **Turbo for little RAM** | Compressed KV cache (q8_0), flash attention and prompt-cache reuse are switched on automatically when your llama.cpp supports them; the context size is derived from your free RAM; profiles *Automatisch / Sparsam / Schnell*. |
+| **Turbo for little RAM** | Compressed KV cache (q8_0), flash attention and prompt-cache reuse are switched on automatically when your llama.cpp supports them; the context size is derived from your free RAM and the exact KV-cache size read from the model file (e.g. Qwen2.5 7B on a 16 GB Mac: 32 768 instead of ~8 000 tokens, same safety margin); profiles *Automatisch / Sparsam / Schnell*. |
 | **Holds on instead of giving up** | No fixed time limits on slow Macs (answers stream token by token), progress is saved while a task runs, an interrupted task continues after an engine crash, a RAM guard waits for memory instead of failing, and the model is unloaded when idle to free RAM. |
 | **Long chats & big jobs** | Long conversations are summarised instead of forgotten; a *Großauftrag* splits a big goal into small steps that fit into little RAM (optionally on several devices) and merges the results. |
 | **Knowledge base** | Chat with your own documents (local search, answers cite their sources). |
@@ -176,8 +179,13 @@ What LowRAM AI does – and does not do – on your Mac:
   folder you gave the coding agent. The model can never run commands; your
   test command runs only when you click *Tests ausführen*.
 * **Gentle on the hardware.** One heavy job at a time, RAM guard and waiting
-  instead of overloading, model unloaded when idle, battery pause, and the Mac
-  is kept awake only while a long job runs.
+  instead of overloading, model unloaded when idle, battery pause, cooling
+  breaks when the Mac gets very warm, and the Mac is kept awake only while a
+  long job runs.
+* **Model files are only read, carefully.** Besides llama.cpp itself, LowRAM AI
+  reads just the header of a model file (to size the memory exactly) – with
+  hard limits on every length and count, so a broken or crafted file is simply
+  ignored.
 * A paired device is trusted to return honest answers – only pair your own computers.
 
 ## Tests
@@ -186,7 +194,7 @@ What LowRAM AI does – and does not do – on your Mac:
 python3 -m unittest discover -s tests
 ```
 
-About 760 tests with fake model/image servers – no model or network needed.
+About 820 tests with fake model/image servers – no model or network needed.
 CI runs them on Ubuntu and macOS with Python 3.10–3.13; the release workflow
 builds the macOS and Windows apps on every `v*` tag.
 

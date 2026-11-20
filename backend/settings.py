@@ -60,6 +60,8 @@ DEFAULTS: dict[str, Any] = {
     "power": {
         "keep_awake": True,  # keep the Mac awake while long jobs run (caffeinate)
         "battery_min_percent": 20,  # on battery below this, long jobs pause (0 = never pause)
+        "pause_when_hot": True,  # the Mac reports "serious"/"critical" heat: long jobs pause between steps
+        "cool_wait_minutes": 15,  # a task loop that stays too hot this long stops (the Mac can cool down)
         "notifications": True,  # system notifications when long jobs finish / devices ask to pair
     },
 }

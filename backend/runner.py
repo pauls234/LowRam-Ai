@@ -577,7 +577,9 @@ def run_loop(
 
     Stop conditions: queue empty, ``max_tasks`` executed, a task failed
     (``stop_on_failure``), RAM too low, on battery below the minimum
-    (``power.battery_block_reason``), another inference busy, or
+    (``power.battery_block_reason``), the Mac very warm for longer than
+    ``power.cool_wait_minutes`` (``too_hot``; shorter heat is a cool-down pause reported
+    as ``waiting``), another inference busy, or
     ``stop_event`` set (checked between tasks; a running inference is never
     killed mid-way).
 
@@ -614,6 +616,19 @@ def run_loop(
             if battery:
                 summary.update(stopped_because="on_battery", message=battery)
                 break
+            if power.heat_block_reason():  # very warm: a cool-down pause, shown in the progress timeline
+                cool = power.wait_until_cool(stop_event, lambda message: _emit_waiting(on_step, message))
+                if not cool:
+                    if stop_event is not None and stop_event.is_set():
+                        summary.update(stopped_because="stop_requested", message="Stopped on request.")
+                    else:
+                        minutes = round(power.cool_wait_seconds() / 60)
+                        waited = (f"{minutes} Minuten lang " if minutes > 1 else
+                                  "eine Minute lang " if minutes == 1 else "")
+                        summary.update(stopped_because="too_hot", message=(
+                            f"Der Mac blieb {waited}sehr warm – der Durchlauf wurde angehalten, "
+                            "damit er abkühlen kann. Du kannst ihn später fortsetzen."))
+                    break
             if summary["steps"]:  # between tasks: hold on instead of giving up while RAM is short
                 held = _hold_for_ram(stop_event, on_step)
                 if held is not None:
