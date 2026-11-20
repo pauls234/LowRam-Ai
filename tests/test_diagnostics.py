@@ -68,12 +68,14 @@ class CheckTests(DiagnosticsTestCase):
 
     def test_report_hides_home_and_secrets(self):
         home = str(Path.home())
-        os.environ["LOWRAM_LLM_URL"] = "https://user:pw@example.com/v1/chat/completions?key=secret"
-        bad = diagnostics._check("x", "X", "warn", f"{home}/models token=abc123 https://u:p@h.example/x?api_key=zz")
+        # upper case and hyphens: random temporary folder names (a-z, 0-9, _) can never contain them
+        os.environ["LOWRAM_LLM_URL"] = "https://user:pw@example.com/v1/chat/completions?key=KEY-SECRET-1"
+        bad = diagnostics._check("x", "X", "warn",
+                                 f"{home}/models token=TOK-ABC-123 https://u:p@h.example/x?api_key=API-ZZ-9")
         report = diagnostics.build_report([bad, *diagnostics.run_checks()])
         self.assertNotIn(home, report)
         self.assertIn("~/models", report)
-        for secret in ("abc123", "secret", "u:p@", "zz", "pw@"):
+        for secret in ("TOK-ABC-123", "KEY-SECRET-1", "u:p@", "API-ZZ-9", "pw@"):
             self.assertNotIn(secret, report)
 
     def test_checks_never_raise(self):

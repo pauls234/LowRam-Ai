@@ -82,9 +82,11 @@ def main() -> None:
             break
         log(f"   attempt {attempt + 1}: {status} {data.get('error')}")
         time.sleep(5)
-    if status != 201 or "Example Domain" not in data["upload"]["preview"]:
+    upload = (data.get("upload") or {}) if status == 201 else {}
+    # the title becomes the document name; the body text of example.com changes now and then
+    if status != 201 or "Example Domain" not in upload.get("name", "") or upload.get("chars", 0) < 50:
         fail(f"web page: {status} {data}")
-    log(f"   ok: {data['upload']['name']!r}")
+    log(f"   ok: {upload['name']!r}, {upload['chars']} characters: {upload['preview'][:160]!r}")
     status, data = app.call("POST", "/api/documents/uploads/url", {"url": "http://127.0.0.1/"})
     if status != 422 or "eigenen Netz" not in data.get("error", ""):
         fail(f"a local address must be refused: {status} {data}")
@@ -96,10 +98,13 @@ def main() -> None:
         fail(f"skill: {status} {data}")
     log("   ok")
 
-    log("5. Live web search (only reported)")
+    log("5. Live web search and the raw page markup (only reported)")
     try:
-        from backend import internet
+        from backend import doctext, internet
 
+        markup = internet.request("https://example.com/")["data"].decode("utf-8", "replace")
+        log(f"   example.com markup: {markup[:1500]!r}")
+        log(f"   read as: {doctext.html_to_text(markup)[0][:400]!r}")
         results = internet.search("Python Programmiersprache")
         log(f"   {len(results)} results, first: {results[0]['url'] if results else '-'}")
     except Exception as exc:  # noqa: BLE001 - a search engine may block CI addresses
