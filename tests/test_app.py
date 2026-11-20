@@ -3,6 +3,7 @@ import json
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from backend import app, db, runner
 from tests.helpers import Gate, HttpError, LowRAMTestCase, Text, wait_until
@@ -332,6 +333,51 @@ class LoopApiTests(AppTestCase):
         self.assertEqual(state["completed"], 1)
         self.assertEqual([t["status"] for t in db.list_tasks(pid)], ["done", "pending", "pending"])
         self.assertEqual(len(self.llm.requests), 1)
+
+    def test_progress_step_timeline_and_time_left(self):
+        """Percent over all steps, the running step, the time left and a timeline one can follow."""
+        pid = self.new_project("Einleitung schreiben\nBeispiele sammeln\nFazit")
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+        self.llm.push(Text("first"))
+        self.llm.push(Gate(gate, "second"))
+        with mock.patch.object(runner, "typical_task_seconds", return_value=None):
+            self.assertEqual(self.api("POST", f"/api/projects/{pid}/loop")[0], 202)
+
+        def current_position():
+            return (self.api("GET", "/api/loop")[1]["loop"].get("current") or {}).get("position")
+
+        self.assertTrue(wait_until(lambda: current_position() == 2))
+        loop = self.api("GET", "/api/loop")[1]["loop"]
+        self.assertEqual((loop["planned"], loop["current"]["title"], loop["estimate_basis"]),
+                         (3, "Beispiele sammeln", "this_run"))
+        self.assertIsNotNone(loop["eta_s"])
+        self.assertIsNotNone(loop["current_elapsed_s"])
+        self.assertTrue(33 <= loop["progress_percent"] < 67, loop["progress_percent"])
+        self.assertEqual([e["kind"] for e in loop["events"]], ["loop_start", "task_start", "task_done", "task_start"])
+        done = loop["events"][2]
+        self.assertEqual((done["position"], done["title"]), (1, "Einleitung schreiben"))
+        self.assertIsInstance(done["duration_s"], float)
+        gate.set()
+        state = self.wait_loop_done()
+        self.assertEqual((state["progress_percent"], state["current"], state["eta_s"]), (100, None, None))
+        self.assertEqual([e["kind"] for e in state["events"]],
+                         ["loop_start"] + ["task_start", "task_done"] * 3 + ["loop_end"])
+        self.assertEqual(state["events"][-1]["detail"], "queue_empty")
+
+    def test_first_estimate_comes_from_earlier_tasks(self):
+        pid = self.new_project("a\nb")
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+        self.llm.push(Gate(gate, "first"))
+        with mock.patch.object(runner, "typical_task_seconds", return_value=120.0):
+            self.assertEqual(self.api("POST", f"/api/projects/{pid}/loop")[0], 202)
+        self.assertTrue(wait_until(lambda: self.api("GET", "/api/loop")[1]["loop"].get("current")))
+        loop = self.api("GET", "/api/loop")[1]["loop"]
+        self.assertEqual((loop["estimate_basis"], loop["per_task_s"]), ("history", 120.0))
+        self.assertTrue(200 <= loop["eta_s"] <= 240, loop["eta_s"])  # ~1.0 step left of 2 x 120 s
+        gate.set()
+        self.wait_loop_done()
 
     def test_stop_when_idle_is_harmless(self):
         status, data = self.api("POST", "/api/loop/stop")

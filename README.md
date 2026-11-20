@@ -15,6 +15,9 @@ Built for Macs with little RAM (Apple Silicon), also runs on Windows and Linux.
 > Eigene Modelle per Hugging-Face-Link, Modelle auf externer Festplatte,
 > Bilder/Videos und mehrere Geräte im WLAN koppeln (wie Bluetooth: gleiche
 > 6-stellige Zahl auf beiden Bildschirmen, „Erlauben“ klicken).
+> Lange Arbeiten zeigen Prozent, ungefähre Restzeit, den aktuellen Schritt und
+> einen Verlauf mit Uhrzeiten – geschätzt aus dem, was dein Computer vorher
+> gemessen hat.
 > Schon eine lokale KI (Ollama, LM Studio, Jan, GPT4All …)? LowRAM AI findet
 > ihre Modelle und laufende KI-Programme selbst – direkt verwenden, ohne neuen
 > Download.
@@ -52,6 +55,7 @@ internet afterwards – only model/engine downloads you start yourself.
 | **Task queue** | One task per line; run one, or a bounded loop that stops by itself (queue empty, limit, failure, low RAM, no model, stop button). |
 | **Devices** | Let other computers on your Wi-Fi help with a project: they take tasks in parallel with their own local model, and the host combines the results. |
 | **Your models** | Pick from a curated catalog with RAM-based recommendations, paste any Hugging Face GGUF repo/link, or use a `.gguf` file you already have. |
+| **Progress you can follow** | Long work says how far it is and roughly how long it still takes: task loops and big jobs show "Schritt 2 von 4: …", percent, time left and a step history with times; the chat shows percent and time left while the model loads and while it reads a long message; planning a big job, images/videos and downloads show the time left. Estimates come from what this computer measured before ("Pi mal Daumen") and say so when something takes longer than usual. |
 | **Already have a local AI?** | LowRAM AI finds models that Ollama, LM Studio, Jan, GPT4All, llama.cpp or the Hugging Face cache already downloaded and uses them in place (nothing copied or deleted) – or chats directly through an AI program that is running (Ollama, LM Studio, Jan, Docker Model Runner, …), so no model sits in RAM twice. Only folders of these apps are read, only 127.0.0.1 is asked. |
 | **External drive** | Keep models on an external SSD; LowRAM AI runs them from there and says so clearly when the drive is unplugged. |
 | **Turbo for little RAM** | Compressed KV cache (q8_0), flash attention and prompt-cache reuse are switched on automatically when your llama.cpp supports them; the context size is derived from your free RAM; profiles *Automatisch / Sparsam / Schnell*. |

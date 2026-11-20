@@ -52,7 +52,7 @@ from urllib.parse import quote, unquote, urlencode, urlparse
 
 import psutil
 
-from . import artifacts, config, db, downloads, llm, settings, web
+from . import artifacts, config, db, downloads, llm, progress, settings, web
 from .web import HTTPError, Request, Response, route
 
 log = logging.getLogger("lowram.engine")
@@ -1979,6 +1979,18 @@ def _process_ended(proc: subprocess.Popen) -> bool:
         return False
 
 
+LOAD_GUESS_BASE_S = 10.0  # first load ever: start-up + warm-up …
+LOAD_GUESS_S_PER_GIB = 3.0  # … plus reading the weights
+
+
+def expected_load_seconds(entry: CatalogEntry) -> tuple[float, bool]:
+    """``(seconds, measured)``: how long loading ``entry`` takes – measured here before, else a rough guess."""
+    measured = progress.typical("model_load", entry.id)
+    if measured is not None:
+        return measured, True
+    return LOAD_GUESS_BASE_S + LOAD_GUESS_S_PER_GIB * _model_bytes(entry) / GIB, False
+
+
 def _exit_reason(code: int | None) -> str:
     if code is None:
         return "stopped"
@@ -2036,6 +2048,8 @@ class EngineManager:
         self._key: str | None = None
         self._shutting_down = False
         self._restart_times: list[float] = []  # automatic restarts within RESTART_WINDOW_S (monotonic)
+        self._load_started: float | None = None  # monotonic start of the current load
+        self._load_expected: tuple[float, bool] = (0.0, False)  # (seconds, measured on this computer)
         self._crash_locked = False  # restart limit reached: only a manual start may start it again
         self._last_use = time.monotonic()
         self._info = self._idle()
@@ -2064,8 +2078,15 @@ class EngineManager:
             self._on_exit(proc, gen, log_path(), was_ready=True)
 
     def snapshot(self) -> dict:
+        """The server state; while ``starting`` also ``load``: elapsed, expected, percent and time left."""
         with self._lock:
-            return dict(self._info)
+            info = dict(self._info)
+            started, (expected, measured) = self._load_started, self._load_expected
+        if info.get("state") == "starting" and started is not None:
+            elapsed = time.monotonic() - started
+            info["load"] = {"elapsed_s": round(elapsed, 1), "expected_s": round(expected, 1), "measured": measured,
+                            **progress.estimate(elapsed, expected)}
+        return info
 
     @property
     def paused(self) -> bool:
@@ -2159,7 +2180,9 @@ class EngineManager:
         finally:
             os.close(log_fd)
         lower_priority(proc.pid, LLAMA_NICE)
+        expected = expected_load_seconds(entry)
         with self._lock:
+            self._load_started, self._load_expected = time.monotonic(), expected
             self._gen += 1
             gen = self._gen
             self._proc = proc
@@ -2219,8 +2242,14 @@ class EngineManager:
             self._last_use = time.monotonic()  # the idle time counts from "ready", not from the launch
             config.set_runtime_llm_url(url)
             config.set_runtime_llm_api_key(self._key)
+            took = time.monotonic() - self._load_started if self._load_started is not None else None
+            loaded_id = self._info.get("model_id")
+            self._load_started = None
+            if took is not None and isinstance(loaded_id, str):
+                # the next estimate uses this computer's speed; under the lock, so stop() waits for the write
+                progress.remember("model_load", loaded_id, took)
             self._cond.notify_all()
-        log.info("llama-server is ready on port %s", port)
+        log.info("llama-server is ready on port %s%s", port, f" after {took:.1f} s" if took is not None else "")
         while True:
             try:
                 proc.wait(IDLE_CHECK_S)
@@ -2254,6 +2283,7 @@ class EngineManager:
                 delay = RESTART_BACKOFF_S[min(len(self._restart_times), len(RESTART_BACKOFF_S)) - 1]
                 restarts = int(self._info.get("restarts") or 0) + 1
                 self._info.update(state="starting", pid=None, port=None, error=None, restarts=restarts)
+                self._load_started = None  # no load progress until the new process is spawned
                 restart = (model_id, self._gen, delay, restarts)
             else:
                 head = f"llama-server {reason}."
@@ -2474,6 +2504,11 @@ def start(model_id: str | None = None, *, persist: bool = True, manual: bool = F
 
 def stop() -> dict:
     return _manager.stop()
+
+
+def load_progress() -> dict | None:
+    """While the built-in model loads: ``{elapsed_s, expected_s, measured, percent, eta_s, overdue}``."""
+    return _manager.snapshot().get("load")
 
 
 def ensure_running(timeout: float = HEALTH_TIMEOUT_S, model_id: str | None = None) -> str:

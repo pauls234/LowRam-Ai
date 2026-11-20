@@ -267,7 +267,7 @@ class RunLoopTests(LowRAMTestCase):
         pid = runner.create_project("p", "a\nb")
         seen = []
         runner.run_loop(pid, on_step=lambda o: seen.append(o["status"]))
-        self.assertEqual(seen, ["done", "done", "empty"])
+        self.assertEqual(seen, ["running", "done", "running", "done", "empty"])  # "running": a step was claimed
 
 
 if __name__ == "__main__":

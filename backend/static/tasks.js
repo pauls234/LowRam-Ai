@@ -210,14 +210,18 @@
     const failed = loop.failed || 0;
     const max = LR.isNum(loop.max_tasks) && loop.max_tasks > 0 ? loop.max_tasks : null;
     // Progress against what is actually left in the project (the limit is only a cap).
-    const left = project && project.counts && LR.isNum(project.counts.pending) ? project.counts.pending + (project.counts.running || 0) : null;
-    const planned = left !== null ? Math.min(max || Infinity, completed + failed + left) : max;
+    // the loop's own plan is exact; the project counts (refreshed less often) are the fallback
+    const left = LR.isNum(loop.planned) ? Math.max(0, loop.planned - completed - failed)
+      : project && project.counts && LR.isNum(project.counts.pending) ? project.counts.pending + (project.counts.running || 0) : null;
+    const planned = LR.isNum(loop.planned) ? loop.planned : left !== null ? Math.min(max || Infinity, completed + failed + left) : max;
     const bar = LR.progress({ label: LR.t('Loop progress') });
-    bar.set(planned ? Math.min(1, (completed + failed) / planned) : null, completed + LR.t(' done') + (planned ? LR.t(' of ') + planned : ''));
+    const pct = LR.isNum(loop.progress_percent) ? loop.progress_percent : null;
+    if (pct !== null) bar.set(Math.min(1, pct / 100), pct + ' %');
+    else bar.set(planned ? Math.min(1, (completed + failed) / planned) : null, completed + LR.t(' done') + (planned ? LR.t(' of ') + planned : ''));
     const parts = [completed + LR.t(' done')];
     if (failed) parts.push(failed + LR.t(' failed'));
     if (active && left !== null) parts.push(LR.t('{n} left', { n: left }));
-    if (max) parts.push(LR.t('limit ') + max);
+    if (max && !(planned && max >= planned)) parts.push(LR.t('limit ') + max);  // only when it really limits
     let tone = 'accent';
     let title = loop.stop_requested ? LR.t('Loop stopping…') : LR.t('Loop running');
     if (!active) {
@@ -244,13 +248,74 @@
         h('div', { class: 'loop-actions' }, actions),
       ]),
       bar.el,
-      loop.last_message
+      active ? stepInfo(loop, completed + failed) : null,
+      timeline(loop),
+      loop.last_message && !(active && loop.current && !isWaitMessage(loop.last_message))  // the step line says it
         ? (isWaitMessage(loop.last_message)
           ? h('p', { class: 'loop-msg is-info' }, [icon('clock'), h('span', { text: LR.str(loop.last_message) })])
           : h('p', { class: 'loop-msg', text: LR.str(loop.last_message) }))
         : null,
       !active && loop.stopped_because === 'on_battery' ? h('p', { class: 'loop-msg loop-hint' }, [LR.icon('bolt'), h('span', { text: LR.t('Plug in your Mac and run the loop again – or lower the battery limit in Models & Settings.') })]) : null,
     ].filter(Boolean));
+  }
+
+  /** "Schritt 2 von 3: …", how long this step runs and roughly how long everything still takes. */
+  function stepInfo(loop, finished) {
+    const total = LR.isNum(loop.planned) ? loop.planned : null;
+    const cur = loop.current;
+    const out = [];
+    if (cur) {
+      const title = LR.str(cur.title).split('\n')[0];
+      const label = total ? LR.t('Step {n} of {total}', { n: Math.min(finished + 1, total), total }) : LR.t('Step {n}', { n: finished + 1 });
+      out.push(h('p', { class: 'loop-step' }, [h('strong', { text: label + ': ' }), h('span', { text: title })]));
+    }
+    const facts = [];
+    if (LR.isNum(loop.progress_percent)) facts.push(Math.round(loop.progress_percent) + ' %');
+    if (cur && LR.isNum(loop.current_elapsed_s)) facts.push(LR.t('this step for {t}', { t: fmt.clock(loop.current_elapsed_s * 1000) }));
+    if (loop.current_overdue) facts.push(LR.t('takes longer than usual'));
+    if (LR.isNum(loop.eta_s)) facts.push(loop.eta_s > 0 ? LR.t('in total {eta}', { eta: fmt.eta(loop.eta_s) }) : LR.t('almost done'));
+    else if (!loop.estimate_basis) facts.push(LR.t('time left: estimated after the first step'));
+    if (loop.estimate_basis === 'history') facts.push(LR.t('estimate from earlier tasks'));
+    if (facts.length) out.push(h('p', { class: 'loop-eta' }, [icon('clock'), h('span', { text: facts.join(' · ') })]));
+    return out.length ? h('div', { class: 'loop-progress-info' }, out) : null;
+  }
+
+  /** The step history with times, newest first – so it is clear what took how long. */
+  function timeline(loop) {
+    const events = Array.isArray(loop.events) ? loop.events : [];
+    if (!events.length) return null;
+    const items = events.slice().reverse().map((e) => h('li', null, [
+      h('time', { class: 'mono', text: clockTime(e.at) }),
+      h('span', { text: eventText(e) }),
+    ]));
+    const box = h('details', { class: 'loop-history', open: st.timelineOpen ? true : null }, [
+      h('summary', { text: LR.t('Step history ({n})', { n: events.length }) }),
+      h('ol', { class: 'loop-timeline' }, items),
+    ]);
+    box.addEventListener('toggle', () => { st.timelineOpen = box.open; });
+    return box;
+  }
+
+  function clockTime(iso) {
+    const d = fmt.parseTime(iso);
+    return d ? d.toLocaleTimeString(document.documentElement.lang || [], { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : '';
+  }
+
+  function eventText(e) {
+    const title = e.title ? LR.str(e.title).split('\n')[0] : '';
+    const took = LR.isNum(e.duration_s) ? fmt.duration(e.duration_s) : '–';
+    switch (e.kind) {
+      case 'loop_start': return LR.isNum(e.count) ? LR.t('Started – {n} steps planned', { n: e.count }) : LR.t('Started');
+      case 'task_start': return LR.t('Step started: {title}', { title });
+      case 'task_done': return LR.t('Step finished after {t}: {title}', { t: took, title });
+      case 'task_failed': return LR.t('Step failed after {t}: {title}', { t: took, title }) + (e.detail ? ' – ' + LR.str(e.detail) : '');
+      case 'wait': return LR.t('Waiting: {reason}', { reason: LR.str(e.detail) });
+      case 'loop_end': {
+        const reason = STOP_REASONS[e.detail];
+        return LR.t('Loop finished') + (reason ? ': ' + reason[1] : '');
+      }
+      default: return LR.str(e.kind);
+    }
   }
 
   /* ------------------------------------------------------------ detail */
@@ -624,6 +689,7 @@
     const startBtn = LR.button({ text: LR.t('Start big job'), icon: 'play', variant: 'primary', type: 'submit', onclick: (ev) => { ev.preventDefault(); submit(); } });
     let busy = false;
     let stopTimer = null;
+    let planTimer = 0;
     async function submit() {
       if (busy) return;
       fGoal.setError('');
@@ -637,8 +703,21 @@
       busy = true;
       LR.setBusy(startBtn, true, LR.t('Planning…'));
       const elapsed = h('span', { class: 'run-elapsed' });
-      status.replaceChildren(h('p', { class: 'run-busy' }, [LR.spinner(), h('span', { text: LR.t('The model splits the job into subtasks – on small computers this can take a few minutes…') }), elapsed]));
+      const planBar = LR.progress({ label: LR.t('Planning progress') });
+      const planInfo = h('p', { class: 'run-eta muted small' });
+      status.replaceChildren(h('p', { class: 'run-busy' }, [LR.spinner(), h('span', { text: LR.t('The model splits the job into subtasks – on small computers this can take a few minutes…') }), elapsed]), planBar.el, planInfo);
       stopTimer = LR.elapsed(elapsed);
+      const t0 = Date.now();
+      let expected = null;
+      LR.get('/api/autosplit/estimate').then((d) => { expected = d && LR.isNum(d.expected_s) ? d.expected_s : null; }).catch(() => {});
+      const tick = () => {
+        const est = LR.estimate((Date.now() - t0) / 1000, expected);
+        planBar.set(LR.isNum(est.percent) ? est.percent / 100 : null);
+        planInfo.textContent = expected ? LR.progressText(est) : LR.t('No estimate yet – after this first big job LowRAM AI knows how long planning takes on this computer.');
+      };
+      tick();
+      window.clearInterval(planTimer);
+      planTimer = window.setInterval(tick, 1000);
       try {
         const body = { goal: text, percent: LR.budgetPercent(), max_tasks: n };
         if (helpers) body.distribute = helpers.checked;
@@ -658,6 +737,7 @@
         status.replaceChildren(LR.callout({ tone: err.status === 409 ? 'warn' : 'error', role: 'alert', title: LR.t('Could not start the big job'), text: err.message }));
       } finally {
         busy = false;
+        window.clearInterval(planTimer);
         if (stopTimer) stopTimer();
         if (startBtn.isConnected) LR.setBusy(startBtn, false);
       }

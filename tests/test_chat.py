@@ -686,11 +686,11 @@ class ManagedEngineStreamTests(ChatApiTestCase):
     def test_status_events_while_the_model_loads(self):
         cid = self.new_chat(mode="code")
         self.fake.push(Stream(["loaded and answering"]))
-        with mock.patch.object(chat, "STATUS_INTERVAL_S", 0.05):
+        with mock.patch.object(chat, "LOAD_STATUS_INTERVAL_S", 0.05):
             client = self.send(cid, "q" * 15000)
             self.assertEqual(client.status, 200)
             self.assertEqual([e["type"] for e in client.until("status")], ["start", "status"])
-            self.assertEqual(client.next(), {"type": "status", "text": chat.LOADING_TEXT})  # repeated
+            self.assertEqual(client.next(), {"type": "status", "text": chat.LOADING_TEXT, "phase": "load"})  # repeated
             self.assertEqual(self.fake.requests, [])
             self.loaded.set()
             events = client.rest()

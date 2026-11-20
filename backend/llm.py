@@ -618,8 +618,26 @@ def _first_token(response, outcome: dict) -> None:
         outcome["timeout"] = idle
 
 
+def prompt_progress(info: object) -> dict | None:
+    """llama-server's ``prompt_progress`` (``total``, ``cache``, ``processed``, ``time_ms``) as
+    ``{"total", "processed", "percent", "eta_s"}``; ``None`` for anything else."""
+    if not isinstance(info, dict):
+        return None
+    total, processed, cache, time_ms = (info.get(key) for key in ("total", "processed", "cache", "time_ms"))
+    if not all(isinstance(v, int) and not isinstance(v, bool) for v in (total, processed)) or total <= 0:
+        return None
+    processed = max(0, min(processed, total))
+    cache = cache if isinstance(cache, int) and not isinstance(cache, bool) and 0 <= cache <= processed else 0
+    eta = None
+    fresh = processed - cache  # cached tokens cost nothing; the rate comes from the ones really read
+    if isinstance(time_ms, (int, float)) and not isinstance(time_ms, bool) and time_ms > 0 and fresh > 0 \
+            and processed < total:
+        eta = round((total - processed) * (time_ms / 1000) / fresh, 1)
+    return {"total": total, "processed": processed, "percent": int(100 * processed / total), "eta_s": eta}
+
+
 def _stream_deltas(response, stop_event: threading.Event | None, api_key: str | None,
-                   outcome: dict) -> Iterator[str]:
+                   outcome: dict, on_progress: Callable[[dict], None] | None = None) -> Iterator[str]:
     """Text deltas of an OpenAI-style SSE stream; ``reasoning_content`` is wrapped in ``<think>``."""
     in_reasoning = False
     for name, value in _sse_fields(response, stop_event, outcome):
@@ -637,6 +655,15 @@ def _stream_deltas(response, stop_event: threading.Event | None, api_key: str | 
         if chunk.get("error"):
             raise _reported_error(chunk, api_key)
         _usage_tokens(chunk, outcome)
+        reading = prompt_progress(chunk.get("prompt_progress"))
+        if reading is not None:
+            if on_progress is not None:
+                try:
+                    on_progress(reading)
+                except Exception:  # a progress display must never break the answer
+                    log.debug("on_progress failed", exc_info=True)
+            if not isinstance(chunk.get("choices"), list):
+                continue  # a progress-only chunk
         choices = chunk.get("choices")
         if not isinstance(choices, list):
             raise LLMError(_NOT_OPENAI_STREAM)
@@ -683,6 +710,7 @@ def stream_chat(
     stop_event: threading.Event | None = None,
     stats: dict | None = None,
     idle_timeout: float | None = None,
+    on_progress: Callable[[dict], None] | None = None,
 ) -> Iterator[str]:
     """Stream a chat completion and yield the text deltas as they arrive.
 
@@ -701,6 +729,10 @@ def stream_chat(
     request runs longer than ``MAX_REQUEST_S`` (3 h) in total: then the
     connection is closed and a non-transient ``LLMError`` is raised.
 
+    ``on_progress`` (only for the built-in llama-server): asks it to report how far it has read the
+    prompt (``return_progress``) and is called with ``{"total", "processed", "percent", "eta_s"}``
+    while it does so – on a slow computer a long question can take minutes before the first word.
+
     ``stats`` (optional dict) is filled when the generator ends, also on
     stop or error: ``tokens`` (server-reported ``usage.completion_tokens`` if
     sent, else the number of text deltas), ``tokens_per_s`` (first delta to
@@ -717,6 +749,8 @@ def stream_chat(
         "stream": True,
         "stream_options": {"include_usage": True},
     }
+    if on_progress is not None:
+        payload["return_progress"] = True
     headers, api_key = _headers(parsed, "text/event-stream, application/json")
     if stop_event is not None and stop_event.is_set():
         return
@@ -751,7 +785,7 @@ def stream_chat(
                 visible.append(text)
                 yield text
         else:
-            for piece in _stream_deltas(response, stop_event, api_key, outcome):
+            for piece in _stream_deltas(response, stop_event, api_key, outcome, on_progress):
                 visible.append(piece)
                 yield piece
         if not outcome["complete"] and _past_limit(outcome):

@@ -1494,3 +1494,18 @@ a.kb-row:hover { background: var(--surface-2); }
 @media (max-width: 560px) {
   .found-row { flex-direction: column; align-items: stretch; }
 }
+
+/* ------------------------------------------------------------ progress: steps, time left, history */
+.loop-progress-info { display: grid; gap: 2px; margin-top: 8px; }
+.loop-step { margin: 0; font-size: 14px; overflow-wrap: anywhere; }
+.loop-eta { margin: 0; display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text-2); }
+.loop-eta .icon { width: 14px; height: 14px; flex: none; }
+.loop-history { margin-top: 8px; font-size: 13px; }
+.loop-history summary { cursor: pointer; color: var(--text-2); }
+.loop-timeline { list-style: none; margin: 6px 0 0; padding: 0; display: grid; gap: 4px; max-height: 240px; overflow-y: auto; }
+.loop-timeline li { display: flex; gap: 10px; align-items: baseline; overflow-wrap: anywhere; }
+.loop-timeline time { flex: none; font-size: 12px; color: var(--text-3); }
+.msg-wait { flex-wrap: wrap; }
+.msg-wait .wait-progress { flex: 1 1 100%; max-width: 360px; }
+.run-eta { margin: 6px 0 0; }
+.step-eta { color: var(--text-2); }

@@ -28,6 +28,21 @@ class AutosplitApiTests(AppTestCase):
     def final_ready(self, pid):
         return wait_until(lambda: self.api("GET", f"/api/cluster/projects/{pid}/final")[0] == 200, 20)
 
+    def test_planning_time_is_measured_for_the_next_estimate(self):
+        self.assertEqual(self.api("GET", "/api/autosplit/estimate"), (200, {"expected_s": None}))
+        self.llm.push(Text('{"tasks": ["Teil A", "Teil B"]}'))
+        # without the devices module: no merge keeps running in the background after this test
+        with mock.patch.object(autosplit, "_cluster", return_value=None):
+            status, data = self.split(max_tasks=3, percent=40)
+        self.assertEqual(status, 202, data)
+        status, estimate = self.api("GET", "/api/autosplit/estimate")
+        self.assertEqual(status, 200)
+        self.assertIsInstance(estimate["expected_s"], float)
+        self.assertGreater(estimate["expected_s"], 0)
+        pid = data["project"]["id"]
+        self.assertTrue(wait_until(lambda: db.get_project(pid)["counts"]["done"] == 2, 15))
+        self.wait_loop_done()  # no loop thread may outlive the test
+
     def test_split_creates_project_merges_and_runs(self):
         self.llm.push(Text(PLAN))  # tasks and merge get the default answer
         status, data = self.split(max_tasks=3, distribute=True, percent=40)

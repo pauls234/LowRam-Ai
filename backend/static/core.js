@@ -478,6 +478,23 @@
   };
 
   /** Determinate/indeterminate progress bar; value is a fraction 0..1 or null. */
+  /** Like backend/progress.estimate: percent and time left for work that usually takes `expected` s. */
+  LR.estimate = function (elapsed, expected) {
+    if (!isNum(expected) || expected <= 0) return { percent: null, eta_s: null, overdue: false };
+    if (elapsed > expected * 1.15) return { percent: 95, eta_s: null, overdue: true };
+    return { percent: Math.min(95, Math.floor((100 * elapsed) / expected)), eta_s: Math.max(1, expected - elapsed), overdue: false };
+  };
+
+  /** "40 % · noch etwa 12 s" or "95 % · dauert länger als üblich" for { percent, eta_s, overdue }. */
+  LR.progressText = function (info) {
+    if (!info) return '';
+    const parts = [];
+    if (isNum(info.percent)) parts.push(Math.round(info.percent) + ' %');
+    if (info.overdue) parts.push(LR.t('takes longer than usual'));
+    else if (isNum(info.eta_s) && info.eta_s > 0) parts.push(fmt.eta(info.eta_s));
+    return parts.join(' · ');
+  };
+
   LR.progress = function (opts) {
     const o = opts || {};
     const fill = h('span', { class: 'progress-fill' });

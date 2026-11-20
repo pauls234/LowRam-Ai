@@ -1343,6 +1343,23 @@ class SupervisorAndIdleTests(EngineTestCase):
                     self.assertIn("SIGKILL", engine._manager.snapshot()["error"])
         mgr._gen += 1  # forget the scheduled (mocked) restart
 
+    def test_load_progress_is_measured_and_reused(self):
+        """While loading: percent and time left; the measured time is the next estimate."""
+        from backend import progress
+        engine.start(SMALL)
+        snap = engine._manager.snapshot()
+        self.assertEqual(snap["state"], "starting")
+        load = snap["load"]
+        self.assertFalse(load["measured"])  # first load ever: a guess from the model size
+        self.assertGreaterEqual(load["expected_s"], engine.LOAD_GUESS_BASE_S)
+        self.assertIsInstance(load["percent"], int)
+        self.assertIsNotNone(load["eta_s"])
+        self.wait_state("ready")
+        self.assertNotIn("load", engine._manager.snapshot())
+        measured = progress.typical("model_load", SMALL)
+        self.assertIsNotNone(measured)
+        self.assertEqual(engine.expected_load_seconds(engine.get_entry(SMALL)), (measured, True))
+
     def test_idle_model_is_unloaded_and_loaded_again_on_demand(self):
         settings.update("resilience", {"idle_unload_minutes": 0.01})  # 0.6 s
         engine.ensure_running(timeout=15)

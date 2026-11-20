@@ -520,7 +520,7 @@ class RamGuardTests(LowRAMTestCase):
 
         def on_step(outcome):
             seen.append((outcome["status"], outcome["reason"]))
-            if outcome["status"] == "done" and len(seen) == 1:
+            if outcome["status"] == "done" and [status for status, _ in seen].count("done") == 1:
                 self.ram_mib = 100
                 self.recover_after(0.2)
 

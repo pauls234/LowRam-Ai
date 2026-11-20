@@ -33,7 +33,7 @@ from http import HTTPStatus
 from pathlib import Path
 from typing import Any
 
-from . import agent, artifacts, config, db, llm, memory, runner, settings, web
+from . import agent, artifacts, config, db, llm, memory, progress, runner, settings, web
 from .web import HTTPError, Request, Response, route
 
 log = logging.getLogger("lowram.autosplit")
@@ -362,6 +362,21 @@ def on_app_shutdown(server: Any) -> None:
 # --------------------------------------------------------------------------- route
 
 
+def _plan_key() -> str:
+    """Planning speed depends on the model: the chosen local server's or the built-in one's."""
+    server = config.local_server()
+    if server:
+        return f"{server['name']}/{server['model']}"[:120]
+    model = settings.get("engine", "model_id")
+    return model if isinstance(model, str) and model else config.llm_model()
+
+
+@route("GET", r"/api/autosplit/estimate")
+def get_estimate(req: Request) -> Response:
+    """How long splitting a big job took on this computer before (``null`` before the first time)."""
+    return Response({"expected_s": progress.typical("autosplit_plan", _plan_key())})
+
+
 @route("POST", r"/api/autosplit")
 def post_autosplit(req: Request) -> Response:
     data = req.json()
@@ -378,7 +393,9 @@ def post_autosplit(req: Request) -> Response:
     plan = memory.plan(percent)
     if not plan.can_run:
         raise HTTPError(HTTPStatus.CONFLICT, plan.reason)
+    planning = time.monotonic()
     tasks, raw = plan_tasks(goal, max_tasks, plan)
+    progress.remember("autosplit_plan", _plan_key(), time.monotonic() - planning)
     project_id = create_project(goal, tasks, raw)
     started = launch(req.server, project_id, percent, distribute)
     return Response(

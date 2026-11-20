@@ -84,11 +84,12 @@ QUEUE_POLL_S = 0.2
 STOP_GRACE_S = 3.0
 WORKER_JOIN_S = 2.0
 ENGINE_START_TIMEOUT_S = 300.0
-STATUS_INTERVAL_S = 5.0
+LOAD_STATUS_INTERVAL_S = 1.0  # percent and time left while the model loads: once a second
 CHARS_PER_TOKEN = 2.5  # conservative: code and non-English text pack fewer characters per token
 CTX_RESERVE_TOKENS = 256  # chat-template markup and safety margin
 MIN_CONTEXT_CHARS = 1000
 LOADING_TEXT = "Loading the model… (first answer after a start can take a minute)"
+READING_TEXT = "Reading your message…"
 
 NO_MODEL_MESSAGE = "No model is running. Open Models to install and start one."
 OMITTED_NOTE = "[Earlier messages of this conversation were left out to fit the memory budget.]"
@@ -1212,14 +1213,22 @@ class _Answer:
                     self.loading = False
             if self.memory is not None and not self.stop_event.is_set():
                 self._remember()
+            managed = _managed_engine() is not None  # only llama-server reports how far it has read
             for piece in llm.stream_chat(
                 self.messages, max_tokens=self.max_tokens, temperature=self.temperature,
                 url=self.url, stop_event=self.stop_event, stats=self.stats,
+                on_progress=self._reading if managed else None,
             ):
                 self.queue.put(("text", piece))
             self.queue.put(("end", None))
         except Exception as exc:  # handed to the HTTP thread, reported to the user there
             self.queue.put(("error", exc))
+
+    def _reading(self, info: dict) -> None:
+        """Prompt-reading progress of llama-server, shown until the first word arrives."""
+        if info.get("percent", 0) < 100:
+            self.queue.put(("status", {"text": READING_TEXT, "phase": "prompt", "percent": info.get("percent"),
+                                       "eta_s": info.get("eta_s")}))
 
     def _remember(self) -> None:
         """Fold older turns into the chat summary, inside the inference slot this answer
@@ -1357,6 +1366,20 @@ class _Answer:
                 del _ACTIVE[self.chat_id]
 
 
+def _loading_event() -> dict:
+    """The "loading the model" status, with percent and time left when the engine can estimate them."""
+    event: dict = {"type": "status", "text": LOADING_TEXT, "phase": "load"}
+    engine = _managed_engine()
+    try:
+        load = engine.load_progress() if engine is not None and hasattr(engine, "load_progress") else None
+    except Exception:  # the estimate is optional
+        log.debug("No load progress", exc_info=True)
+        load = None
+    if isinstance(load, dict):
+        event.update({key: load.get(key) for key in ("percent", "eta_s", "overdue", "measured")})
+    return event
+
+
 def _pump(answer: _Answer) -> Iterator[dict]:
     """Forward the worker's text as events. Returns ``(status, error)``."""
     answer.start_worker()
@@ -1364,7 +1387,7 @@ def _pump(answer: _Answer) -> Iterator[dict]:
     last_event = last_status = time.monotonic()
     stop_seen: float | None = None
     if answer.wait is not None:  # the managed model is still starting / loading
-        yield {"type": "status", "text": LOADING_TEXT}
+        yield _loading_event()
     while True:
         try:
             kind, value = answer.queue.get(timeout=QUEUE_POLL_S)
@@ -1375,16 +1398,16 @@ def _pump(answer: _Answer) -> Iterator[dict]:
                 if now - stop_seen >= STOP_GRACE_S:
                     log.info("Chat #%s: model connection did not close in time; stopping anyway", answer.chat_id)
                     break
-            if answer.loading and now - last_status >= STATUS_INTERVAL_S:
+            if answer.loading and now - last_status >= LOAD_STATUS_INTERVAL_S:
                 last_status = last_event = now
-                yield {"type": "status", "text": LOADING_TEXT}
+                yield _loading_event()
             elif now - last_event >= PING_INTERVAL_S:
                 last_event = now
                 yield {"type": "ping"}
             continue
         if kind == "status":
             last_event = time.monotonic()
-            yield {"type": "status", "text": value}
+            yield {"type": "status", **value} if isinstance(value, dict) else {"type": "status", "text": value}
             continue
         if kind == "error":
             if answer.stop_event.is_set():
