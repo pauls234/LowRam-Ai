@@ -92,7 +92,7 @@ from typing import Any
 
 import psutil
 
-from . import artifacts, config, db, llm, memory, power, runner, settings, web
+from . import artifacts, config, db, llm, memory, power, progress, runner, settings, web
 from .web import HTTPError, Request, Response, route
 
 log = logging.getLogger("lowram.cluster")
@@ -1688,6 +1688,7 @@ def distributed_projects() -> list[dict]:
             "merge": bool(row["merge"]),
             "merge_state": row["merge_state"],
             "merge_error": row["merge_error"],
+            "merge_progress": merge_progress(row["project_id"]) if row["merge_state"] == "running" else None,
             "final_available": row["merge_state"] == "done" and bool(row["final_path"]),
             "counts": project["counts"],
             "total": project["total"],
@@ -1740,6 +1741,39 @@ def _merge_prompt(project: dict, done: list[dict], failed: list[dict], budget: i
     return "\n\n---\n\n".join(parts), info
 
 
+_merges_lock = threading.Lock()
+_merges_running: dict[int, float] = {}  # project id -> time.monotonic() when combining started (this process)
+
+
+def _merge_key() -> str:
+    """Combining speed depends on the model: the chosen local server's or the built-in one's."""
+    server = config.local_server()
+    if server:
+        return f"{server['name']}/{server['model']}"[:120]
+    model = settings.get("engine", "model_id")
+    return model if isinstance(model, str) and model else config.llm_model()
+
+
+def merge_expected_seconds(project_id: int) -> float | None:
+    """How long combining this project's results probably takes – ``None`` if it is not combined (or never measured)."""
+    row = _distributed_row(project_id)
+    if not row or not row["merge"] or row["merge_state"] not in ("waiting", "running"):
+        return None
+    return progress.typical("merge", _merge_key())
+
+
+def merge_progress(project_id: int) -> dict | None:
+    """``{elapsed_s, expected_s, measured, percent, eta_s, overdue}`` while the results are being combined."""
+    with _merges_lock:
+        started = _merges_running.get(project_id)
+    if started is None:
+        return None
+    elapsed = time.monotonic() - started
+    expected = progress.typical("merge", _merge_key())
+    return {"elapsed_s": round(elapsed, 1), "expected_s": expected, "measured": expected is not None,
+            **progress.estimate(elapsed, expected)}
+
+
 def run_merge(project_id: int) -> dict:
     """Combine all task results of a finished distributed project into ``final.md``.
 
@@ -1766,8 +1800,11 @@ def run_merge(project_id: int) -> dict:
     started = time.monotonic()
     try:
         with db.inference_slot(f"combining the results of project #{project_id}"):
-            _set_merge_state(project_id, "running")
+            key, merge_started = _merge_key(), time.monotonic()
+            with _merges_lock:  # registered before "running" is visible: the progress is never missing
+                _merges_running[project_id] = merge_started
             try:
+                _set_merge_state(project_id, "running")
                 prompt, info = _merge_prompt(project, done, failed, mem.context_chars)
                 url = local_llm_url()
                 answer = llm.chat(
@@ -1803,6 +1840,10 @@ def run_merge(project_id: int) -> dict:
                 log.warning("Merging project #%s failed: %s", project_id, message)
                 _set_merge_state(project_id, "failed", error=message)
                 return {"status": "failed", "error": message}
+            finally:
+                with _merges_lock:
+                    _merges_running.pop(project_id, None)
+            progress.remember("merge", key, time.monotonic() - merge_started)  # the next estimate learns from it
     except db.Busy as exc:
         _set_merge_state(project_id, "waiting", error=None)
         return {"status": "waiting", "reason": str(exc)}

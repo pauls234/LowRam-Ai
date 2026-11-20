@@ -58,7 +58,15 @@
 
   const collectionName = (c) => LR.str(c && c.name, t('Untitled'));
 
+  const DOCUMENT_EXT = /\.(pdf|docx|odt|pptx|xlsx|epub|rtf)$/i;
+
   async function readFile(file) {
+    if (DOCUMENT_EXT.test(file.name)) {  // PDF, Word & co.: their text is read on this computer
+      const data = await LR.upload('/api/documents/uploads?text=1', file);
+      const text = LR.str(data.upload && data.upload.text);
+      if (new TextEncoder().encode(text).length > MAX_BYTES) throw new Error(t('The text of {name} is longer than 2 MB – split the document first.', { name: file.name }));
+      return text;
+    }
     if (file.size > MAX_BYTES) throw new Error(t('{name} is larger than 2 MB.', { name: file.name }));
     if (BINARY_EXT.test(file.name) || /^(image|audio|video)\//.test(file.type) || /pdf|zip|octet-stream/.test(file.type)) {
       throw new Error(t('{name} is not a text file.', { name: file.name }));
@@ -152,7 +160,7 @@
 
     // add documents: file picker + drag & drop
     const fileInput = h('input', { type: 'file', multiple: true, class: 'visually-hidden', tabindex: '-1', 'aria-hidden': 'true',
-      accept: '.txt,.md,.markdown,.rst,.csv,.tsv,.json,.yaml,.yml,.toml,.ini,.xml,.html,.css,.js,.mjs,.ts,.tsx,.jsx,.py,.rb,.go,.rs,.java,.kt,.swift,.c,.h,.cpp,.hpp,.cs,.php,.sh,.sql,.log,text/*' });
+      accept: '.pdf,.docx,.odt,.pptx,.xlsx,.epub,.rtf,.txt,.md,.markdown,.rst,.csv,.tsv,.json,.yaml,.yml,.toml,.ini,.xml,.html,.css,.js,.mjs,.ts,.tsx,.jsx,.py,.rb,.go,.rs,.java,.kt,.swift,.c,.h,.cpp,.hpp,.cs,.php,.sh,.sql,.log,text/*' });
     const status = h('p', { class: 'kb-status', role: 'status', 'aria-live': 'polite' });
     const pickBtn = LR.button({ text: t('Choose files…'), icon: 'file', variant: 'secondary', onclick: () => fileInput.click() });
     const drop = h('div', { class: 'kb-drop' }, [

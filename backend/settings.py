@@ -57,6 +57,10 @@ DEFAULTS: dict[str, Any] = {
     "chat": {
         "instructions": "",  # custom instructions added to every conversation (max 4000 chars)
     },
+    "internet": {
+        "enabled": True,  # the chat's "Internet" switch and reading links may be used at all
+        "searx_url": "",  # optional own SearXNG instance instead of DuckDuckGo (JSON API)
+    },
     "power": {
         "keep_awake": True,  # keep the Mac awake while long jobs run (caffeinate)
         "battery_min_percent": 20,  # on battery below this, long jobs pause (0 = never pause)

@@ -9,7 +9,7 @@
   const h = LR.h;
   const icon = LR.icon;
   const fmt = LR.fmt;
-  const FEATURE_OF = { chat: 'chat', code: 'api_coding', media: 'media', devices: 'cluster' };
+  const FEATURE_OF = { chat: 'chat', code: 'api_coding', media: 'media', devices: 'cluster', documents: 'documents', skills: 'skills' };
   const app = { route: null, params: [], mounted: new Map(), drawer: false, tokenRejected: false, startupDismissed: false, retryAt: 0 };
   LR.currentRoute = () => app.route;
 

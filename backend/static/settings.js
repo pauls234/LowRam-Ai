@@ -850,6 +850,26 @@
     }
   }
 
+  /* ------------------------------------------------------------ internet (v0.6) */
+
+  function buildInternet() {
+    const sec = section(LR.t('Internet'), LR.t('The AI only goes online when you switch on “Internet” in the chat or add a web page as a document.'));
+    sec.el.hidden = !(LR.state.settings && LR.state.settings.internet);
+    const cfg = () => (LR.state.settings && LR.state.settings.internet) || {};
+    const searx = h('input', { class: 'input', type: 'url', placeholder: 'https://searx.example.org', value: LR.str(cfg().searx_url) });
+    searx.addEventListener('change', () => saveSetting('internet', { searx_url: searx.value.trim() }, searx.value.trim() ? LR.t('Own search engine saved') : LR.t('DuckDuckGo is used again')));
+    sec.body.append(
+      LR.switchRow({
+        label: LR.t('Allow the internet'),
+        description: LR.t('Shows the “Internet” switch in the chat. Only public web pages are read – never devices in your home network – and nothing about you is sent along.'),
+        checked: cfg().enabled !== false,
+        onChange: (on, input) => saveSetting('internet', { enabled: on }, on ? LR.t('Internet allowed') : LR.t('Internet switched off')).then((ok) => { if (!ok) input.checked = !on; }),
+      }).el,
+      LR.field({ label: LR.t('Own SearXNG search (optional)'), control: searx, optional: true, hint: LR.t('Instead of DuckDuckGo: the address of your own SearXNG instance (its JSON output must be allowed).') }).el,
+    );
+    return sec.el;
+  }
+
   /* ------------------------------------------------------------ MacBook & power (v0.3.2) */
 
   let powerSupported = null;
@@ -1293,7 +1313,7 @@
     storage.hidden = true;
     const perf = buildPerf();
     perf.hidden = true;
-    page.append(head, ui.engine.el, perf, ui.models.el, ui.foundSlot, own, ui.downloads.el, storage, buildMemory(), buildResilience(), buildInstructions(), buildPrefs(), buildPower(), ui.about.el);
+    page.append(head, ui.engine.el, perf, ui.models.el, ui.foundSlot, own, ui.downloads.el, storage, buildMemory(), buildResilience(), buildInstructions(), buildPrefs(), buildInternet(), buildPower(), ui.about.el);
     root.append(page);
     return root;
   }

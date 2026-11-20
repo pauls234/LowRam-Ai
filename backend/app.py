@@ -34,7 +34,7 @@ from .web import FileResponse, HTTPError, StreamResponse
 # Feature modules register their routes/hooks on import. A module that does not
 # exist yet (built in parallel) is skipped; any other import error is raised.
 FEATURE_MODULES = ("api_coding", "chat", "engine", "localai", "media", "cluster", "power", "diagnostics", "knowledge",
-                   "autosplit")
+                   "autosplit", "documents", "skills", "internet")
 LOADED_FEATURES: list[str] = []
 for _name in FEATURE_MODULES:
     try:
@@ -119,7 +119,29 @@ class LoopController:
             state["current"] = dict(self._state["current"]) if self._state["current"] else None
             durations, prior, current_mono = list(self._durations), self._prior, self._current_mono
         state.update(self._estimate(state, durations, prior, current_mono))
+        self._include_merge(state)
         return state
+
+    @staticmethod
+    def _include_merge(state: dict) -> None:
+        """A big job ends with combining the results: count it into percent and time left ("bis komplett fertig")."""
+        if not state["active"]:
+            return
+        cluster = sys.modules.get(f"{__package__}.cluster")  # an optional feature module
+        try:
+            merge = cluster.merge_expected_seconds(int(state["project_id"])) if cluster else None
+        except Exception:  # an estimate is optional
+            log.debug("No combining estimate", exc_info=True)
+            merge = None
+        if not merge:
+            return
+        state["merge_expected_s"] = round(merge)
+        if state.get("eta_s") is not None:
+            state["eta_s"] = round(state["eta_s"] + merge)
+        per_task, planned = state.get("per_task_s"), state.get("planned")
+        if per_task and planned and state.get("progress_percent") is not None:
+            share = planned * per_task / (planned * per_task + merge)
+            state["progress_percent"] = min(99, int(state["progress_percent"] * share))
 
     @staticmethod
     def _estimate(state: dict, durations: list[float], prior: float | None, current_mono: float | None) -> dict:

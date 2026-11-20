@@ -8,7 +8,7 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest import mock
 
-from backend import chat, config, llm, progress
+from backend import app, chat, cluster, config, llm, progress
 from tests.helpers import LowRAMTestCase
 
 
@@ -56,6 +56,38 @@ class MemoryTests(LowRAMTestCase):
         stored = json.loads((config.home_dir() / progress.FILE_NAME).read_text())
         self.assertEqual(len(stored), progress.MAX_KEYS)
         self.assertIn(f"k:{progress.MAX_KEYS + 19}", stored)  # the newest survive
+
+
+class CombiningEstimateTests(unittest.TestCase):
+    """A big job is "komplett fertig" only after its results are combined: the loop counts that in."""
+
+    def state(self, **extra):
+        return {"active": True, "project_id": 7, "eta_s": 120, "per_task_s": 60.0, "planned": 2,
+                "progress_percent": 50, **extra}
+
+    def test_time_left_and_percent_include_combining(self):
+        state = self.state()
+        with mock.patch.object(cluster, "merge_expected_seconds", return_value=60.0) as expected:
+            app.LoopController._include_merge(state)
+        expected.assert_called_once_with(7)
+        # half of the steps done = 50 % × 120 s / (120 s + 60 s) of everything
+        self.assertEqual((state["merge_expected_s"], state["eta_s"], state["progress_percent"]), (60, 180, 33))
+
+    def test_nothing_changes_without_combining(self):
+        for merge in (None, 0.0, RuntimeError("db gone")):
+            state = self.state()
+            kwargs = {"side_effect": merge} if isinstance(merge, Exception) else {"return_value": merge}
+            with mock.patch.object(cluster, "merge_expected_seconds", **kwargs):
+                app.LoopController._include_merge(state)
+            self.assertEqual(state, self.state())
+        state = self.state(active=False)
+        with mock.patch.object(cluster, "merge_expected_seconds", return_value=60.0) as expected:
+            app.LoopController._include_merge(state)
+        expected.assert_not_called()
+        state = self.state(eta_s=None, per_task_s=None)  # no estimate yet: only the expectation is shown
+        with mock.patch.object(cluster, "merge_expected_seconds", return_value=60.0):
+            app.LoopController._include_merge(state)
+        self.assertEqual((state["merge_expected_s"], state["eta_s"], state["progress_percent"]), (60, None, 50))
 
 
 # --------------------------------------------------------------------------- reading the prompt (llama-server)

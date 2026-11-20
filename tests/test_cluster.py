@@ -15,7 +15,7 @@ from collections import namedtuple
 from contextlib import redirect_stderr
 from unittest import mock
 
-from backend import artifacts, cluster, db, settings, worker
+from backend import artifacts, cluster, db, progress, settings, worker
 from tests.cluster_helpers import ClusterTestCase, free_udp_port, null_slot, requires_openssl, result_meta
 from tests.helpers import Gate, HttpError, LowRAMTestCase, Text, closed_port_url, wait_until
 
@@ -488,6 +488,28 @@ class MergeTests(ClusterTestCase):
         self.assertIn("task 2", prompt)
         project = self.api("GET", "/api/cluster")[1]["projects"][0]
         self.assertEqual((project["merge_state"], project["final_available"]), ("done", True))
+
+    def test_combining_shows_progress_and_is_remembered(self):
+        """The last step of a big job: percent and time left while combining; the duration is learned."""
+        pid = self.new_project(1)
+        cluster.distribute(pid, 40, merge=True)
+        key = cluster._merge_key()
+        self.assertIsNone(cluster.merge_expected_seconds(pid))  # never measured on this computer
+        progress.remember("merge", key, 30)
+        self.assertEqual(cluster.merge_expected_seconds(pid), 30.0)
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+        self.llm.push(Gate(gate, "COMBINED"))
+        self.finish_all(pid)
+        self.wait(lambda: self.api("GET", "/api/cluster")[1]["projects"][0]["merge_state"] == "running")
+        info = self.api("GET", "/api/cluster")[1]["projects"][0]["merge_progress"]
+        self.assertEqual((info["expected_s"], info["measured"], info["overdue"]), (30.0, True, False))
+        self.assertTrue(0 <= info["percent"] <= 95 and info["eta_s"] > 0, info)
+        gate.set()
+        self.wait(lambda: self.final(pid)[0] == 200)
+        self.assertIsNone(self.api("GET", "/api/cluster")[1]["projects"][0]["merge_progress"])
+        self.assertIsNone(cluster.merge_expected_seconds(pid))  # combined: nothing is left to wait for
+        self.assertLess(progress.typical("merge", key), 30)  # the median now includes this quick run
 
     def test_merge_failure_is_reported_and_can_be_retried(self):
         pid = self.new_project(1)

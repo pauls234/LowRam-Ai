@@ -1115,4 +1115,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    import multiprocessing
+
+    multiprocessing.freeze_support()  # the app reads PDFs in a child process (backend/doctext.py)
     raise SystemExit(main())

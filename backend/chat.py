@@ -326,6 +326,18 @@ def clean_instructions(value: object) -> str:
     return text
 
 
+def instructions_with_skill(skill: object = None) -> str:
+    """The custom instructions plus the chosen skill's working instructions (resolved here, never sent)."""
+    base = current_instructions()
+    if skill in (None, ""):
+        return base
+    from . import skills  # lazy: optional module
+
+    chosen = skills.enabled_skill(skill)
+    part = f"Skill „{chosen['name']}“ – arbeite für diese Antwort so:\n{chosen['instructions']}"
+    return f"{base}\n\n{part}" if base else part
+
+
 def current_instructions() -> str:
     """``settings.chat.instructions`` cleaned; an over-long value (generic settings API) is truncated."""
     try:
@@ -1163,7 +1175,8 @@ class _Answer:
     def __init__(self, *, chat: dict, user_message: dict | None, assistant_message: dict, messages: list[dict],
                  max_tokens: int, temperature: float, url: str | None, slot: ExitStack,
                  wait=None, action: str = "message", extra: dict | None = None, restore: dict | None = None,
-                 memory: dict | None = None, replaces: int | None = None, previous: dict | None = None) -> None:
+                 memory: dict | None = None, replaces: int | None = None, previous: dict | None = None,
+                 web: dict | None = None) -> None:
         self.chat_id = int(chat["id"])
         self.chat = chat
         self.user_message = user_message
@@ -1178,6 +1191,7 @@ class _Answer:
         self.extra = extra or {}
         self.restore = restore
         self.memory = memory  # summarisation job from _with_memory, run before the answer
+        self.web = web  # internet research (the user switched "Internet" on), run before the answer
         self.replaces = replaces
         self.previous = previous
         self.kept_previous = False
@@ -1211,6 +1225,8 @@ class _Answer:
                     raise llm.LLMError(f"The model could not be loaded: {exc}") from exc
                 finally:
                     self.loading = False
+            if self.web is not None and not self.stop_event.is_set():
+                self._research()
             if self.memory is not None and not self.stop_event.is_set():
                 self._remember()
             managed = _managed_engine() is not None  # only llama-server reports how far it has read
@@ -1229,6 +1245,33 @@ class _Answer:
         if info.get("percent", 0) < 100:
             self.queue.put(("status", {"text": READING_TEXT, "phase": "prompt", "percent": info.get("percent"),
                                        "eta_s": info.get("eta_s")}))
+
+    def _research(self) -> None:
+        """Search the web / read the user's links, put the pages into the prompt and keep them as sources.
+        A failure is told to the model (it says so in the answer) – never a broken answer."""
+        from . import internet
+
+        job, self.web = self.web, None
+        try:
+            block, sources = internet.research(job["query"], job["budget"],
+                                               on_progress=lambda info: self.queue.put(("status", info)))
+        except Exception as exc:  # no connection, search blocked, …
+            reason = str(exc) if isinstance(exc, internet.InternetError) else type(exc).__name__
+            log.info("Chat #%s: web research failed: %s", self.chat_id, reason)
+            self.queue.put(("status", {"text": f"Internet: {reason}", "phase": "web"}))
+            block, sources = internet.FAILED_HEADER.format(reason=reason), []
+        if self.stop_event.is_set():
+            return
+        self.messages, self.memory = job["rebuild"](block)
+        if sources:
+            stored = job["sources"] + sources
+            self.assistant = {**self.assistant, "sources": stored}  # the final message shows them right away
+            try:
+                with _connect() as conn:
+                    conn.execute("UPDATE messages SET sources = ? WHERE id = ?",
+                                 (json.dumps(stored, ensure_ascii=False), self.assistant_id))
+            except sqlite3.Error:
+                log.warning("Chat #%s: the web sources could not be stored", self.chat_id, exc_info=True)
 
     def _remember(self) -> None:
         """Fold older turns into the chat summary, inside the inference slot this answer
@@ -1544,8 +1587,23 @@ def _settle_unstarted(fields: dict, error: str) -> None:
         log.exception("Could not settle the unstarted answer #%s", message_id)
 
 
+def _web_requested(web: object) -> bool:
+    """``web: true`` in the request: only when the internet is allowed in the settings (403 otherwise)."""
+    if web is not True:
+        return False
+    from . import internet
+
+    internet.check_allowed()
+    return True
+
+
+def _web_job(query: str, sources: list[dict], budget: int, rebuild) -> dict:
+    """What :meth:`_Answer._research` needs: the question, room for the pages, how to rebuild the prompt."""
+    return {"query": query, "sources": list(sources), "budget": max(1500, budget // 3), "rebuild": rebuild}
+
+
 def start_answer(chat_id: int, content: object, percent: object = None, attachments: object = None,
-                 collection_id: object = None) -> ChatStream:
+                 collection_id: object = None, skill: object = None, web: object = False) -> ChatStream:
     """Validate, take the inference slot, store the turn and return the event stream.
 
     Raises ``ValueError`` (400), ``db.NotFound`` (404), ``db.Busy`` or
@@ -1554,24 +1612,35 @@ def start_answer(chat_id: int, content: object, percent: object = None, attachme
     files = validate_attachments(attachments)
     text = validate_content(content, allow_empty=bool(files))
     collection = validate_collection_id(collection_id)
+    instructions = instructions_with_skill(skill)  # an unknown or switched-off skill: 400 before anything starts
+    use_web = _web_requested(web)
 
     def prepare(mode: str, budget: int, endpoint: dict) -> dict:
         history = _recent_messages(chat_id, budget)
         block, sources = _knowledge_sources(collection, text, budget)
         messages, job = _with_memory(
-            chat_id, mode, history, text, budget, attachments=files, instructions=current_instructions(),
+            chat_id, mode, history, text, budget, attachments=files, instructions=instructions,
             sources_block=block,
         )
         user, assistant, chat = _insert_turn(chat_id, text, files, endpoint["model"], sources)
-        return {"chat": chat, "user_message": user, "assistant_message": assistant, "messages": messages,
-                "memory": job}
+        fields = {"chat": chat, "user_message": user, "assistant_message": assistant, "messages": messages,
+                  "memory": job}
+        if use_web:
+            fields["web"] = _web_job(text, sources, budget, lambda web_block: _with_memory(
+                chat_id, mode, history, text, budget, attachments=files, instructions=instructions,
+                sources_block="\n\n".join(part for part in (block, web_block) if part),
+            ))
+        return fields
 
     return _open_stream(chat_id, percent, prepare)
 
 
-def regenerate_answer(chat_id: int, percent: object = None, collection_id: object = None) -> ChatStream:
+def regenerate_answer(chat_id: int, percent: object = None, collection_id: object = None,
+                      skill: object = None, web: object = False) -> ChatStream:
     """Replace the last assistant answer with a new one for the same user message."""
     collection = validate_collection_id(collection_id)
+    instructions = instructions_with_skill(skill)
+    use_web = _web_requested(web)
 
     def prepare(mode: str, budget: int, endpoint: dict) -> dict:
         with _connect() as conn:
@@ -1583,7 +1652,7 @@ def regenerate_answer(chat_id: int, percent: object = None, collection_id: objec
             block, sources = _knowledge_sources(collection, user["content"], budget)
             messages, job = _with_memory(
                 chat_id, mode, history, user["content"], budget, attachments=files,
-                instructions=current_instructions(), sources_block=block,
+                instructions=instructions, sources_block=block,
             )
             now = db.utcnow()
             with db.transaction(conn):
@@ -1599,18 +1668,25 @@ def regenerate_answer(chat_id: int, percent: object = None, collection_id: objec
                     (chat_id, endpoint["model"], now, json.dumps(sources, ensure_ascii=False) if sources else None),
                 ).lastrowid
                 conn.execute("UPDATE conversations SET updated_at = ? WHERE id = ?", (now, chat_id))
-            return {
+            fields = {
                 "chat": _get_conversation(conn, chat_id), "user_message": user,
                 "assistant_message": _get_message(conn, new_id), "messages": messages,
                 "action": "regenerate", "extra": {"replaced_message_id": old["id"]}, "memory": job,
                 "replaces": old["id"], "previous": old,
             }
+            if use_web:
+                fields["web"] = _web_job(user["content"], sources, budget, lambda web_block: _with_memory(
+                    chat_id, mode, history, user["content"], budget, attachments=files, instructions=instructions,
+                    sources_block="\n\n".join(part for part in (block, web_block) if part),
+                ))
+            return fields
 
     return _open_stream(chat_id, percent, prepare)
 
 
-def continue_answer(chat_id: int, percent: object = None) -> ChatStream:
+def continue_answer(chat_id: int, percent: object = None, skill: object = None) -> ChatStream:
     """Append to the last assistant answer when it was cut off at the length limit."""
+    instructions = instructions_with_skill(skill)
 
     def prepare(mode: str, budget: int, endpoint: dict) -> dict:
         with _connect() as conn:
@@ -1621,7 +1697,7 @@ def continue_answer(chat_id: int, percent: object = None) -> ChatStream:
             files = _recent_messages(chat_id, budget, before_id=old["id"], limit=1)[0]["attachments"]
             messages, job = _with_memory(
                 chat_id, mode, history, user["content"], budget, attachments=files,
-                instructions=current_instructions(), partial=old["content"],
+                instructions=instructions, partial=old["content"],
             )
             with db.transaction(conn):
                 cur = conn.execute(
@@ -1699,19 +1775,21 @@ def post_message(req: Request, chat_id: int) -> StreamResponse:
     data = req.json(max_bytes=MAX_MESSAGE_BODY_BYTES)
     return StreamResponse(start_answer(
         chat_id, data.get("content"), data.get("percent"), data.get("attachments"), data.get("collection_id"),
+        skill=data.get("skill"), web=data.get("web", False),
     ))
 
 
 @route("POST", r"/api/chats/(\d+)/continue")
 def post_continue(req: Request, chat_id: int) -> StreamResponse:
     data = req.json()
-    return StreamResponse(continue_answer(chat_id, data.get("percent")))
+    return StreamResponse(continue_answer(chat_id, data.get("percent"), skill=data.get("skill")))
 
 
 @route("POST", r"/api/chats/(\d+)/regenerate")
 def post_regenerate(req: Request, chat_id: int) -> StreamResponse:
     data = req.json()
-    return StreamResponse(regenerate_answer(chat_id, data.get("percent"), data.get("collection_id")))
+    return StreamResponse(regenerate_answer(chat_id, data.get("percent"), data.get("collection_id"),
+                                            skill=data.get("skill"), web=data.get("web", False)))
 
 
 @route("POST", r"/api/chats/(\d+)/stop")
