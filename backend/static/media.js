@@ -300,6 +300,15 @@
 
   /* ------------------------------------------------------------ queue */
 
+  /** "noch etwa 3 Min." from the time spent so far and the progress (once there is enough to go by). */
+  function jobTimeLeft(j) {
+    const started = fmt.parseTime(j.started_at);
+    const p = j.progress;
+    if (!started || !LR.isNum(p) || p < 0.05 || p >= 1) return '';
+    const elapsed = (Date.now() - started.getTime()) / 1000;
+    return elapsed < 5 ? '' : fmt.eta(elapsed * (1 - p) / p);
+  }
+
   function renderJobs() {
     if (!ui.queue) return;
     const jobs = st.jobs.filter((j) => ACTIVE.has(j.status) || j.status === 'failed' || j.status === 'cancelled');
@@ -336,7 +345,10 @@
       r.badge.textContent = { queued: LR.t('Waiting'), running: LR.isNum(j.progress) ? Math.round(j.progress * 100) + '%' : LR.t('Working'), failed: LR.t('Failed'), cancelled: LR.t('Cancelled') }[j.status] || j.status;
       r.bar.set(j.status === 'running' && LR.isNum(j.progress) ? j.progress : null);
       r.msg.className = 'job-msg' + (j.status === 'failed' ? ' is-error' : '');
-      r.msg.textContent = j.status === 'failed' ? LR.str(j.error, LR.t('Generation failed.')) : LR.str(j.message) || (j.status === 'queued' ? LR.t('Waiting for the current job to finish…') : '');
+      let text = j.status === 'failed' ? LR.str(j.error, LR.t('Generation failed.')) : LR.str(j.message) || (j.status === 'queued' ? LR.t('Waiting for the current job to finish…') : '');
+      const left = j.status === 'running' ? jobTimeLeft(j) : '';
+      if (left) text = text ? text + ' · ' + left : left;
+      r.msg.textContent = text;
       ui.queue.append(r.el);
     }
     for (const [key, r] of rows) {

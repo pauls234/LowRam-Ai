@@ -23,9 +23,11 @@ import importlib
 import logging
 import math
 import os
+import statistics
 import threading
 import time
 from collections.abc import Callable
+from datetime import datetime
 from pathlib import Path
 
 from . import artifacts, config, db, llm, memory, power, settings
@@ -445,14 +447,16 @@ def _generate(project_id: int, task: dict, mem: memory.MemoryPlan, checkpoint: C
 
 def run_next(project_id: int, percent: object = memory.DEFAULT_PERCENT, *,
              stop_event: threading.Event | None = None,
-             on_wait: Callable[[str], None] | None = None) -> dict:
+             on_wait: Callable[[str], None] | None = None,
+             on_start: Callable[[dict], None] | None = None) -> dict:
     """Run the next pending task of a general project.
 
     Returns a dict with ``status`` one of ``done``, ``failed``, ``paused``
     (not enough free RAM) or ``empty`` (no pending task). Raises ``db.Busy``
     when another inference is in progress. ``on_wait(message)`` reports
     waits for the model after a transient error; ``stop_event`` ends such a
-    wait early (the task then fails, its partial answer kept).
+    wait early (the task then fails, its partial answer kept). ``on_start(task)`` is
+    called once the task is claimed (for progress displays; its errors are ignored).
     """
     pct = memory.validate_percent(percent)
     require_general(project_id)
@@ -468,6 +472,11 @@ def run_next(project_id: int, percent: object = memory.DEFAULT_PERCENT, *,
     task = db.claim_next_task(project_id)
     if task is None:
         return {**outcome, "status": "empty", "reason": "No pending tasks in this project."}
+    if on_start is not None:
+        try:
+            on_start(task)
+        except Exception:  # a progress display must never break the task itself
+            log.debug("on_start callback failed", exc_info=True)
     started = time.monotonic()
     skipped: list[int] = []
     info: dict = {}
@@ -537,6 +546,24 @@ def _hold_for_ram(stop_event: threading.Event | None,
     return "paused_low_ram", f"{memory.plan().reason} (Waited {minutes:g} min for free RAM.)"
 
 
+def typical_task_seconds(limit: int = 20) -> float | None:
+    """Median duration of the last finished tasks on this computer – the first estimate for a new loop."""
+    with db.connect() as conn:
+        rows = conn.execute(
+            "SELECT started_at, finished_at FROM tasks WHERE status = 'done' AND started_at IS NOT NULL "
+            "AND finished_at IS NOT NULL ORDER BY finished_at DESC LIMIT ?", (int(limit),),
+        ).fetchall()
+    durations = []
+    for row in rows:
+        try:
+            seconds = (datetime.fromisoformat(row["finished_at"]) - datetime.fromisoformat(row["started_at"])).total_seconds()
+        except (TypeError, ValueError):
+            continue
+        if 0 < seconds < 24 * 3600:
+            durations.append(seconds)
+    return float(statistics.median(durations)) if durations else None
+
+
 def run_loop(
     project_id: int,
     percent: object = memory.DEFAULT_PERCENT,
@@ -594,7 +621,10 @@ def run_loop(
                     break
             try:
                 outcome = run_next(project_id, pct, stop_event=stop_event,
-                                   on_wait=lambda message: _emit_waiting(on_step, message))
+                                   on_wait=lambda message: _emit_waiting(on_step, message),
+                                   on_start=None if on_step is None else (
+                                       lambda task: on_step({"status": "running", "task": task, "result": None,
+                                                             "error": None, "reason": None})))
             except db.Busy as exc:
                 summary.update(stopped_because="busy", message=str(exc))
                 break

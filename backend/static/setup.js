@@ -372,13 +372,14 @@
     if (download) await follow(download, key, label);
   }
 
-  async function waitReady(modelId) {
+  async function waitReady(modelId, onLoad) {
     const started = Date.now();
     for (;;) {
       const eng = await LR.get('/api/engine/status');
       LR.state.engine = eng;
       LR.emit('engine', eng);
       const server = eng.server || {};
+      if (server.load && onLoad) onLoad(server.load);
       if (server.state === 'ready' && (!modelId || !server.model_id || server.model_id === modelId)) return;
       if (server.state === 'error') throw new Error(server.error || LR.t('The model could not be started.'));
       if (server.state === 'stopped' && Date.now() - started > 15000) throw new Error(LR.t('The engine stopped before the model was ready.'));
@@ -421,11 +422,17 @@
 
       setStep('start', 'active', LR.t('Loading ') + name + LR.t(' into memory – this can take a minute…'));
       const elapsed = h('span', { class: 'step-elapsed' });
-      ui.steps.get('start').slot.replaceChildren(h('p', { class: 'muted small' }, [LR.t('Elapsed '), elapsed]));
+      const loadBar = LR.progress({ size: 'sm', label: LR.t('Loading progress') });
+      const loadInfo = h('span', { class: 'step-eta' });
+      ui.steps.get('start').slot.replaceChildren(loadBar.el, h('p', { class: 'muted small' }, [LR.t('Elapsed '), elapsed, ' ', loadInfo]));
+      const showLoad = (load) => {
+        loadBar.set(LR.isNum(load.percent) ? load.percent / 100 : null);
+        loadInfo.textContent = '· ' + LR.progressText(load) + (load.measured ? '' : ' (' + LR.t('first estimate') + ')');
+      };
       const stopTimer = LR.elapsed(elapsed);
       try {
         await LR.post('/api/engine/start', { model_id: model.id });
-        await waitReady(model.id);
+        await waitReady(model.id, showLoad);
       } finally {
         stopTimer();
       }

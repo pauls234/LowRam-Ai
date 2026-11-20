@@ -18,15 +18,17 @@ import logging
 import re
 import secrets
 import signal
+import statistics
 import sys
 import threading
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from . import api_core, artifacts, config, db, power, runner, web  # noqa: F401 - api_core registers routes
+from . import api_core, artifacts, config, db, power, progress, runner, web  # noqa: F401 - api_core registers routes
 from .web import FileResponse, HTTPError, StreamResponse
 
 # Feature modules register their routes/hooks on import. A module that does not
@@ -78,14 +80,28 @@ LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "[::1]")
 
 
 
+MAX_LOOP_EVENTS = 100
+
+
 class LoopController:
-    """Runs one bounded background loop at a time and exposes its state."""
+    """Runs one bounded background loop at a time and exposes its state.
+
+    Besides the counters the state tells where the loop is: ``planned`` steps, the ``current`` step
+    (``{task_id, position, title, started_at}``), a timeline of ``events`` (``{at, kind, position,
+    title, duration_s, detail}`` with kind ``loop_start``, ``task_start``, ``task_done``,
+    ``task_failed``, ``wait`` or ``loop_end``) and, computed per request, ``progress_percent``,
+    ``eta_s`` (time probably left), ``per_task_s`` and ``estimate_basis`` – ``this_run`` (steps
+    measured in this loop), ``history`` (earlier tasks on this computer) or ``None``.
+    """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._state = self._idle_state()
+        self._durations: list[float] = []  # seconds of the steps finished in this loop
+        self._prior: float | None = None  # typical step duration from earlier loops
+        self._current_mono: float | None = None  # monotonic start of the running step
 
     @staticmethod
     def _idle_state() -> dict:
@@ -93,11 +109,60 @@ class LoopController:
             "active": False, "project_id": None, "percent": None, "max_tasks": None,
             "completed": 0, "failed": 0, "current_task_id": None, "stop_requested": False,
             "stopped_because": None, "started_at": None, "finished_at": None, "last_message": "",
+            "planned": None, "current": None, "events": [],
         }
 
     def status(self) -> dict:
         with self._lock:
-            return dict(self._state)
+            state = dict(self._state)
+            state["events"] = [dict(event) for event in self._state["events"]]
+            state["current"] = dict(self._state["current"]) if self._state["current"] else None
+            durations, prior, current_mono = list(self._durations), self._prior, self._current_mono
+        state.update(self._estimate(state, durations, prior, current_mono))
+        return state
+
+    @staticmethod
+    def _estimate(state: dict, durations: list[float], prior: float | None, current_mono: float | None) -> dict:
+        """Percent over all planned steps and the time probably left (from measured step durations)."""
+        per_task = float(statistics.median(durations)) if durations else prior
+        running = bool(state["active"]) and current_mono is not None
+        elapsed = time.monotonic() - current_mono if running else 0.0
+        out = {"per_task_s": round(per_task, 1) if per_task else None,
+               "estimate_basis": "this_run" if durations else ("history" if prior else None),
+               "current_elapsed_s": round(elapsed, 1) if running else None,
+               "progress_percent": None, "eta_s": None, "current_overdue": False}
+        planned = state.get("planned")
+        if not planned:
+            return out
+        finished = state["completed"] + state["failed"]
+        if not state["active"]:
+            out["progress_percent"] = int(100 * min(finished, planned) / planned)
+            return out
+        left = max(0, planned - finished)
+        fraction = 0.0
+        if per_task and running:
+            step = progress.estimate(elapsed, per_task)
+            fraction = (step["percent"] or 0) / 100
+            out["current_overdue"] = step["overdue"]
+            current_left = step["eta_s"] if step["eta_s"] is not None else per_task * 0.15
+            out["eta_s"] = round(current_left + max(0, left - 1) * per_task)
+        elif per_task:
+            out["eta_s"] = round(left * per_task)
+        out["progress_percent"] = min(99, int(100 * (finished + fraction) / planned))
+        return out
+
+    def _event(self, kind: str, task: dict | None = None, **extra: object) -> None:
+        """Append to the timeline (caller holds the lock); consecutive waits collapse into one entry."""
+        events = self._state["events"]
+        if kind == "wait" and events and events[-1]["kind"] == "wait":
+            events[-1]["detail"] = extra.get("detail")
+            return
+        event: dict = {"at": db.utcnow(), "kind": kind}
+        if task:
+            event.update(position=task.get("position"), title=str(task.get("title") or "")[:160])
+        event.update({key: value for key, value in extra.items() if value is not None})
+        events.append(event)
+        del events[:-MAX_LOOP_EVENTS]
 
     def is_active(self) -> bool:
         with self._lock:
@@ -107,6 +172,12 @@ class LoopController:
         reason = db.busy_reason()  # outside the lock: may wait on SQLite
         if reason:
             raise db.Busy(reason)
+        pending = len(db.tasks_with_status(project_id, ["pending"]))
+        try:
+            prior = runner.typical_task_seconds()
+        except Exception:  # an estimate is optional
+            log.debug("No typical task duration", exc_info=True)
+            prior = None
         with self._lock:
             if self._state["active"]:
                 raise db.Busy("A loop is already running. Stop it first.")
@@ -114,7 +185,10 @@ class LoopController:
             self._state = {
                 **self._idle_state(), "active": True, "project_id": project_id, "percent": percent,
                 "max_tasks": max_tasks, "started_at": db.utcnow(), "last_message": "Loop started.",
+                "planned": min(max_tasks, pending) or None,
             }
+            self._durations, self._prior, self._current_mono = [], prior, None
+            self._event("loop_start", count=self._state["planned"])
             self._thread = threading.Thread(
                 target=self._run, args=(project_id, percent, max_tasks, self._stop),
                 name=f"lowram-loop-{project_id}", daemon=True,
@@ -134,14 +208,32 @@ class LoopController:
         with self._lock:
             task = outcome.get("task") or {}
             status = outcome["status"]
+            if status == "running":  # a step was claimed: it is the current one from now on
+                self._state["current_task_id"] = task.get("id")
+                self._state["current"] = {"task_id": task.get("id"), "position": task.get("position"),
+                                          "title": str(task.get("title") or "")[:160], "started_at": db.utcnow()}
+                self._current_mono = time.monotonic()
+                if self._state["events"] and self._state["events"][-1]["kind"] == "wait":
+                    self._state["last_message"] = ""  # the wait is over; "current" tells what runs now
+                self._event("task_start", task)
+                return
             if status == "waiting":  # RAM guard / model restart: show the wait, change no counters
                 self._state["last_message"] = str(outcome.get("reason") or "")[:500]
+                self._event("wait", detail=self._state["last_message"][:300])
                 return
+            took = time.monotonic() - self._current_mono if self._current_mono is not None else None
             if status == "done":
                 self._state["completed"] += 1
+                if took is not None:
+                    self._durations.append(took)
+                self._event("task_done", task, duration_s=round(took, 1) if took is not None else None)
             elif status == "failed":
                 self._state["failed"] += 1
+                self._event("task_failed", task, duration_s=round(took, 1) if took is not None else None,
+                            detail=str(outcome.get("error") or "")[:300] or None)
             self._state["current_task_id"] = None
+            self._state["current"] = None
+            self._current_mono = None
             label = f"Task {task['position']} (id {task['id']}) {status}" if task else status
             detail = outcome.get("error") or outcome.get("reason") or ""
             self._state["last_message"] = f"{label}{': ' + detail if detail else ''}"[:500]
@@ -157,9 +249,11 @@ class LoopController:
         finally:
             with self._lock:
                 self._state.update(
-                    active=False, current_task_id=None, stopped_because=stopped_because,
+                    active=False, current_task_id=None, current=None, stopped_because=stopped_because,
                     finished_at=db.utcnow(), last_message=(message or stopped_because)[:500],
                 )
+                self._current_mono = None
+                self._event("loop_end", detail=stopped_because)
                 done, failed = self._state["completed"], self._state["failed"]
             if done or failed:
                 finished = stopped_because in ("queue_empty", "max_tasks")

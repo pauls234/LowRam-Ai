@@ -499,7 +499,9 @@
     const think = h('div', { class: 'thinking', hidden: true }, [thinkToggle, thinkBody]);
     const body = h('div', { class: 'msg-body md' });
     const waitText = h('span', { class: 'wait-text', text: LR.t('Working on it…') });
-    const wait = h('div', { class: 'msg-wait' }, [h('span', { class: 'typing', 'aria-hidden': 'true' }, [h('i'), h('i'), h('i')]), waitText]);
+    const waitBar = LR.progress({ size: 'sm', label: LR.t('Progress'), cls: 'wait-progress' });
+    waitBar.el.hidden = true;
+    const wait = h('div', { class: 'msg-wait' }, [h('span', { class: 'typing', 'aria-hidden': 'true' }, [h('i'), h('i'), h('i')]), waitText, waitBar.el]);
     const extra = h('div', { class: 'msg-extra' });
     const cont = h('div', { class: 'msg-continue', hidden: true });
     const meta = h('span', { class: 'msg-meta' });
@@ -533,15 +535,18 @@
     let thinkStart = 0;
     let thinkSecs = null;
     let statusText = '';
+    let statusExtra = '';
     let started = Date.now();
     let waitTimer = 0;
     function startWait() {
       started = Date.now();
       statusText = '';
+      statusExtra = '';
+      waitBar.el.hidden = true;
       waitText.textContent = LR.t('Working on it…');
       window.clearInterval(waitTimer);
       waitTimer = window.setInterval(() => {
-        if ((Date.now() - started) / 1000 > 6) waitText.textContent = (statusText || LR.t('Still working – local models can take a moment')) + ' · ' + fmt.clock(Date.now() - started);
+        if ((Date.now() - started) / 1000 > 6) waitText.textContent = (statusText || LR.t('Still working – local models can take a moment')) + (statusExtra ? ' · ' + statusExtra : '') + ' · ' + fmt.clock(Date.now() - started);
       }, 1000);
     }
     function stopTimers() {
@@ -610,10 +615,15 @@
         isLast = last;
         syncLast();
       },
-      /** Backend progress note ("Loading the model…") shown until tokens arrive. */
-      status(text) {
+      /** Backend progress note ("Loading the model…", "Reading your message…") until tokens arrive;
+       *  with percent / time left when the backend could estimate them. */
+      status(text, info) {
         statusText = text;
-        if (text) waitText.textContent = text;
+        statusExtra = info ? LR.progressText(info) : '';
+        if (text) waitText.textContent = statusExtra ? text + ' · ' + statusExtra : text;
+        const pct = info && LR.isNum(info.percent) ? info.percent : null;
+        waitBar.el.hidden = pct === null;
+        if (pct !== null) waitBar.set(Math.min(1, pct / 100));
       },
       /** Clear the bubble before a regenerated answer streams in. */
       reset() {
@@ -849,7 +859,7 @@
             LR.emit('status-refresh');
           } else if (ev.type === 'status') {
             ctx.gotStart = true;
-            a.status(LR.str(ev.text));
+            a.status(LR.t(LR.str(ev.text)), ev);
           } else if (ev.type === 'token') {
             ctx.gotStart = true;
             ctx.tokens += LR.str(ev.text);

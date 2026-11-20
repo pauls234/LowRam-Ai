@@ -90,7 +90,10 @@
     const name = LR.modelName(server.model_id);
     let line = LR.t('No model is running.');
     if (server.state === 'ready') line = (name || LR.t('The model')) + LR.t(' is ready.');
-    else if (server.state === 'starting') line = LR.t('Loading ') + (name || LR.t('the model')) + LR.t(' into memory – this can take a minute.');
+    else if (server.state === 'starting') {
+      line = LR.t('Loading ') + (name || LR.t('the model')) + LR.t(' into memory – this can take a minute.');
+      if (server.load) line += ' ' + LR.progressText(server.load);
+    }
     else if (server.state === 'error') line = LR.t('The engine stopped with an error.');
     if (eng.paused) line = LR.t('Paused while an image or video is generated – the model restarts by itself afterwards.');
     else if (server.state !== 'ready' && server.state !== 'starting' && (eng.unloaded_idle || server.unloaded_idle)) line = LR.t('Paused to free memory – the model loads again with your next question.');

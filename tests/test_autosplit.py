@@ -28,6 +28,17 @@ class AutosplitApiTests(AppTestCase):
     def final_ready(self, pid):
         return wait_until(lambda: self.api("GET", f"/api/cluster/projects/{pid}/final")[0] == 200, 20)
 
+    def test_planning_time_is_measured_for_the_next_estimate(self):
+        self.assertEqual(self.api("GET", "/api/autosplit/estimate"), (200, {"expected_s": None}))
+        self.llm.push(Text(PLAN))
+        status, data = self.split(max_tasks=3, percent=40)
+        self.assertEqual(status, 202, data)
+        status, data = self.api("GET", "/api/autosplit/estimate")
+        self.assertEqual(status, 200)
+        self.assertIsInstance(data["expected_s"], float)
+        self.assertGreater(data["expected_s"], 0)
+        self.wait_loop_done()  # no loop thread may outlive the test
+
     def test_split_creates_project_merges_and_runs(self):
         self.llm.push(Text(PLAN))  # tasks and merge get the default answer
         status, data = self.split(max_tasks=3, distribute=True, percent=40)
