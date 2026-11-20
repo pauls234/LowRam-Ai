@@ -2245,9 +2245,10 @@ class EngineManager:
             took = time.monotonic() - self._load_started if self._load_started is not None else None
             loaded_id = self._info.get("model_id")
             self._load_started = None
+            if took is not None and isinstance(loaded_id, str):
+                # the next estimate uses this computer's speed; under the lock, so stop() waits for the write
+                progress.remember("model_load", loaded_id, took)
             self._cond.notify_all()
-        if took is not None and isinstance(loaded_id, str):
-            progress.remember("model_load", loaded_id, took)  # the next estimate uses this computer's speed
         log.info("llama-server is ready on port %s%s", port, f" after {took:.1f} s" if took is not None else "")
         while True:
             try:
