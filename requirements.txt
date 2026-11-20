@@ -1,1 +1,3 @@
 psutil==7.2.2
+# PDF text for documents (pure Python; read in a separate process with a time limit)
+pypdf==6.21.4

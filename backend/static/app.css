@@ -1511,3 +1511,44 @@ a.kb-row:hover { background: var(--surface-2); }
 .msg-wait .wait-progress { flex: 1 1 100%; max-width: 360px; }
 .run-eta { margin: 6px 0 0; }
 .step-eta { color: var(--text-2); }
+
+/* ------------------------------------------------------------------ documents */
+
+.doc-drop { display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 28px 16px; text-align: center; border: 2px dashed var(--border); border-radius: 14px; cursor: pointer; transition: border-color 0.15s ease, background 0.15s ease; }
+.doc-drop:hover, .doc-drop:focus-visible, .doc-drop.is-drop { border-color: var(--accent); background: var(--accent-soft); outline: none; }
+.doc-drop.is-busy { opacity: 0.6; pointer-events: none; }
+.doc-drop p { margin: 0; }
+.doc-drop-icon { width: 44px; height: 44px; border-radius: 12px; display: grid; place-items: center; background: var(--accent-soft); color: var(--accent-text); }
+.doc-drop-icon .icon { width: 22px; height: 22px; }
+.doc-form { display: flex; flex-direction: column; gap: 14px; margin-top: 16px; }
+.doc-file { display: flex; align-items: center; gap: 12px; min-width: 0; }
+.doc-file-main { flex: 1; min-width: 0; }
+.doc-file p, .doc-job p { margin: 0; }
+.doc-name { overflow-wrap: anywhere; }
+.doc-preview summary { cursor: pointer; font-size: 14px; color: var(--text-2); }
+.doc-preview-text { max-height: 220px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13px; padding: 10px 12px; border-radius: 10px; background: var(--accent-soft); margin: 8px 0 0; }
+.doc-form .field .label { display: flex; flex-direction: column; gap: 6px; }
+.doc-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.doc-jobs { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 12px; }
+.doc-job { display: flex; flex-direction: column; gap: 10px; padding: 14px; border: 1px solid var(--border); border-radius: 12px; min-width: 0; }
+.doc-job-head { display: flex; align-items: center; gap: 12px; min-width: 0; }
+.doc-job-head .machine-icon { width: 38px; height: 38px; border-radius: 11px; }
+.doc-job-title { flex: 1; min-width: 0; }
+.doc-result { border-top: 1px solid var(--border); padding-top: 10px; max-height: 420px; overflow: auto; overflow-wrap: anywhere; }
+@media (max-width: 640px) {
+  .doc-job-head { flex-wrap: wrap; }
+}
+
+/* ------------------------------------------------------------------ internet (chat switch, sources) */
+
+.web-toggle { display: inline-flex; align-items: center; gap: 5px; font: inherit; font-size: 13px; color: var(--text-3); background: transparent; border: 1px solid var(--border); border-radius: 999px; padding: 3px 10px; cursor: pointer; }
+.web-toggle[hidden] { display: none; }
+.web-toggle .icon { width: 14px; height: 14px; }
+.web-toggle:hover { color: var(--text); }
+.web-toggle.is-on { color: var(--accent-text); background: var(--accent-soft); border-color: color-mix(in srgb, var(--accent) 45%, transparent); }
+.web-toggle:focus-visible { outline: 2px solid var(--accent-ring); outline-offset: 1px; }
+.composer-hint.is-web { color: var(--accent-text); }
+.msg-source-link { color: var(--accent-text); text-decoration: underline; text-underline-offset: 2px; }
+.msg-source-host { margin: 0; font-size: 12px; color: var(--text-3); overflow-wrap: anywhere; }
+.doc-link { display: flex; align-items: center; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
+.doc-link .input { flex: 1; min-width: 180px; }

@@ -112,19 +112,19 @@
     ui.stop = h('button', { type: 'button', class: 'stop-btn', 'aria-label': LR.t('Stop generating'), title: LR.t('Stop (Esc)'), hidden: true, onclick: stopStream }, icon('stop'));
     ui.fileInput = h('input', {
       type: 'file', multiple: true, class: 'visually-hidden', tabindex: '-1', 'aria-hidden': 'true',
-      accept: '.txt,.md,.markdown,.csv,.tsv,.json,.yaml,.yml,.toml,.ini,.xml,.html,.css,.js,.mjs,.ts,.tsx,.jsx,.py,.rb,.go,.rs,.java,.kt,.swift,.c,.h,.cpp,.hpp,.cs,.php,.sh,.zsh,.sql,.log,.env.example,text/*',
+      accept: '.pdf,.docx,.odt,.pptx,.xlsx,.epub,.rtf,.txt,.md,.markdown,.csv,.tsv,.json,.yaml,.yml,.toml,.ini,.xml,.html,.htm,.css,.js,.mjs,.ts,.tsx,.jsx,.py,.rb,.go,.rs,.java,.kt,.swift,.c,.h,.cpp,.hpp,.cs,.php,.sh,.zsh,.sql,.log,.env.example,text/*',
     });
     ui.fileInput.addEventListener('change', () => {
       addFiles(ui.fileInput.files);
       ui.fileInput.value = '';
     });
-    ui.attach = h('button', { type: 'button', class: 'icon-btn attach-btn', 'aria-label': LR.t('Attach text or code files'), title: LR.t('Attach files (text or code, up to 200 KB)'), onclick: () => ui.fileInput.click() }, icon('paperclip'));
+    ui.attach = h('button', { type: 'button', class: 'icon-btn attach-btn', 'aria-label': LR.t('Attach documents, text or code files'), title: LR.t('Attach files (PDF, Word, PowerPoint, Excel, text or code)'), onclick: () => ui.fileInput.click() }, icon('paperclip'));
     ui.atts = h('ul', { class: 'att-list composer-atts', 'aria-label': LR.t('Files to send'), hidden: true });
     ui.attachMsg = h('p', { class: 'attach-msg', role: 'status', hidden: true });
     ui.form = h('form', { class: 'composer', novalidate: true }, [
       ui.atts,
       ui.input,
-      h('div', { class: 'composer-bar' }, [ui.attach, ui.mode.el, buildKnowledgePicker(), h('span', { class: 'composer-spacer' }), buildBigJobButton(), ui.stop, ui.send]),
+      h('div', { class: 'composer-bar' }, [ui.attach, ui.mode.el, buildWebToggle(), buildKnowledgePicker(), buildSkillPicker(), h('span', { class: 'composer-spacer' }), buildBigJobButton(), ui.stop, ui.send]),
       ui.fileInput,
     ]);
     let dragDepth = 0;
@@ -148,10 +148,8 @@
       ui.form.classList.remove('is-drop');
       addFiles(ev.dataTransfer.files);
     });
-    ui.hint = h('p', { class: 'composer-hint', id: 'composer-hint' }, [
-      icon('shield'),
-      h('span', { text: LR.t('Runs locally – answers can take a little longer. Nothing leaves this computer.') }),
-    ]);
+    ui.hintText = h('span', { text: LR.t('Runs locally – answers can take a little longer. Nothing leaves this computer.') });
+    ui.hint = h('p', { class: 'composer-hint', id: 'composer-hint' }, [icon('shield'), ui.hintText]);
     ui.examples = h('div', { class: 'examples', role: 'list', 'aria-label': LR.t('Example prompts') });
     ui.dock = h('div', { class: 'composer-dock' }, [ui.notice, ui.form, ui.attachMsg, ui.hint, ui.examples]);
     ui.status = h('div', { class: 'visually-hidden', 'aria-live': 'polite', 'aria-atomic': 'true' });
@@ -201,6 +199,67 @@
     LR.on('knowledge', renderKnowledgePicker);
     window.setTimeout(renderKnowledgePicker, 0);
     return ui.kbWrap;
+  }
+
+  /** "Internet": search the web / read the links of this question (off after every start). */
+  function buildWebToggle() {
+    const ui = S.ui;
+    S.web = false;
+    ui.web = h('button', {
+      type: 'button', class: 'web-toggle', 'aria-pressed': 'false', hidden: true,
+      title: LR.t('Search the internet for the next answers'), onclick: () => setWeb(!S.web),
+    }, [icon('search'), h('span', { text: LR.t('Internet') })]);
+    LR.get('/api/internet').then((data) => { S.webInfo = data; ui.web.hidden = !data.enabled; if (!data.enabled) setWeb(false); })
+      .catch(() => { ui.web.hidden = true; });
+    return ui.web;
+  }
+
+  function setWeb(on) {
+    const ui = S.ui;
+    S.web = Boolean(on) && !ui.web.hidden;
+    ui.web.setAttribute('aria-pressed', String(S.web));
+    ui.web.classList.toggle('is-on', S.web);
+    const provider = (S.webInfo && S.webInfo.provider) || 'DuckDuckGo';
+    ui.hintText.textContent = S.web
+      ? LR.t('Internet on: your question goes to {provider}, the pages read appear as sources. Nothing else leaves this computer.', { provider })
+      : LR.t('Runs locally – answers can take a little longer. Nothing leaves this computer.');
+    ui.hint.classList.toggle('is-web', S.web);
+  }
+
+  /** "Skill: …" – how LowRAM AI should work for this chat (resolved on the server, see skills.js). */
+  function buildSkillPicker() {
+    const ui = S.ui;
+    const id = 'composer-skill';
+    ui.skillSelect = h('select', { class: 'kb-select', id });
+    ui.skillSelect.addEventListener('change', () => {
+      S.skill = ui.skillSelect.value || null;
+      if (S.skill) LR.store.set('lowram.chatSkill', S.skill);
+      else LR.store.remove('lowram.chatSkill');
+      ui.skillWrap.classList.toggle('is-on', Boolean(S.skill));
+    });
+    ui.skillWrap = h('div', { class: 'kb-picker', hidden: true }, [
+      icon('sparkle'),
+      h('label', { class: 'kb-label', for: id, text: LR.t('Skill') + ':' }),
+      ui.skillSelect,
+    ]);
+    S.skill = LR.store.get('lowram.chatSkill') || null;
+    LR.on('skills', renderSkillPicker);
+    window.setTimeout(renderSkillPicker, 0);
+    return ui.skillWrap;
+  }
+
+  function renderSkillPicker() {
+    const ui = S.ui;
+    if (!ui.skillWrap) return;
+    const list = LR.skills && LR.skills.usable ? LR.skills.usable() : [];
+    ui.skillWrap.hidden = !list.length;
+    if (S.skill && !list.some((s) => s.name === S.skill)) S.skill = null;
+    ui.skillSelect.replaceChildren(
+      h('option', { value: '', text: LR.t('No skill') }),
+      ...list.map((s) => h('option', { value: s.name, text: LR.str(s.title) })),
+    );
+    ui.skillSelect.value = S.skill || '';
+    ui.skillWrap.classList.toggle('is-on', Boolean(S.skill));
   }
 
   function renderKnowledgePicker() {
@@ -258,10 +317,15 @@
   function sourcesBlock(sources) {
     if (!Array.isArray(sources) || !sources.length) return null;
     const id = LR.uid('src');
+    const web = (src) => src && src.kind === 'web' && /^https?:\/\//i.test(LR.str(src.url));
+    const host = (url) => { try { return new URL(url).hostname; } catch (_) { return ''; } };
     return h('section', { class: 'msg-sources', 'aria-labelledby': id }, [
-      h('h3', { class: 'msg-sources-title', id }, [icon('book'), h('span', { text: LR.t('Sources') + ' (' + sources.length + ')' })]),
+      h('h3', { class: 'msg-sources-title', id }, [icon(sources.some(web) ? 'search' : 'book'), h('span', { text: LR.t('Sources') + ' (' + sources.length + ')' })]),
       h('ol', { class: 'msg-sources-list' }, sources.map((src) => h('li', { class: 'msg-source' }, [
-        h('p', { class: 'msg-source-doc', text: LR.str(src && src.document, LR.t('(unnamed file)')) }),
+        web(src)
+          ? h('a', { class: 'msg-source-doc msg-source-link', href: src.url, target: '_blank', rel: 'noopener noreferrer', text: LR.str(src.title, src.url) })
+          : h('p', { class: 'msg-source-doc', text: LR.str(src && src.document, LR.t('(unnamed file)')) }),
+        web(src) ? h('p', { class: 'msg-source-host', text: host(src.url) }) : null,
         src && src.snippet ? h('p', { class: 'msg-source-snippet', text: LR.str(src.snippet).slice(0, 400) }) : null,
       ]))),
     ]);
@@ -773,6 +837,22 @@
   const MAX_FILES = 5;
   const MAX_FILE_BYTES = 200 * 1024;
   const BINARY_EXT = /\.(png|jpe?g|gif|webp|heic|bmp|ico|tiff?|pdf|zip|gz|tgz|bz2|xz|7z|rar|dmg|pkg|exe|dll|so|dylib|bin|iso|mp3|wav|m4a|flac|ogg|mp4|mov|avi|mkv|webm|docx?|xlsx?|pptx?|key|pages|numbers|sqlite|db|gguf|safetensors|pt|onnx|class|jar|o|a|woff2?|ttf|otf)$/i;
+  // read on this computer by the documents module (PDF, Word, …): only their text is attached
+  const DOCUMENT_EXT = /\.(pdf|docx|odt|pptx|xlsx|epub|rtf)$/i;
+
+  /** The text of a document, cut to what fits into one attachment (with a note when cut). */
+  async function documentText(file) {
+    const data = await LR.upload('/api/documents/uploads?text=1', file);
+    let text = LR.str(data.upload && data.upload.text);
+    const enc = new TextEncoder();
+    const note = '\n\n[' + LR.t('Shortened – the document is longer. For the whole document use “Documents”.') + ']';
+    if (enc.encode(text).length > MAX_FILE_BYTES) {
+      let cut = Math.floor(MAX_FILE_BYTES / 2);
+      while (cut < text.length && enc.encode(text.slice(0, cut + 4096)).length + enc.encode(note).length < MAX_FILE_BYTES) cut += 4096;
+      text = text.slice(0, cut) + note;
+    }
+    return text;
+  }
 
   function attachNote(text) {
     const el = S.ui.attachMsg;
@@ -790,6 +870,16 @@
         problems.push(LR.t('You can attach up to ') + MAX_FILES + LR.t(' files.'));
         break;
       }
+      if (DOCUMENT_EXT.test(file.name)) {
+        attachNote(LR.t('Reading {name}…', { name: file.name }));
+        try {
+          const text = await documentText(file);
+          S.attachments = S.attachments.filter((a) => a.name !== file.name).concat({ name: file.name, size: file.size, content: text });
+        } catch (err) {
+          problems.push(file.name + ': ' + err.message);
+        }
+        continue;
+      }
       if (file.size > MAX_FILE_BYTES) { problems.push(file.name + LR.t(' is larger than 200 KB.')); continue; }
       if (BINARY_EXT.test(file.name) || /^(image|audio|video)\//.test(file.type) || /pdf|zip|octet-stream/.test(file.type)) {
         problems.push(file.name + LR.t(' is not a text file.'));
@@ -801,7 +891,7 @@
       if (text.includes('\u0000') || bad > Math.max(4, text.length / 100)) { problems.push(file.name + LR.t(' looks like a binary file.')); continue; }
       S.attachments = S.attachments.filter((a) => a.name !== file.name).concat({ name: file.name, size: file.size, content: text });
     }
-    attachNote(problems.length ? problems.join(' ') + LR.t(' Only text and code files up to 200 KB work.') : '');
+    attachNote(problems.length ? problems.join(' ') + LR.t(' Documents (PDF, Word, …) and text or code files up to 200 KB work.') : '');
     renderAttachments();
   }
 
@@ -920,7 +1010,7 @@
     runStream({
       pane, a, chatId: pane.id,
       path: '/api/chats/' + encodeURIComponent(pane.id) + '/regenerate',
-      body: { percent: budget() },
+      body: Object.assign({ percent: budget() }, S.skill ? { skill: S.skill } : {}, S.web ? { web: true } : {}),
       onRejected: (err) => {
         a.finish(prev, prevExtra);
         showNotice(err, () => regenerate(pane, a));
@@ -938,7 +1028,7 @@
     runStream({
       pane, a, chatId: pane.id, base, extra: prevExtra,
       path: '/api/chats/' + encodeURIComponent(pane.id) + '/continue',
-      body: { percent: budget() },
+      body: S.skill ? { percent: budget(), skill: S.skill } : { percent: budget() },
       onRejected: (err) => {
         a.finish(prev, prevExtra);
         showNotice(err, () => continueAnswer(pane, a));
@@ -1004,6 +1094,8 @@
     scrollToBottom(true);
 
     const body = { content, percent: budget() };
+    if (S.skill) body.skill = S.skill;
+    if (S.web) body.web = true;
     if (S.collectionId && LR.knowledge && LR.knowledge.available) body.collection_id = isNaN(Number(S.collectionId)) ? S.collectionId : Number(S.collectionId);
     if (attachments.length) body.attachments = attachments.map((x) => ({ name: x.name, content: x.content }));
     await runStream({

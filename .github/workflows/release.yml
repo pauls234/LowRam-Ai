@@ -40,6 +40,8 @@ jobs:
           curl -fsS http://127.0.0.1:8799/api/diagnostics | python -c "import json, sys; d = json.load(sys.stdin); assert isinstance(d['checks'], list) and d['checks'] and isinstance(d['report'], str), d"
           curl -fsS http://127.0.0.1:8799/ | grep -q '<title>LowRAM AI'
           curl -fsS -o /dev/null http://127.0.0.1:8799/static/app.js
+          # documents (PDF read in a separate process inside the bundle), a real web page, skills
+          python desktop/feature_smoke.py http://127.0.0.1:8799
           kill -TERM "$pid"
           wait "$pid"
           grep -q "LowRAM AI stopped" "$LOWRAM_HOME/logs/app.log"
@@ -129,6 +131,9 @@ jobs:
           $index = Invoke-WebRequest -Uri http://127.0.0.1:8799/ -UseBasicParsing
           if ($index.Content -notmatch "<title>LowRAM AI") { throw "Unexpected index page" }
           Invoke-WebRequest -Uri http://127.0.0.1:8799/static/app.js -UseBasicParsing | Out-Null
+          # documents (PDF read in a separate process inside the bundle), a real web page, skills
+          python desktop/feature_smoke.py http://127.0.0.1:8799
+          if ($LASTEXITCODE -ne 0) { Stop-Process -Id $proc.Id -Force; throw "The feature check of the built app failed" }
           Stop-Process -Id $proc.Id -Force
           "Smoke test passed: version $($status.version)"
       - name: Show app log

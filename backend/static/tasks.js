@@ -204,7 +204,8 @@
     }
     ui.loop.hidden = false;
     const project = projectById(loop.project_id);
-    const sig = JSON.stringify([loop, project && project.name, project && project.counts, st.selected]);
+    const shared = st.shared ? st.shared.get(loop.project_id) || null : null;
+    const sig = JSON.stringify([loop, project && project.name, project && project.counts, st.selected, shared && [shared.merge_state, shared.merge_progress]]);
     if (sig === ui.loopSig) return;
     ui.loopSig = sig;
     const completed = loop.completed || 0;
@@ -225,7 +226,12 @@
     if (max && !(planned && max >= planned)) parts.push(LR.t('limit ') + max);  // only when it really limits
     let tone = 'accent';
     let title = loop.stop_requested ? LR.t('Loop stopping…') : LR.t('Loop running');
-    if (!active) {
+    const merging = !active && shared && shared.merge && shared.merge_state === 'running';
+    if (merging) {  // the big job is not finished yet: its last step runs now
+      const mp = shared.merge_progress || {};
+      title = LR.t('Combining the results');
+      bar.set(LR.isNum(mp.percent) ? Math.min(1, mp.percent / 100) : null, LR.isNum(mp.percent) ? mp.percent + ' %' : LR.t('Combining…'));
+    } else if (!active) {
       const reason = STOP_REASONS[loop.stopped_because] || ['info', LR.t('Loop finished.')];
       tone = reason[0];
       title = LR.t('Loop finished');
@@ -237,11 +243,11 @@
     if (!active && loop.stopped_because === 'on_battery') actions.push(LR.button({ text: LR.t('Power settings'), icon: 'battery', size: 'sm', variant: 'ghost', onclick: () => LR.go('#/settings') }));
     if (active) actions.push(LR.button({ text: loop.stop_requested ? LR.t('Stopping…') : LR.t('Stop loop'), icon: 'stop', size: 'sm', variant: 'secondary', disabled: loop.stop_requested, onclick: stopLoop }));
     else actions.push(LR.button({ text: LR.t('Dismiss'), size: 'sm', variant: 'ghost', onclick: () => { st.loopDismissed = loopKey(loop); LR.store.set('lowram.loopDismissed', st.loopDismissed); renderLoop(); } }));
-    ui.loop.className = 'loop-banner tone-' + tone + (active ? ' is-active' : '');
+    ui.loop.className = 'loop-banner tone-' + tone + (active || merging ? ' is-active' : '');
     // (null children would be inserted as the text "null")
     ui.loop.replaceChildren(...[
       h('div', { class: 'loop-head' }, [
-        active ? LR.spinner() : icon(tone === 'error' ? 'alert' : 'check'),
+        active || merging ? LR.spinner() : icon(tone === 'error' ? 'alert' : 'check'),
         h('div', { class: 'loop-heading' }, [
           h('p', { class: 'loop-title', text: title }),
           h('p', { class: 'loop-sub', text: (project ? project.name : LR.t('Project ') + loop.project_id) + ' · ' + parts.join(' · ') }),
@@ -250,6 +256,9 @@
       ]),
       bar.el,
       active ? stepInfo(loop, completed + failed) : null,
+      merging ? mergeInfo(shared.merge_progress) : null,
+      !active && !merging && shared && shared.merge && shared.merge_state === 'waiting' && loop.stopped_because === 'queue_empty'
+        ? h('p', { class: 'loop-eta' }, [icon('clock'), h('span', { text: MERGE_TEXT.waiting })]) : null,
       timeline(loop),
       loop.last_message && !(active && loop.current && !isWaitMessage(loop.last_message))  // the step line says it
         ? (isWaitMessage(loop.last_message)
@@ -274,11 +283,25 @@
     if (LR.isNum(loop.progress_percent)) facts.push(Math.round(loop.progress_percent) + ' %');
     if (cur && LR.isNum(loop.current_elapsed_s)) facts.push(LR.t('this step for {t}', { t: fmt.clock(loop.current_elapsed_s * 1000) }));
     if (loop.current_overdue) facts.push(LR.t('takes longer than usual'));
-    if (LR.isNum(loop.eta_s)) facts.push(loop.eta_s > 0 ? LR.t('in total {eta}', { eta: fmt.eta(loop.eta_s) }) : LR.t('almost done'));
+    if (LR.isNum(loop.eta_s)) {
+      const total = LR.isNum(loop.merge_expected_s) ? 'in total {eta} (including combining the results)' : 'in total {eta}';
+      facts.push(loop.eta_s > 0 ? LR.t(total, { eta: fmt.eta(loop.eta_s) }) : LR.t('almost done'));
+    }
     else if (!loop.estimate_basis) facts.push(LR.t('time left: estimated after the first step'));
     if (loop.estimate_basis === 'history') facts.push(LR.t('estimate from earlier tasks'));
     if (facts.length) out.push(h('p', { class: 'loop-eta' }, [icon('clock'), h('span', { text: facts.join(' · ') })]));
     return out.length ? h('div', { class: 'loop-progress-info' }, out) : null;
+  }
+
+  /** The last step of a big job: "Letzter Schritt: Ergebnisse zusammenführen · 40 % · noch etwa 1 Min." */
+  function mergeInfo(mp) {
+    const info = mp || {};
+    const facts = [LR.t('Last step: combining the results')];
+    const text = LR.progressText(info);
+    if (text) facts.push(text);
+    else if (!info.measured) facts.push(LR.t('time left: measured for the first time now'));
+    if (LR.isNum(info.elapsed_s)) facts.push(LR.t('running for {t}', { t: fmt.clock(info.elapsed_s * 1000) }));
+    return h('div', { class: 'loop-progress-info' }, [h('p', { class: 'loop-eta' }, [icon('clock'), h('span', { text: facts.join(' · ') })])]);
   }
 
   /** The step history with times, newest first – so it is clear what took how long. */
@@ -386,7 +409,7 @@
     const on = shared ? true : st.distributed.has(p.id);
     const merge_state = shared ? shared.merge_state : null;
     const mergeNote = merge_state && MERGE_TEXT[merge_state]
-      ? h('p', { class: 'small' + (merge_state === 'failed' ? ' is-error-text' : ' muted') }, [merge_state === 'failed' ? LR.icon('alert') : LR.spinner(), ' ', MERGE_TEXT[merge_state] + (merge_state === 'failed' && shared.merge_error ? ' ' + shared.merge_error : '')])
+      ? h('p', { class: 'small' + (merge_state === 'failed' ? ' is-error-text' : ' muted') }, [merge_state === 'failed' ? LR.icon('alert') : LR.spinner(), ' ', MERGE_TEXT[merge_state] + (merge_state === 'failed' && shared.merge_error ? ' ' + shared.merge_error : '') + (merge_state === 'running' && LR.progressText(shared.merge_progress) ? ' ' + LR.progressText(shared.merge_progress) : '')])
       : null;
     return h('div', { class: 'distribute' }, [
       h('div', { class: 'distribute-text' }, [

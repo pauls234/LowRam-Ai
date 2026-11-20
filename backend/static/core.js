@@ -270,6 +270,36 @@
   LR.get = (path, opts) => api('GET', path, null, opts);
   LR.post = (path, body, opts) => api('POST', path, body, opts);
 
+  /** POST a file's raw bytes (name in X-Filename) and return the JSON answer – documents, audio. */
+  LR.upload = async function (path, file, opts) {
+    const init = {
+      method: 'POST',
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/octet-stream',
+        'X-LowRAM-Token': LR.token,
+        'X-Filename': encodeURIComponent((file && file.name) || 'datei'),
+      },
+      body: file,
+      cache: 'no-store',
+      credentials: 'same-origin',
+      signal: opts && opts.signal,
+    };
+    let res;
+    try {
+      res = await fetch(path, init);
+    } catch (err) {
+      if (err && err.name === 'AbortError') throw err;
+      LR.setBackendDown(true);
+      throw new ApiError(LR.t('LowRAM AI is not reachable right now.'), 0, null, true);
+    }
+    LR.setBackendDown(false);
+    if (!res.ok) throw await errorFrom(res);
+    const data = await res.json().catch(() => null);
+    if (!data || typeof data !== 'object') throw new ApiError(LR.t('Unexpected response from LowRAM AI.'), res.status);
+    return data;
+  };
+
   /**
    * POST and consume a text/event-stream answer (EventSource cannot POST).
    * JSON errors sent before the stream starts are thrown as ApiError.
