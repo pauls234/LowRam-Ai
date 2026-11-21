@@ -26,6 +26,10 @@ Built for Macs with little RAM (Apple Silicon), also runs on Windows and Linux.
 > Schritt, Prozent und Restzeit; Ergebnis als Word-Datei. **Skills** (eigene Arbeitsweisen)
 > anlegen oder importieren. **Internet** im Chat einschalten: Websuche und Webseiten lesen,
 > mit Quellenangaben – nur öffentliche Seiten, nie Geräte im Heimnetz.
+> **Diktieren:** Auf das Mikrofon neben dem Eingabefeld klicken und sprechen – eine lokale
+> Spracherkennung (Whisper) macht daraus Text, mit Prozent und Restzeit. Auch Aufnahmen
+> (MP3, WAV, Sprachmemos) werden unter „Dokumente“ zu Text. Aufnahmen verlassen den Computer
+> nie und werden direkt danach gelöscht.
 > Wird der Mac sehr warm, machen lange Arbeiten eine Abkühlpause. Den Speicherbedarf
 > des Modells liest LowRAM AI genau aus der Modelldatei – so passt bei gleicher
 > Sicherheitsgrenze oft ein mehrfach größerer Kontext in den Arbeitsspeicher.
@@ -60,6 +64,7 @@ internet afterwards – only model/engine downloads you start yourself.
 | **MacBook-friendly** | Long jobs keep the Mac awake, pause on battery below a threshold you choose (default 20 %), take a cooling break when macOS reports the Mac as very warm (and continue once it has cooled down), and a notification tells you when a loop, an image or a merged result is ready – start it, do something else, come back later. |
 | **Documents** | Insert a PDF, Word, PowerPoint, Excel, OpenDocument, EPUB, RTF or HTML file (or a web page) and let LowRAM AI summarise, translate, correct, simplify or rewrite it with your own instruction. Long documents are split into sections that fit the model; you see "Abschnitt 3 von 12", percent, time left and a step history, an interrupted job continues where it stopped, and the result downloads as Word, Markdown or text. Documents also work as chat attachments and in the knowledge base. |
 | **Skills** | Reusable working instructions ("so arbeitest du") for the chat and documents: write your own or import a Markdown file – imported skills stay off until you have read them, and a skill changed afterwards must be checked again. Skills only change how LowRAM AI answers; nothing is ever run. |
+| **Dictation (speech to text)** | Click the microphone next to the chat input and speak: a local speech recognition (whisper.cpp, Whisper models) turns it into text in the input – with percent and time left while it works. Recordings (MP3, WAV, FLAC, Ogg; on the Mac also M4A/AIFF from Voice Memos) become documents you can summarise or translate. The app ships the program; the Whisper model (Base, Small or Large v3 Turbo – recommended by your RAM) downloads once with a SHA-256 check. Recordings never leave the computer and are deleted right after the transcription. |
 | **Internet (when you switch it on)** | The chat's *Internet* switch searches the web (DuckDuckGo, or your own SearXNG) or reads the links in your question, puts the best pages into the answer and lists them as sources [1], [2]. Only public web pages are read – never devices in your home network –, every redirect is checked, sizes and times are limited, and nothing about you is sent along. |
 | **Code** | A code chat mode, plus the coding agent: point it at a project folder, it plans small steps and proposes complete file changes as a diff. **Nothing changes on disk until you click Approve.** The model can never run commands. |
 | **Images & video** | Local generation with [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) (SD-Turbo, SD 1.5, SDXL-Turbo, Wan 2.1 video). Jobs queue up, show progress and can be cancelled. Video is very slow on small machines. |
@@ -195,6 +200,10 @@ What LowRAM AI does – and does not do – on your Mac:
 * **Documents are only read, carefully.** Only the text of a document is read – never
   macros or embedded objects – with limits on size, unpacked size ("zip bombs"), and XML
   without DTDs; PDFs are read in a separate process with a time limit.
+* **Recordings are deleted at once.** Dictation and audio files are sent only to LowRAM AI on
+  this computer, checked (format, length, silence), transcribed locally and deleted right
+  afterwards (leftovers of a crash at the next start); the text is kept only until the page
+  picked it up. The microphone is only on while the button shows the recording time.
 * **The internet only when you ask.** Nothing goes online unless you switch on *Internet* in
   the chat or add a web page; then the question goes to DuckDuckGo (or your SearXNG) and only
   public pages are read (no home-network addresses, checked redirects, no cookies).
@@ -210,7 +219,7 @@ What LowRAM AI does – and does not do – on your Mac:
 python3 -m unittest discover -s tests
 ```
 
-About 900 tests with fake model/image/web servers – no model or network needed.
+About 920 tests with fake model/image/web servers – no model or network needed.
 CI runs them on Ubuntu and macOS with Python 3.10–3.13; the release workflow
 builds the macOS and Windows apps on every `v*` tag.
 

@@ -580,7 +580,7 @@ def alert(message: str) -> None:
     try:
         if sys.platform == "darwin":
             script = 'on run argv\ndisplay alert "LowRAM AI konnte nicht starten" message (item 1 of argv) as critical\nend run'
-            subprocess.run(["osascript", "-e", script, message], timeout=600, check=False)
+            subprocess.run(["/usr/bin/osascript", "-e", script, message], timeout=600, check=False)
         elif os.name == "nt":
             import ctypes
 

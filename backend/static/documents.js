@@ -126,8 +126,40 @@
     ui.uploadMsg.className = 'small' + (tone === 'error' ? ' is-error-text' : ' muted');
   }
 
+  /** A recording: turned into text on this computer, then handled like any document. */
+  async function uploadAudio(file) {
+    if (st.uploading) return;
+    st.uploading = true;
+    ui.drop.classList.add('is-busy');
+    let cancel = null;
+    const stop = LR.button({ text: t('Cancel'), size: 'sm', variant: 'ghost', onclick: () => { if (cancel) cancel(); } });
+    const note = (text) => { uploadNote(text); ui.uploadMsg.append(' ', stop); };
+    try {
+      if (!(await LR.speech.ensureReady())) return;
+      note(t('Turning {name} into text on this computer …', { name: file.name }));
+      const job = await LR.speech.transcribe(file, {
+        onStart: (c) => { cancel = c; },
+        onProgress: (j) => note(file.name + ': ' + LR.speech.progressText(j)),
+      });
+      const data = await LR.post('/api/speech/jobs/' + job.id + '/document', {});
+      st.upload = data.upload;
+      uploadNote('');
+      renderForm();
+    } catch (err) {
+      if (err.cancelled) uploadNote('');
+      else uploadNote(err.message, 'error');
+    } finally {
+      st.uploading = false;
+      ui.drop.classList.remove('is-busy');
+    }
+  }
+
   async function upload(file) {
     if (st.uploading) return;
+    if (LR.speech && LR.speech.available !== false && LR.speech.isAudio(file)) {
+      uploadAudio(file);
+      return;
+    }
     const formats = st.formats || {};
     if (LR.isNum(formats.max_mb) && file.size > formats.max_mb * 1024 * 1024) {
       uploadNote(t('{name} is larger than {n} MB.', { name: file.name, n: formats.max_mb }), 'error');
@@ -205,7 +237,7 @@
         LR.setBusy(btn, false);
       }
     } });
-    const preview = h('details', { class: 'doc-preview' }, [
+    const preview = h('details', { class: 'doc-preview', open: u.kind === 'audio' }, [
       h('summary', { text: t('Show the beginning of the text') }),
       h('pre', { class: 'doc-preview-text', text: LR.str(u.preview) + (u.chars > LR.str(u.preview).length ? '\n…' : '') }),
     ]);
@@ -387,8 +419,10 @@
   async function show() {
     try {
       const f = await loadFormats();
-      ui.fileInput.accept = (f.suffixes || []).join(',');
-      ui.formatsLine.textContent = t('PDF, Word, PowerPoint, Excel, OpenDocument, EPUB, RTF, HTML or text') + ' · ' + t('up to {n} MB', { n: f.max_mb });
+      const speech = LR.speech && LR.speech.available !== false;
+      ui.fileInput.accept = (f.suffixes || []).concat(speech ? LR.speech.suffixes : []).join(',');
+      ui.formatsLine.textContent = t('PDF, Word, PowerPoint, Excel, OpenDocument, EPUB, RTF, HTML or text') + ' · ' + t('up to {n} MB', { n: f.max_mb })
+        + (speech ? ' · ' + t('recordings (MP3, WAV, M4A …) become text on this computer') : '');
     } catch (err) {
       if (err.status === 404) { ui.body.replaceChildren(LR.unavailable(t('Documents'))); return; }
     }

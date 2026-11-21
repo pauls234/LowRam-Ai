@@ -22,6 +22,10 @@ jobs:
         run: python -m pip install -r requirements.txt -r requirements-desktop.txt
       - name: Run tests
         run: python -m unittest discover -s tests -v
+      - name: Build whisper-cli (speech recognition, fixed whisper.cpp commit)
+        run: |
+          bin=$(bash desktop/build_whisper.sh)
+          echo "LOWRAM_BUNDLE_WHISPER=$bin" >> "$GITHUB_ENV"
       - name: Build LowRAM AI.app
         run: bash desktop/build_macos.sh
       - name: Smoke test (headless)
@@ -91,6 +95,26 @@ jobs:
           LOWRAM_HOME: ${{ runner.temp }}/lowram-real
         run: |
           for f in "$LOWRAM_HOME"/logs/*.log; do echo "== $f"; tail -n 80 "$f"; done || true
+      - name: Speech test (bundled whisper.cpp, model download, real transcription)
+        env:
+          LOWRAM_HOME: ${{ runner.temp }}/lowram-speech
+        run: |
+          "dist/LowRAM AI.app/Contents/MacOS/LowRAM AI" --headless --port 8797 &
+          pid=$!
+          for _ in $(seq 1 60); do
+            curl -fsS -o /dev/null http://127.0.0.1:8797/api/status && break
+            sleep 1
+          done
+          code=0
+          python desktop/speech_smoke.py http://127.0.0.1:8797 || code=$?
+          kill -TERM "$pid"
+          wait "$pid" || true
+          exit "$code"
+      - name: Show speech logs
+        if: always()
+        env:
+          LOWRAM_HOME: ${{ runner.temp }}/lowram-speech
+        run: tail -n 80 "$LOWRAM_HOME/logs/app.log" || true
 
   windows:
     name: Windows app (x64)
@@ -108,6 +132,26 @@ jobs:
       # portable launcher tests guard the Windows build.
       - name: Run desktop tests
         run: python -m unittest tests.test_desktop -v
+      - name: Build whisper-cli (speech recognition, fixed whisper.cpp commit)
+        shell: pwsh
+        run: |
+          $commit = "d1be6fde11ac6e0407606b4e42fe72d34add8037"  # whisper.cpp v1.9.5, as in desktop/build_whisper.sh
+          $work = Join-Path $env:RUNNER_TEMP "whisper.cpp"
+          git init -q $work
+          git -C $work remote add origin https://github.com/ggml-org/whisper.cpp.git
+          git -C $work fetch -q --depth 1 origin $commit
+          git -C $work checkout -q --force FETCH_HEAD
+          if ((git -C $work rev-parse HEAD) -ne $commit) { throw "unexpected whisper.cpp commit" }
+          # static C runtime and no OpenMP: the program needs no Visual C++ runtime on the user's PC
+          cmake -S $work -B "$work\build" -A x64 -DBUILD_SHARED_LIBS=OFF -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_OPENMP=OFF -DWHISPER_BUILD_TESTS=OFF -DWHISPER_BUILD_SERVER=OFF -DWHISPER_SDL2=OFF -DWHISPER_CURL=OFF -DCMAKE_POLICY_DEFAULT_CMP0091=NEW -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+          if ($LASTEXITCODE -ne 0) { throw "cmake configure failed" }
+          cmake --build "$work\build" --config Release --target whisper-cli -j 4
+          if ($LASTEXITCODE -ne 0) { throw "cmake build failed" }
+          $bin = Get-ChildItem -Path "$work\build" -Recurse -Filter whisper-cli.exe | Select-Object -First 1
+          if (-not $bin) { throw "whisper-cli.exe was not built" }
+          & $bin.FullName -h 2>$null | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "whisper-cli.exe does not start" }
+          "LOWRAM_BUNDLE_WHISPER=$($bin.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
       - name: Build LowRAM AI.exe
         run: python -m PyInstaller --noconfirm --clean desktop/LowRAM-AI.spec
       - name: Smoke test (headless)
@@ -152,6 +196,27 @@ jobs:
           name: LowRAM-AI-Windows-x64
           path: dist/LowRAM-AI-*-Windows-x64.zip
           if-no-files-found: error
+      - name: Speech test (bundled whisper.cpp, model download, real transcription)
+        shell: pwsh
+        env:
+          LOWRAM_HOME: ${{ runner.temp }}\lowram-speech
+        run: |
+          $exe = Join-Path $PWD "dist\LowRAM AI\LowRAM AI.exe"
+          $proc = Start-Process -FilePath $exe -ArgumentList "--headless", "--port", "8797" -PassThru
+          $status = $null
+          for ($i = 0; $i -lt 60 -and -not $status; $i++) {
+            try { $status = Invoke-RestMethod -Uri http://127.0.0.1:8797/api/status -TimeoutSec 2 } catch { Start-Sleep -Seconds 1 }
+          }
+          python desktop/speech_smoke.py http://127.0.0.1:8797
+          $code = $LASTEXITCODE
+          Stop-Process -Id $proc.Id -Force
+          if ($code -ne 0) { throw "The speech check of the built app failed" }
+      - name: Show speech log
+        if: always()
+        shell: pwsh
+        env:
+          LOWRAM_HOME: ${{ runner.temp }}\lowram-speech
+        run: Get-Content "$env:LOWRAM_HOME\logs\app.log" -Tail 80 -ErrorAction SilentlyContinue
 
   release:
     name: GitHub release

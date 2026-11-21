@@ -50,7 +50,7 @@ DEFAULT_COOL_WAIT_MINUTES = 15
 ES_CONTINUOUS = 0x80000000
 ES_SYSTEM_REQUIRED = 0x00000001
 # Control characters, zero-width and bidi overrides: never shown in a notification.
-_UNSAFE = re.compile(r"[\x00-\x1f\x7f-\x9f​-‏ -‮⁠-⁩﻿]+")
+_UNSAFE = re.compile(r"[\x00-\x1f\x7f-\x9f\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]+")
 
 
 def _platform() -> str:

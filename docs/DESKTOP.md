@@ -145,6 +145,17 @@ and per-device keys. Windows shows a similar firewall prompt – allow it for
 *private* networks only. Because the app is only ad-hoc signed, macOS may ask
 again after you install a new version.
 
+### Dictation (microphone)
+
+The first click on the microphone next to the chat input brings up the macOS
+prompt *"LowRAM AI" would like to access the microphone* (with the text "LowRAM
+AI hört nur zu, während du diktierst …") – allow it. If you denied it: System
+Settings → Privacy & Security → Microphone → turn on LowRAM AI. The recording
+stays on this computer and is deleted right after it became text. If the window
+cannot use the microphone, the message names LowRAM AI's address (e.g.
+`http://127.0.0.1:8765`) – open it in Safari or Chrome – or record with the
+Voice Memos app and drop the file under *Documents*.
+
 ### MacBook: long jobs, battery and notifications
 
 * **Stays awake while it works.** During the task queue, image/video jobs and

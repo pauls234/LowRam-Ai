@@ -1313,7 +1313,8 @@
     storage.hidden = true;
     const perf = buildPerf();
     perf.hidden = true;
-    page.append(head, ui.engine.el, perf, ui.models.el, ui.foundSlot, own, ui.downloads.el, storage, buildMemory(), buildResilience(), buildInstructions(), buildPrefs(), buildInternet(), buildPower(), ui.about.el);
+    ui.speech = LR.speech ? LR.speech.settingsCard() : null;
+    page.append(head, ui.engine.el, perf, ui.models.el, ui.foundSlot, own, ui.downloads.el, storage, buildMemory(), buildResilience(), buildInstructions(), buildPrefs(), buildInternet(), ...(ui.speech ? [ui.speech.el] : []), buildPower(), ui.about.el);
     root.append(page);
     return root;
   }
@@ -1337,6 +1338,7 @@
       syncExtras();
       syncInstructions();
       loadPower();
+      if (ui.speech) ui.speech.show();
       renderMemory(LR.state.memory);
       if (engineOk) LR.loadCatalog().catch(() => {});
       if (!unmountDownloads && !ui.downloads.el.hidden) {
@@ -1362,6 +1364,7 @@
     hide() {
       window.clearTimeout(storageTimer);
       window.clearTimeout(powerTimer);
+      if (ui.speech) ui.speech.hide();
       while (offs.length) offs.pop()();
       if (unmountDownloads) { unmountDownloads(); unmountDownloads = null; }
     },
