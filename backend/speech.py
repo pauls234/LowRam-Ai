@@ -82,6 +82,7 @@ RAM_WAIT_LONG_S = 600.0
 WAIT_STEP_S = 5.0
 CONVERT_TIMEOUT_S = 600.0
 KEEP_JOBS = 20
+MAX_QUEUE = 3  # recordings waiting at once (each is a file on disk until it is done)
 RESULT_TTL_S = 3600.0
 PARAGRAPH_CHARS = 700
 MISSING_CLI = ("Die Spracherkennung (whisper.cpp) fehlt. In der fertigen App ist sie enthalten – beim Start aus "
@@ -485,6 +486,10 @@ class SpeechWorker:
                 _remove(job.audio)
                 raise HTTPError(HTTPStatus.SERVICE_UNAVAILABLE, "LowRAM AI wird gerade beendet.")
             self._prune_locked()
+            if len(self._queue) >= MAX_QUEUE:
+                _remove(job.audio)
+                raise HTTPError(HTTPStatus.TOO_MANY_REQUESTS, "Es warten schon mehrere Aufnahmen – bitte warte, bis "
+                                                              "sie verschriftlicht sind.")
             if self._running or self._queue:
                 job.message = "Wartet, bis die vorherige Aufnahme verschriftlicht ist."
             self._jobs[job.id] = job
@@ -677,6 +682,9 @@ def transcribe(job: _Job) -> str:
         if job.cancel.is_set():
             raise _Cancelled
         if code != 0 or not text_file.is_file():
+            if job.kind == "ogg" and job.converted is None:
+                raise SpeechError("Diese Ogg-Datei ließ sich nicht lesen – Sprachnachrichten im Opus-Format kann "
+                                  "LowRAM AI noch nicht verschriftlichen. Speichere sie bitte als MP3 oder WAV.")
             detail = " · ".join(tail)[-300:] or f"Code {code}"
             raise SpeechError(f"Die Spracherkennung hat nicht geklappt ({detail}).")
         text = tidy(text_file.read_text(encoding="utf-8", errors="replace"))

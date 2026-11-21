@@ -313,6 +313,28 @@ class SpeechApiTests(AppTestCase):
             self.assertEqual(self.wait_for(first["id"], "done", "failed")["status"], "done")
         self.assertTrue(wait_until(lambda: self.leftovers() == []), self.leftovers())
 
+    def test_only_a_few_recordings_may_wait(self):
+        self.install_model()
+        with mock.patch.dict(os.environ, {"FAKE_WHISPER_MODE": "slow"}), mock.patch.object(speech, "MAX_QUEUE", 1):
+            first = self.send(tone(self.tmp / "a.wav").read_bytes())[1]["job"]
+            self.assertTrue(wait_until(lambda: self.job(first["id"])["status"] == "running", 10))
+            second = self.send(tone(self.tmp / "b.wav").read_bytes())[1]["job"]
+            status, data = self.send(tone(self.tmp / "c.wav").read_bytes())
+            self.assertEqual(status, 429, data)
+            self.assertIn("warten schon", data["error"])
+            self.assertEqual(len(self.leftovers()), 2)  # the refused recording was not kept
+            for job in (first, second):
+                self.api("POST", f"/api/speech/jobs/{job['id']}/cancel", {})
+        self.assertTrue(wait_until(lambda: self.leftovers() == []), self.leftovers())
+
+    def test_an_unreadable_ogg_voice_message_gets_a_clear_hint(self):
+        self.install_model()
+        with mock.patch.dict(os.environ, {"FAKE_WHISPER_MODE": "fail"}):
+            status, data = self.send(b"OggS\x00\x02" + b"\0" * 4000, name="Sprachnachricht.ogg")
+            self.assertEqual(status, 202, data)
+            job = self.wait_for(data["job"]["id"], "failed", "done")
+        self.assertIn("Opus", job["error"])
+
     def test_long_recordings_wait_for_other_work(self):
         self.install_model()
         release, held = threading.Event(), threading.Event()

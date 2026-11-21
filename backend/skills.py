@@ -164,7 +164,9 @@ def skill_path(name: str) -> Path:
 MAX_PROMPT_CHARS = 8000  # what a skill may add to a prompt (~2500 tokens)
 MAX_TITLE_CHARS = 80
 MAX_DESCRIPTION_CHARS = 300
-RESERVED_NAMES = frozenset({"import"})
+# "import" is a route; the others are device names Windows does not allow as file names (con.md …)
+RESERVED_NAMES = frozenset({"import", "con", "prn", "aux", "nul", *(f"com{i}" for i in range(1, 10)),
+                            *(f"lpt{i}" for i in range(1, 10))})
 _FRONT = re.compile(r"\A---[ \t]*\r?\n(.*?)\r?\n---[ \t]*(?:\r?\n|\Z)", re.S)
 
 

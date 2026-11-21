@@ -227,6 +227,12 @@ class StudioSkillTests(ChatApiTestCase):
         finally:
             conn.close()
 
+    def test_windows_device_names_are_never_file_names(self):
+        for title, name in (("Con", "con-2"), ("NUL", "nul-2"), ("com1", "com1-2"), ("Import", "import-2")):
+            status, data = self.api("POST", "/api/skills", {"title": title, "instructions": "Kurz antworten."})
+            self.assertEqual(status, 201, data)
+            self.assertEqual(data["skill"]["name"], name)
+
     def test_own_skill_is_used_in_the_chat(self):
         status, data = self.api("POST", "/api/skills", {"title": "Höfliche E-Mails", "description": "Für Kunden",
                                                          "instructions": "Antworte immer mit Sie und kurz."})
