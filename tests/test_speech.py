@@ -327,6 +327,16 @@ class SpeechApiTests(AppTestCase):
                 self.api("POST", f"/api/speech/jobs/{job['id']}/cancel", {})
         self.assertTrue(wait_until(lambda: self.leftovers() == []), self.leftovers())
 
+    def test_a_transcription_that_takes_too_long_is_stopped_with_a_clear_message(self):
+        self.install_model()
+        with mock.patch.dict(os.environ, {"FAKE_WHISPER_MODE": "slow"}), \
+                mock.patch.object(speech, "_timeout", return_value=0.5):
+            status, data = self.send(tone(self.tmp / "a.wav").read_bytes())
+            job = self.wait_for(data["job"]["id"], "failed", "done")
+        self.assertEqual(job["status"], "failed")
+        self.assertIn("zu lange gedauert", job["error"])
+        self.assertTrue(wait_until(lambda: self.leftovers() == []), self.leftovers())
+
     def test_an_unreadable_ogg_voice_message_gets_a_clear_hint(self):
         self.install_model()
         with mock.patch.dict(os.environ, {"FAKE_WHISPER_MODE": "fail"}):

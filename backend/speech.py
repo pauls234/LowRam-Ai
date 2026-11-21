@@ -661,7 +661,13 @@ def transcribe(job: _Job) -> str:
     _lower_priority(proc.pid)
     if job.cancel.is_set():
         _kill(proc)
-    timer = threading.Timer(_timeout(job), _kill, args=(proc,))
+    timed_out = threading.Event()
+
+    def too_long() -> None:
+        timed_out.set()
+        _kill(proc)
+
+    timer = threading.Timer(_timeout(job), too_long)
     timer.daemon = True
     timer.start()
     tail: collections.deque[str] = collections.deque(maxlen=8)
@@ -683,6 +689,9 @@ def transcribe(job: _Job) -> str:
     try:
         if job.cancel.is_set():
             raise _Cancelled
+        if timed_out.is_set():
+            raise SpeechError("Die Verschriftlichung hat zu lange gedauert und wurde abgebrochen – teile die Aufnahme "
+                              "bitte auf oder wähle ein kleineres Sprachmodell.")
         if code != 0 or not text_file.is_file():
             if job.kind == "ogg" and job.converted is None:
                 raise SpeechError("Diese Ogg-Datei ließ sich nicht lesen – Sprachnachrichten im Opus-Format kann "
