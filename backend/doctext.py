@@ -53,7 +53,8 @@ SUFFIX_KIND = {
 }
 OLD_OFFICE = {".doc": "Word", ".xls": "Excel", ".ppt": "PowerPoint"}
 KIND_LABEL = {"pdf": "PDF", "docx": "Word", "odt": "OpenDocument-Text", "pptx": "PowerPoint", "xlsx": "Excel",
-              "epub": "E-Book (EPUB)", "rtf": "RTF", "html": "Webseite (HTML)", "text": "Text"}
+              "epub": "E-Book (EPUB)", "rtf": "RTF", "html": "Webseite (HTML)", "text": "Text",
+              "audio": "Verschriftlichung (Audio)"}
 
 W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 A = "http://schemas.openxmlformats.org/drawingml/2006/main}"

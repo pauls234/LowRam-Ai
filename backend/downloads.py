@@ -68,7 +68,7 @@ MAX_REDIRECTS = 10
 
 JOB_ID_RE = re.compile(r"[A-Za-z0-9._-]{1,80}")
 SHA256_RE = re.compile(r"[0-9a-fA-F]{64}")
-KINDS = ("runtime", "model", "media-runtime", "media-model")
+KINDS = ("runtime", "model", "media-runtime", "media-model", "speech-model")
 EXTRACT_FORMATS = ("zip", "tar.gz")
 ACTIVE_STATES = ("queued", "downloading", "verifying", "extracting")
 FINAL_STATES = ("done", "failed", "cancelled")

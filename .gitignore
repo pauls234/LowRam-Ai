@@ -19,3 +19,5 @@ htmlcov/
 # desktop build output
 build/
 dist/
+# whisper.cpp source and build of desktop/build_whisper.sh outside CI
+.cache/

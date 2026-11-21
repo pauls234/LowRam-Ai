@@ -30,7 +30,7 @@ VERSION = re.search(r'__version__\s*=\s*"([^"]+)"', (ROOT / "backend" / "__init_
 # import scanner cannot see them. Modules that do not exist yet only produce an
 # "ERROR: Hidden import ... not found" line; the build continues.
 FEATURE_MODULES = ["api_coding", "chat", "engine", "localai", "downloads", "media", "cluster", "worker", "power", "diagnostics",
-                   "knowledge", "autosplit", "documents", "skills", "internet", "doctext"]
+                   "knowledge", "autosplit", "documents", "skills", "internet", "doctext", "speech"]
 hiddenimports = sorted(
     {f"backend.{p.stem}" for p in (ROOT / "backend").glob("*.py") if p.stem != "__init__"}
     | {f"backend.{name}" for name in FEATURE_MODULES}
@@ -83,10 +83,17 @@ elif sys.platform == "win32":
 else:
     icns = exe_icon = None
 
+# Speech recognition: the release workflow builds whisper-cli (whisper.cpp, fixed commit, see
+# desktop/build_whisper.sh) and passes its path; without it the app falls back to whisper-cli on the PATH.
+WHISPER = os.environ.get("LOWRAM_BUNDLE_WHISPER", "").strip()
+if WHISPER and not Path(WHISPER).is_file():
+    raise SystemExit(f"LOWRAM_BUNDLE_WHISPER points to a missing file: {WHISPER}")
+binaries = [(WHISPER, "whisper")] if WHISPER else []
+
 a = Analysis(  # noqa: F821
     [str(ROOT / "desktop" / "launcher.py")],
     pathex=[str(ROOT)],
-    binaries=[],
+    binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],
@@ -139,5 +146,8 @@ if sys.platform == "darwin":
             # permission; this text is shown in the system prompt. No Bonjour
             # (NSBonjourServices) is used, so no service types are declared.
             "NSLocalNetworkUsageDescription": "LowRAM AI finds and connects to your other computers on the same network.",
+            # Dictation: without this text macOS refuses the microphone (shown in the system prompt).
+            "NSMicrophoneUsageDescription": "LowRAM AI hört nur zu, während du diktierst. Die Aufnahme wird auf "
+                                            "diesem Mac verschriftlicht und danach gelöscht.",
         },
     )
