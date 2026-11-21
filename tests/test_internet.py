@@ -83,7 +83,7 @@ class AddressTests(unittest.TestCase):
                    "0.0.0.0", "224.0.0.251", "::1", "fe80::1", "fc00::1", "::ffff:192.168.0.1", "not-an-ip",
                    # IPv4 inside IPv6: NAT64 and SIIT would connect to the home network; ::a.b.c.d is never a server
                    "64:ff9b::7f00:1", "64:ff9b::c0a8:101", "64:ff9b:1::c0a8:101", "::ffff:0:7f00:1", "::127.0.0.1",
-                   "::8.8.8.8", "2002:c0a8:101::1"):
+                   "::8.8.8.8", "2002:c0a8:101::1", "2002:7f00:1::1", "2001:0:4136:e378:8000:63bf:3fff:fdd2"):
             self.assertFalse(internet.public_address(ip), ip)
         for ip in ("8.8.8.8", "1.1.1.1", "2606:4700:4700::1111", "::ffff:8.8.8.8",
                    "64:ff9b::808:808"):  # NAT64 on an IPv6-only network to a public IPv4 site still works

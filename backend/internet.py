@@ -88,6 +88,9 @@ def check_allowed() -> None:
 # --------------------------------------------------------------------------- safe requests
 
 _IPV4_INSIDE_IPV6 = (ipaddress.ip_network("64:ff9b::/96"), ipaddress.ip_network("::ffff:0:0:0/96"))  # NAT64, SIIT
+# never the internet, whatever the Python version knows: local NAT64 (RFC 8215), Teredo, ::/96
+_NEVER_PUBLIC_V6 = (ipaddress.ip_network("64:ff9b:1::/48"), ipaddress.ip_network("2001::/32"),
+                    ipaddress.ip_network("::/96"))
 
 
 def public_address(ip: str) -> bool:
@@ -101,8 +104,10 @@ def public_address(ip: str) -> bool:
             addr = addr.ipv4_mapped
         elif any(addr in net for net in _IPV4_INSIDE_IPV6):  # a translator would connect to the IPv4 address inside
             addr = ipaddress.IPv4Address(int(addr) & 0xFFFFFFFF)
-        elif int(addr) >> 32 == 0:  # ::/96 – "::127.0.0.1" and other deprecated forms are never a web server
+        elif any(addr in net for net in _NEVER_PUBLIC_V6):
             return False
+        elif addr.sixtofour is not None:  # 6to4: the IPv4 address inside decides
+            addr = addr.sixtofour
     return bool(addr.is_global) and not addr.is_multicast
 
 

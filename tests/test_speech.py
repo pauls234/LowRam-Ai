@@ -182,7 +182,9 @@ class SpeechApiTests(AppTestCase):
         return status, json.loads(payload)
 
     def job(self, job_id):
-        return self.api("GET", f"/api/speech/jobs/{job_id}")[1]["job"]
+        status, data = self.api("GET", f"/api/speech/jobs/{job_id}")
+        self.assertEqual(status, 200, data)  # on a failure: what the server answered
+        return data["job"]
 
     def wait_for(self, job_id, *statuses, timeout=15):
         self.assertTrue(wait_until(lambda: self.job(job_id)["status"] in statuses, timeout), self.job(job_id))
