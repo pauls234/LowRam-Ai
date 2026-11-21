@@ -119,12 +119,13 @@
       ui.fileInput.value = '';
     });
     ui.attach = h('button', { type: 'button', class: 'icon-btn attach-btn', 'aria-label': LR.t('Attach documents, text or code files'), title: LR.t('Attach files (PDF, Word, PowerPoint, Excel, text or code)'), onclick: () => ui.fileInput.click() }, icon('paperclip'));
+    ui.mic = LR.speech ? LR.speech.micButton({ onText: insertDictation, onStatus: micNote }) : null;
     ui.atts = h('ul', { class: 'att-list composer-atts', 'aria-label': LR.t('Files to send'), hidden: true });
     ui.attachMsg = h('p', { class: 'attach-msg', role: 'status', hidden: true });
     ui.form = h('form', { class: 'composer', novalidate: true }, [
       ui.atts,
       ui.input,
-      h('div', { class: 'composer-bar' }, [ui.attach, ui.mode.el, buildWebToggle(), buildKnowledgePicker(), buildSkillPicker(), h('span', { class: 'composer-spacer' }), buildBigJobButton(), ui.stop, ui.send]),
+      h('div', { class: 'composer-bar' }, [ui.attach, ui.mic ? ui.mic.el : null, ui.mode.el, buildWebToggle(), buildKnowledgePicker(), buildSkillPicker(), h('span', { class: 'composer-spacer' }), h('span', { class: 'composer-actions' }, [buildBigJobButton(), ui.stop, ui.send])]),
       ui.fileInput,
     ]);
     let dragDepth = 0;
@@ -175,6 +176,11 @@
       S.draftTimer = window.setTimeout(saveDraft, 300);
     });
     ui.scroll.addEventListener('scroll', onScroll, { passive: true });
+    let resizeTimer = 0;
+    window.addEventListener('resize', () => {  // a restored draft or dictated text keeps the right height
+      window.clearTimeout(resizeTimer);
+      resizeTimer = window.setTimeout(() => { if (ui.root.isConnected && !ui.dock.hidden) autosize(); }, 150);
+    });
     return ui.root;
   }
 
@@ -854,8 +860,50 @@
     return text;
   }
 
+  /** Dictated text goes where the cursor is, with a space to the words around it. */
+  function insertDictation(text) {
+    const input = S.ui.input;
+    const words = LR.str(text).trim();
+    if (!words) return;
+    const start = input.selectionStart ?? input.value.length;
+    const end = input.selectionEnd ?? start;
+    const before = input.value.slice(0, start);
+    const after = input.value.slice(end);
+    const glue = before && !/\s$/.test(before) ? ' ' : '';
+    const tail = after && !/^\s/.test(after) ? ' ' : '';
+    input.value = before + glue + words + tail + after;
+    const cursor = (before + glue + words).length;
+    input.focus();
+    input.setSelectionRange(cursor, cursor);
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+  }
+
+  /** Progress of a dictation: stays until it is done (no 7-second timeout like attachNote). */
+  function micNote(text) {
+    const el = S.ui.attachMsg;
+    window.clearTimeout(S.attachTimer);
+    el.textContent = text;
+    el.hidden = !text;
+    el.classList.toggle('is-progress', Boolean(text));
+  }
+
+  /** An audio file dropped into the chat becomes text in the input (not an attachment). */
+  async function dictateFile(file) {
+    if (!(await LR.speech.ensureReady())) return;
+    micNote(LR.t('Turning {name} into text …', { name: file.name }));
+    try {
+      const job = await LR.speech.transcribe(file, { onProgress: (j) => micNote(file.name + ': ' + LR.speech.progressText(j)) });
+      micNote('');
+      insertDictation(job.text);
+    } catch (err) {
+      micNote('');
+      if (!err.cancelled) attachNote(file.name + ': ' + err.message);
+    }
+  }
+
   function attachNote(text) {
     const el = S.ui.attachMsg;
+    el.classList.remove('is-progress');
     el.textContent = text;
     el.hidden = !text;
     window.clearTimeout(S.attachTimer);
@@ -869,6 +917,10 @@
       if (S.attachments.length >= MAX_FILES && !S.attachments.some((a) => a.name === file.name)) {
         problems.push(LR.t('You can attach up to ') + MAX_FILES + LR.t(' files.'));
         break;
+      }
+      if (LR.speech && LR.speech.available !== false && LR.speech.isAudio(file)) {
+        dictateFile(file);  // runs on its own; its progress shows in the line below the input
+        continue;
       }
       if (DOCUMENT_EXT.test(file.name)) {
         attachNote(LR.t('Reading {name}…', { name: file.name }));
@@ -1448,6 +1500,7 @@
         newChat();
       }
       window.requestAnimationFrame(() => {
+        autosize();  // only now is the input laid out: a restored draft gets its full height
         if (window.matchMedia('(min-width: 900px)').matches && !S.ui.dock.hidden) S.ui.input.focus({ preventScroll: true });
       });
     },

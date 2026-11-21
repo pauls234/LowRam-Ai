@@ -447,6 +447,7 @@ class _Job:
         self.started: float | None = None
         self.finished: float | None = None
         self.expected_s: float | None = None
+        self.first_run = False  # nothing measured on this computer yet (Metal prepares itself once)
         self.cancel = threading.Event()
         self.proc: subprocess.Popen | None = None
 
@@ -467,7 +468,7 @@ class _Job:
                 "eta_s": None if eta is None else round(eta, 1), "message": self.message,
                 "text": self.text if done else None, "error": self.error,
                 "audio_s": None if self.audio_s is None else round(self.audio_s, 1),
-                "model": self.model["id"], "language": self.language}
+                "model": self.model["id"], "language": self.language, "first_run": self.first_run}
 
 
 class SpeechWorker:
@@ -645,6 +646,7 @@ def transcribe(job: _Job) -> str:
     text_file = out_base.with_name(out_base.name + ".txt")
     per_minute = progress.typical("speech_min", job.model["id"])  # seconds of work per minute of audio, measured here
     job.expected_s = per_minute * job.audio_s / 60 if per_minute and job.audio_s else None
+    job.first_run = per_minute is None
     argv = [*command, "-m", str(model_path(job.model)), "-f", str(audio), "-l", job.language,
             "-t", str(_threads()), "-otxt", "-of", str(out_base), "-pp", "-np"]
     job.status, job.message, job.percent, job.started = "running", None, 0, time.monotonic()
