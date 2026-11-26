@@ -409,6 +409,23 @@ class SpeechApiTests(AppTestCase):
             self.assertEqual(self.api("GET", f"/api/speech/jobs/{job['id']}")[0], 404)
         self.assertEqual(self.api("GET", "/api/speech/jobs/zz")[0], 404)
 
+    def test_the_speech_recognition_is_prepared_once(self):
+        model = speech.get_model("base")
+        self.install_model()
+        with mock.patch.object(speech, "WARM_UP_PLATFORMS", (sys.platform,)):
+            with mock.patch.object(power, "battery_block_reason", return_value="Akku fast leer"):
+                self.assertFalse(speech.warm_up(model))  # never on a low battery
+            self.assertTrue(speech.warm_up(model))
+            self.assertFalse(speech.warm_up(model))  # once per program and model
+        calls = self.calls.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(calls), 1)
+        self.assertIn("warm-", calls[0])
+        self.assertIsNone(progress.typical("speech_min", "base"))  # preparing is no measurement for estimates
+        self.assertEqual(self.leftovers(), [])
+        with mock.patch.object(speech, "WARM_UP_PLATFORMS", ()):
+            (config.home_dir() / "speech" / "warmed.json").unlink()
+            self.assertFalse(speech.warm_up(model))  # only where the GPU code needs it (the Mac)
+
     def test_model_install_and_delete(self):
         meta = {"url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin",
                 "sha256": "a" * 64, "size": 147_951_465}
@@ -420,6 +437,7 @@ class SpeechApiTests(AppTestCase):
         args, kwargs = start.call_args
         self.assertEqual(args[0], "speech-base")
         self.assertEqual((kwargs["sha256"], kwargs["size"], kwargs["kind"]), ("a" * 64, 147_951_465, "speech-model"))
+        self.assertTrue(callable(kwargs["on_complete"]))  # prepares the speech recognition after the download
         self.assertEqual(Path(args[2]), speech.model_path(speech.get_model("base")))
 
         path = self.install_model("base")

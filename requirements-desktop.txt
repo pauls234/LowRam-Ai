@@ -9,3 +9,7 @@ pyinstaller-hooks-contrib==2026.9
 # CA certificates for HTTPS downloads inside the frozen app (the bundled
 # Python cannot see the build machine's certificate store).
 certifi==2026.10.23
+# Text recognition (OCR) for photos and scanned PDFs on the Mac: Apple's on-device Vision framework
+# (from the same pyobjc project as pywebview's own macOS dependencies).
+pyobjc-framework-Vision>=10.0; sys_platform == "darwin"
+pyobjc-framework-Quartz>=10.0; sys_platform == "darwin"

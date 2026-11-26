@@ -907,6 +907,45 @@ class WindowController:
             self._call("destroy")
 
 
+SELFTEST_ENV = "LOWRAM_WINDOW_SELFTEST"  # CI only: what the window's web view offers the page, to this file
+SELFTEST_JS = (
+    "JSON.stringify({secure: window.isSecureContext, origin: location.origin,"
+    " mediaDevices: !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia),"
+    " audioContext: typeof (window.AudioContext || window.webkitAudioContext) === 'function',"
+    " audioWorklet: typeof window.AudioWorkletNode === 'function',"
+    " speech: !!(window.LR && window.LR.speech)})"
+)
+
+
+def window_selftest(window: Any, out: Path, quit_app: Callable[[], None], attempts: int = 60,
+                    interval: float = 0.5) -> dict:
+    """Wait for the app page in the window, write what it can use (microphone API …) to ``out``, quit.
+
+    Only reads: nothing is recorded and no permission is asked for. Used by the release workflow to
+    check the real window (WKWebView on the Mac), which a headless test cannot show.
+    """
+    result: dict = {"error": "the app page did not load"}
+    for _ in range(attempts):
+        time.sleep(interval)
+        try:
+            raw = window.evaluate_js(SELFTEST_JS)
+        except Exception as exc:  # the page may still be loading
+            result = {"error": str(exc)[:300]}
+            continue
+        try:
+            data = json.loads(raw) if isinstance(raw, str) else dict(raw or {})
+        except (TypeError, ValueError):
+            continue
+        result = data
+        if data.get("speech"):  # the app page, not the splash screen
+            break
+    try:
+        out.write_text(json.dumps(result), encoding="utf-8")
+    finally:
+        quit_app()
+    return result
+
+
 def run_window(starter: Starter, storage_dir: Path, log_path: Path | None,
                tray_factory: Callable[..., Any] | None = default_tray_factory) -> int | None:
     """Show the native window until it is closed. None = no native web view (use the browser)."""
@@ -949,6 +988,10 @@ def run_window(starter: Starter, storage_dir: Path, log_path: Path | None,
             return
         _call_window(window.load_url, backend.url)
         controller.attach_tray(backend)
+        selftest = os.environ.get(SELFTEST_ENV, "").strip()
+        if selftest:
+            threading.Thread(target=window_selftest, args=(window, Path(selftest), lambda: on_signal(signal.SIGTERM)),
+                             name="lowram-window-selftest", daemon=True).start()
 
     gui_done = threading.Event()
 

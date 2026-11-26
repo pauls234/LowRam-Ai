@@ -126,6 +126,18 @@
     ui.uploadMsg.className = 'small' + (tone === 'error' ? ' is-error-text' : ' muted');
   }
 
+  /** A photo or scanned PDF: its text is recognised on this computer first, page by page. */
+  async function recognise(upload) {
+    let cancel = null;
+    const stop = LR.button({ text: t('Cancel'), size: 'sm', variant: 'ghost', onclick: () => { if (cancel) cancel(); } });
+    const note = (text) => { uploadNote(text); ui.uploadMsg.append(' ', stop); };
+    note(t('Recognising the text of {name} on this computer…', { name: LR.str(upload.name) }));
+    return LR.ocr.run(upload, {
+      onStart: (c) => { cancel = c; },
+      onProgress: (job) => note(LR.str(upload.name) + ': ' + LR.ocr.progressText(job)),
+    });
+  }
+
   /** A recording: turned into text on this computer, then handled like any document. */
   async function uploadAudio(file) {
     if (st.uploading) return;
@@ -170,11 +182,12 @@
     uploadNote(t('Reading {name}…', { name: file.name }));
     try {
       const data = await LR.upload('/api/documents/uploads', file);
-      st.upload = data.upload;
+      st.upload = data.upload.needs_ocr && LR.ocr ? await recognise(data.upload) : data.upload;
       uploadNote('');
       renderForm();
     } catch (err) {
-      uploadNote(err.message, 'error');
+      if (err.cancelled) uploadNote('');
+      else uploadNote(err.message, 'error');
     } finally {
       st.uploading = false;
       ui.drop.classList.remove('is-busy');
@@ -426,6 +439,7 @@
       const speech = LR.speech && LR.speech.available !== false;
       ui.fileInput.accept = (f.suffixes || []).concat(speech ? LR.speech.suffixes : []).join(',');
       ui.formatsLine.textContent = t('PDF, Word, PowerPoint, Excel, OpenDocument, EPUB, RTF, HTML or text') + ' · ' + t('up to {n} MB', { n: f.max_mb })
+        + (f.ocr && f.ocr.available ? ' · ' + t('photos and scans (text recognition on this Mac)') : '')
         + (speech ? ' · ' + t('recordings (MP3, WAV, M4A …) become text on this computer') : '');
     } catch (err) {
       if (err.status === 404) { ui.body.replaceChildren(LR.unavailable(t('Documents'))); return; }

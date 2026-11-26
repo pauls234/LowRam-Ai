@@ -19,6 +19,8 @@ import struct
 import sys
 from pathlib import Path
 
+from PyInstaller.utils.hooks import collect_submodules
+
 ROOT = Path(SPECPATH).resolve().parent  # noqa: F821 - SPECPATH is provided by PyInstaller
 ASSETS = ROOT / "desktop" / "assets"
 ICON_DIR = Path(workpath) / "icons"  # noqa: F821 - workpath is provided by PyInstaller
@@ -30,13 +32,15 @@ VERSION = re.search(r'__version__\s*=\s*"([^"]+)"', (ROOT / "backend" / "__init_
 # import scanner cannot see them. Modules that do not exist yet only produce an
 # "ERROR: Hidden import ... not found" line; the build continues.
 FEATURE_MODULES = ["api_coding", "chat", "engine", "localai", "downloads", "media", "cluster", "worker", "power", "diagnostics",
-                   "knowledge", "autosplit", "documents", "skills", "internet", "doctext", "speech"]
+                   "knowledge", "autosplit", "documents", "skills", "internet", "doctext", "speech", "ocr"]
 hiddenimports = sorted(
     {f"backend.{p.stem}" for p in (ROOT / "backend").glob("*.py") if p.stem != "__init__"}
     | {f"backend.{name}" for name in FEATURE_MODULES}
     | {"desktop", "desktop.launcher", "desktop.tray", "certifi", "pypdf"}
     # menu-bar icon (desktop/tray.py imports these lazily; pyobjc comes with pywebview)
     | ({"AppKit", "Foundation", "PyObjCTools.AppHelper"} if sys.platform == "darwin" else set())
+    # text recognition (backend/ocr.py): Apple's Vision and Quartz (CoreGraphics, ImageIO), loaded in a child process
+    | (set(collect_submodules("Vision")) | set(collect_submodules("Quartz")) if sys.platform == "darwin" else set())
 )
 
 datas = [

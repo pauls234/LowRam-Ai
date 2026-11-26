@@ -133,25 +133,94 @@ def _expire_uploads() -> None:
     metas.sort()
     for index, (mtime, meta) in enumerate(metas):
         if now - mtime > UPLOAD_TTL_S or index < len(metas) - (MAX_UPLOADS - 1):
-            for path in (meta, meta.with_suffix(".txt")):
+            for path in (meta, meta.with_suffix(".txt"), meta.with_suffix(".src"), meta.with_suffix(".pages.json")):
                 path.unlink(missing_ok=True)
 
 
+def _ocr_available() -> tuple[bool, str | None]:
+    try:
+        from . import ocr  # lazy: an optional feature module
+    except ImportError:
+        return False, "Texterkennung ist in dieser Version nicht enthalten."
+    return ocr.available(), ocr.unavailable_reason()
+
+
 def save_upload(name: str, data: bytes) -> dict:
-    """Extract the text of an uploaded file and keep it for 24 hours."""
+    """Extract the text of an uploaded file and keep it for 24 hours.
+
+    A photo or a mostly scanned PDF keeps its original (``<id>.src``) until text recognition
+    (:mod:`backend.ocr`) has read it: the upload then says ``needs_ocr`` and which pages.
+    """
     name = _clean_name(name)
     result = doctext.extract(name, data)
-    if not result.text.strip():
+    ocr_pending = False
+    if result.needs_ocr:
+        can_ocr, reason = _ocr_available()
+        if can_ocr:
+            ocr_pending = True
+            if result.kind == "pdf":
+                result.warnings.append("LowRAM AI erkennt jetzt den Text der eingescannten Seiten (Texterkennung).")
+        elif result.kind == "image" or not result.text.strip():
+            raise doctext.DocumentError(" ".join([*result.warnings, reason or ""]).strip())
+        else:
+            result.warnings.append(reason or "")
+    if not result.text.strip() and not ocr_pending:
         raise doctext.DocumentError(" ".join(result.warnings) or "In der Datei wurde kein Text gefunden.")
     _expire_uploads()
     upload_id = secrets.token_hex(8)
     folder = _uploads()
     artifacts.write_text_atomic(folder / f"{upload_id}.txt", result.text)
     meta = {"id": upload_id, "name": name, "kind": result.kind, "kind_label": result.label, "chars": len(result.text),
-            "pages": result.pages, "truncated": result.truncated, "warnings": result.warnings,
-            "created_at": db.utcnow()}
+            "pages": result.pages, "truncated": result.truncated, "warnings": [w for w in result.warnings if w],
+            "created_at": db.utcnow(), "needs_ocr": ocr_pending}
+    if ocr_pending:
+        (folder / f"{upload_id}.src").write_bytes(data)  # only until the text is recognised (≤ 24 h)
+        meta["ocr_pages"] = result.low_text_pages if result.kind == "pdf" else [1]
+        if result.page_texts is not None:
+            artifacts.write_json_atomic(folder / f"{upload_id}.pages.json", result.page_texts)
     artifacts.write_json_atomic(folder / f"{upload_id}.json", meta)
     return {**meta, "preview": result.text[:PREVIEW_CHARS]}
+
+
+def ocr_source(upload_id: str) -> tuple[dict, Path, list[int] | None]:
+    """The upload, its kept original and the pages to recognise (for :mod:`backend.ocr`)."""
+    meta, _ = load_upload(upload_id)
+    source = _uploads() / f"{upload_id}.src"
+    if not meta.get("needs_ocr") or not source.is_file():
+        raise db.NotFound("Für diese Datei gibt es nichts zu erkennen – lade sie bitte erneut hoch.")
+    pages = meta.get("ocr_pages") if meta["kind"] == "pdf" else None
+    return meta, source, [int(n) for n in pages] if pages else None
+
+
+def finish_ocr(upload_id: str, texts: dict[int, str]) -> dict:
+    """Put the recognised text into the upload: scanned pages replaced, pages with text kept."""
+    meta, text = load_upload(upload_id)
+    folder = _uploads()
+    if meta["kind"] == "pdf":
+        try:
+            pages = json.loads((folder / f"{upload_id}.pages.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            pages = [""] * max(texts or {0: ""})
+        for number, recognised in texts.items():
+            if 1 <= number <= len(pages) and recognised.strip():
+                pages[number - 1] = recognised
+        new_text = doctext.join_pages(pages)
+    else:
+        new_text = (texts.get(1) or "").strip()
+    if not new_text.strip():
+        raise doctext.DocumentError("Auf den Seiten wurde kein Text erkannt – ist das Bild scharf und gut lesbar?")
+    if len(new_text) > doctext.MAX_TEXT_CHARS:
+        new_text = new_text[: doctext.MAX_TEXT_CHARS]
+        meta["truncated"] = True
+    artifacts.write_text_atomic(folder / f"{upload_id}.txt", new_text)
+    warnings = [w for w in meta.get("warnings", []) if "eingescannt" not in w and "Texterkennung" not in w]
+    warnings.append("Der Text wurde per Texterkennung gelesen – Fehler sind möglich, bitte kurz gegenlesen.")
+    meta.update(chars=len(new_text), warnings=warnings, needs_ocr=False, ocr=True)
+    meta.pop("ocr_pages", None)
+    artifacts.write_json_atomic(folder / f"{upload_id}.json", meta)
+    for path in (folder / f"{upload_id}.src", folder / f"{upload_id}.pages.json"):
+        path.unlink(missing_ok=True)
+    return {**meta, "preview": new_text[:PREVIEW_CHARS]}
 
 
 def load_upload(upload_id: object) -> tuple[dict, str]:
@@ -355,6 +424,9 @@ def create_job(data: dict, *, skill: dict | None = None) -> dict:
     if skill:
         options.update(skill_text=skill["instructions"], skill_name=skill["name"])
     meta, text = load_upload(data.get("upload_id"))
+    if meta.get("needs_ocr"):
+        raise HTTPError(HTTPStatus.CONFLICT, "Der Text dieser Datei wird noch erkannt – warte bitte, bis die "
+                                             "Texterkennung fertig ist.")
     with db.connect() as conn:
         count = conn.execute("SELECT COUNT(*) FROM document_jobs").fetchone()[0]
     if count >= MAX_JOBS:
@@ -838,8 +910,11 @@ def plain_text(markdown: str) -> str:
 
 @route("GET", r"/api/documents/formats")
 def get_formats(req: Request) -> Response:
+    can_ocr, reason = _ocr_available()
+    suffixes = [s for s, kind in doctext.SUFFIX_KIND.items() if kind != "image" or can_ocr]
     return Response({
-        "suffixes": sorted(doctext.SUFFIX_KIND),
+        "suffixes": sorted(suffixes),
+        "ocr": {"available": can_ocr, "reason": reason},
         "max_mb": doctext.MAX_FILE_BYTES // doctext.MIB,
         "actions": [{"id": key, "label": label} for key, label in ACTIONS.items()],
         "languages": list(LANGUAGES),

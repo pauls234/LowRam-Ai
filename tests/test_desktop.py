@@ -202,6 +202,29 @@ class InstanceTests(DesktopTestCase):
         self.assertNotIn("shutdown", self.events)
 
 
+class WindowSelfTestTests(unittest.TestCase):
+    def test_reports_what_the_page_can_use_and_quits(self):
+        import tempfile
+
+        answers = iter([None, '{"speech": false}',
+                        '{"speech": true, "secure": true, "mediaDevices": true, "audioWorklet": true}'])
+
+        class Window:
+            def evaluate_js(self, script):
+                self.script = script
+                return next(answers)
+
+        quits = []
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "selftest.json"
+            window = Window()
+            result = launcher.window_selftest(window, out, lambda: quits.append(1), attempts=10, interval=0.01)
+            self.assertEqual(json.loads(out.read_text()), result)
+        self.assertTrue(result["mediaDevices"] and result["secure"])
+        self.assertEqual(quits, [1])
+        self.assertIn("getUserMedia", window.script)  # only reads – nothing is recorded
+
+
 class RunTests(DesktopTestCase):
     def test_no_window_opens_browser_serves_and_shuts_down_cleanly(self):
         port = free_port()

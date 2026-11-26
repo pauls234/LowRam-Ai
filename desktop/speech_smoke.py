@@ -158,6 +158,14 @@ def main() -> None:
         fail(f"settings: {code} {data}")
     log("   ok, speech recognition is ready")
 
+    if sys.platform == "darwin":  # the app prepares the speech recognition after the download (Metal, once)
+        warmed = Path(os.environ["LOWRAM_HOME"]) / "speech" / "warmed.json"
+        started = time.monotonic()
+        while not warmed.exists() and time.monotonic() - started < 120:
+            time.sleep(1)
+        log(f"   prepared in the background: {'yes' if warmed.exists() else 'NO'} "
+            f"(waited {time.monotonic() - started:.0f} s)")
+
     log("3. Silence is refused")
     code, data = app.call("POST", "/api/speech/transcribe", raw=silence(folder / "stille.wav").read_bytes(),
                           name="stille.wav")
@@ -172,7 +180,7 @@ def main() -> None:
         words = set(re.findall(r"\w+", job["text"].lower()))
         share = len(words & expected) / len(expected)
         log(f"   {audio.suffix[1:].upper()}: {job['seconds']:.1f} s for {job['audio_s']} s of audio: {job['text']!r} "
-            f"({share:.0%} of the words)")
+            f"({share:.0%} of the words)" + (" – the first dictation" if audio == files[0] else ""))
         if share < 0.5:
             fail("the text does not match what was said")
     if not files:

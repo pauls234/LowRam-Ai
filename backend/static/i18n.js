@@ -1367,6 +1367,17 @@
     'Turning {name} into text …': '{name} wird zu Text …',
     'Turning {name} into text on this computer …': '{name} wird auf diesem Computer zu Text …',
     'recordings (MP3, WAV, M4A …) become text on this computer': 'Aufnahmen (MP3, WAV, M4A …) werden auf diesem Computer zu Text',
+    // text recognition (v0.7.0)
+    '1 page left': 'noch 1 Seite',
+    '{n} pages left': 'noch {n} Seiten',
+    'Text recognition: page {n} of {total}': 'Texterkennung: Seite {n} von {total}',
+    'Recognising the text…': 'Text wird erkannt …',
+    'Text recognition': 'Texterkennung',
+    'The text recognition failed.': 'Die Texterkennung ist fehlgeschlagen.',
+    'Recognising the text of {name} on this computer…': 'Der Text von {name} wird auf diesem Computer erkannt …',
+    'photos and scans (text recognition on this Mac)': 'Fotos und Scans (Texterkennung auf diesem Mac)',
+    // live writing progress in the chat (v0.7.0)
+    'Writing … {n} words · {rate} words/s · {time}': 'Schreibt … {n} Wörter · {rate} Wörter/s · {time}',
     // steps, sections, parts left (v0.6.2)
     '1 step left': 'noch 1 Schritt',
     '{n} steps left': 'noch {n} Schritte',

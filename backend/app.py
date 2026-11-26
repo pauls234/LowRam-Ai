@@ -34,7 +34,7 @@ from .web import FileResponse, HTTPError, StreamResponse
 # Feature modules register their routes/hooks on import. A module that does not
 # exist yet (built in parallel) is skipped; any other import error is raised.
 FEATURE_MODULES = ("api_coding", "chat", "engine", "localai", "media", "cluster", "power", "diagnostics", "knowledge",
-                   "autosplit", "documents", "skills", "internet", "speech")
+                   "autosplit", "documents", "skills", "internet", "speech", "ocr")
 LOADED_FEATURES: list[str] = []
 for _name in FEATURE_MODULES:
     try:
