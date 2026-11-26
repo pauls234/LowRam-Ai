@@ -60,13 +60,13 @@
 
   const DOCUMENT_EXT = /\.(pdf|docx|odt|pptx|xlsx|epub|rtf)$/i;
 
-  async function readFile(file) {
+  async function readFile(file, onProgress) {
     if (DOCUMENT_EXT.test(file.name) || (LR.ocr && LR.ocr.isImage(file))) {  // PDF, Word, photos & co.: read here
       const data = await LR.upload('/api/documents/uploads?text=1', file);
       let upload = data.upload;
-      if (upload && upload.needs_ocr && LR.ocr) {
-        LR.toast(t('Recognising the text of {name} on this computer…', { name: file.name }));
-        upload = await LR.ocr.run(upload);
+      if (upload && upload.needs_ocr && LR.ocr) {  // a photo or scan: page by page, with the time left
+        if (onProgress) onProgress(t('Recognising the text of {name} on this computer…', { name: file.name }));
+        upload = await LR.ocr.run(upload, { onProgress: (job) => { if (onProgress) onProgress(file.name + ': ' + LR.ocr.progressText(job)); } });
       }
       const text = LR.str(upload && upload.text);
       if (new TextEncoder().encode(text).length > MAX_BYTES) throw new Error(t('The text of {name} is longer than 2 MB – split the document first.', { name: file.name }));
@@ -184,9 +184,10 @@
       let added = 0;
       for (let i = 0; i < files.length; i++) {
         const file = files[i];
-        status.textContent = t('Adding {n} of {total}…', { n: i + 1, total: files.length });
+        const adding = t('Adding {n} of {total}…', { n: i + 1, total: files.length });
+        status.textContent = adding;
         try {
-          const content = await readFile(file);
+          const content = await readFile(file, (text) => { status.textContent = adding + ' ' + text; });
           await LR.post(base + '/documents', { name: file.name, content });
           added++;
         } catch (err) {

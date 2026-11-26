@@ -825,7 +825,14 @@ class HardeningTests(ClusterTestCase):
                     raise ConnectionResetError("closed")
             for sock in held:
                 sock.close()
-            self.wait(lambda: self.lan_request("POST", "/cluster/v1/heartbeat")[0] == 401)
+
+            def answers():  # the server frees the closed connections' slots a moment later: refused until then
+                try:
+                    return self.lan_request("POST", "/cluster/v1/heartbeat")[0] == 401
+                except OSError:
+                    return False
+
+            self.wait(answers)
 
     def test_worker_reconnects_after_the_host_comes_back(self):
         w = self.make_worker(self.new_code(), "roamer")

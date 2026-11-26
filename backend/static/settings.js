@@ -235,7 +235,7 @@
     return h('article', { class: 'model-card' + (m.recommended ? ' is-recommended' : '') + (active ? ' is-active' : ''), 'aria-label': m.name || m.id }, [
       h('div', { class: 'model-head' }, [h('h3', { class: 'model-name', text: m.name || m.id }), h('div', { class: 'badges' }, badges)]),
       h('p', { class: 'model-family', text: [m.family, m.license].filter(Boolean).join(' · ') }),
-      m.description ? h('p', { class: 'model-desc', text: m.description }) : null,
+      m.description ? h('p', { class: 'model-desc', text: LR.t(m.description) }) : null,  // catalog texts are translated
       facts,
       tooBig ? h('p', { class: 'model-warn' }, [icon('alert'), h('span', { text: LR.t('Needs more memory than this computer has – it may be very slow or fail.') })]) : null,
       m.warning ? h('p', { class: 'model-warn' }, [icon('clock'), h('span', { text: LR.str(m.warning) })]) : null,

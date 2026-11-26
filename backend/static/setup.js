@@ -166,7 +166,7 @@
             m.installed ? LR.badge(LR.t('Installed'), 'ok') : null,
             m.purpose === 'code' ? LR.badge('Code', 'info') : null,
           ]),
-          m.description ? h('span', { class: 'choice-desc', text: m.description }) : null,
+          m.description ? h('span', { class: 'choice-desc', text: LR.t(m.description) }) : null,  // catalog texts are translated
           h('span', { class: 'choice-facts', text: [
             m.installed ? LR.t('Already downloaded') : fmt.bytes(m.size_bytes) + LR.t(' download'),
             LR.isNum(m.min_ram_gb) ? LR.t('needs ') + fmt.ramGb(m.min_ram_gb) + ' RAM' : '',

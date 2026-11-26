@@ -504,7 +504,7 @@
         await loadProjects();
         if (data.project) LR.go('#/code/' + data.project.id);
       } catch (err) {
-        (/path|repo|folder|director/i.test(err.message) ? fRepo : fGoal).setError(err.message);
+        (/path|repo|folder|director/i.test(err.raw || err.message) ? fRepo : fGoal).setError(err.message);
         LR.setBusy(btn, false);
       }
     }

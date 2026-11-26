@@ -747,7 +747,7 @@ p.small .icon, p.muted .icon { width: 15px; height: 15px; vertical-align: -3px; 
 }
 .composer-input::placeholder { color: var(--text-3); }
 .composer-input.is-scrolling { overflow-y: auto; }
-.composer-bar { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
+.composer-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; row-gap: 6px; margin-top: 8px; }  /* many tools: a second row, never squashed */
 .composer-spacer { flex: 1; }
 .composer-actions { display: inline-flex; align-items: center; gap: 8px; margin-left: auto; }
 .send-btn, .stop-btn {
@@ -1334,7 +1334,7 @@ p.small .icon, p.muted .icon { width: 15px; height: 15px; vertical-align: -3px; 
 .kb-picker .icon { width: 15px; height: 15px; flex: none; }
 .kb-picker.is-on { color: var(--accent-text); }
 .kb-label { white-space: nowrap; }
-.kb-select { min-width: 0; max-width: 180px; font: inherit; font-size: 13px; color: var(--text); background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; padding: 3px 6px; }
+.kb-select { min-width: 110px; max-width: 180px; font: inherit; font-size: 13px; color: var(--text); background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; padding: 3px 6px; }
 .kb-select:focus-visible { outline: 2px solid var(--accent-ring); outline-offset: 1px; }
 
 .msg-sources { margin-top: 10px; border: 1px solid var(--border); border-radius: 12px; padding: 10px 12px; background: var(--surface-2); }
