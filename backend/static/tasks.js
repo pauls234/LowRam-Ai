@@ -222,7 +222,7 @@
     else bar.set(planned ? Math.min(1, (completed + failed) / planned) : null, completed + LR.t(' done') + (planned ? LR.t(' of ') + planned : ''));
     const parts = [completed + LR.t(' done')];
     if (failed) parts.push(failed + LR.t(' failed'));
-    if (active && left !== null) parts.push(LR.t('{n} left', { n: left }));
+    if (active && left !== null && left > 0) parts.push(LR.leftText(left, 'step'));
     if (max && !(planned && max >= planned)) parts.push(LR.t('limit ') + max);  // only when it really limits
     let tone = 'accent';
     let title = loop.stop_requested ? LR.t('Loop stopping…') : LR.t('Loop running');
