@@ -922,13 +922,15 @@ def window_selftest(window: Any, out: Path, quit_app: Callable[[], None], attemp
     """Wait for the app page in the window, write what it can use (microphone API …) to ``out``, quit.
 
     Only reads: nothing is recorded and no permission is asked for. Used by the release workflow to
-    check the real window (WKWebView on the Mac), which a headless test cannot show.
+    check the real window (WKWebView on the Mac), which a headless test cannot show. ``run_js`` hands
+    the expression to the web view as it is; pywebview's ``evaluate_js`` wraps it in ``eval()``, which
+    the page's Content Security Policy rightly refuses.
     """
     result: dict = {"error": "the app page did not load"}
     for _ in range(attempts):
         time.sleep(interval)
         try:
-            raw = window.evaluate_js(SELFTEST_JS)
+            raw = window.run_js(SELFTEST_JS)
         except Exception as exc:  # the page may still be loading
             result = {"error": str(exc)[:300]}
             continue

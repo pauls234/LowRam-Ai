@@ -210,7 +210,7 @@ class WindowSelfTestTests(unittest.TestCase):
                         '{"speech": true, "secure": true, "mediaDevices": true, "audioWorklet": true}'])
 
         class Window:
-            def evaluate_js(self, script):
+            def run_js(self, script):  # as it is – evaluate_js would wrap it in eval(), which the page's CSP refuses
                 self.script = script
                 return next(answers)
 
