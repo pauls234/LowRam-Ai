@@ -426,6 +426,18 @@ class SpeechApiTests(AppTestCase):
             (config.home_dir() / "speech" / "warmed.json").unlink()
             self.assertFalse(speech.warm_up(model))  # only where the GPU code needs it (the Mac)
 
+    def test_a_dictation_waits_for_the_preparation(self):
+        self.install_model()
+        speech._warm_lock.acquire()  # the one-time preparation runs right now
+        try:
+            job = self.send(tone(self.tmp / "a.wav").read_bytes())[1]["job"]
+            self.assertTrue(wait_until(lambda: "vorbereitet" in (self.job(job["id"])["message"] or ""), 5), self.job(job["id"]))
+            self.assertEqual(self.job(job["id"])["status"], "waiting")
+            self.assertFalse(self.calls.exists())  # whisper-cli never runs twice at once
+        finally:
+            speech._warm_lock.release()
+        self.assertEqual(self.wait_for(job["id"], "done", "failed")["status"], "done")
+
     def test_model_install_and_delete(self):
         meta = {"url": "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin",
                 "sha256": "a" * 64, "size": 147_951_465}

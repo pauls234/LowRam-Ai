@@ -581,6 +581,8 @@ class SpeechWorker:
             if job.cancel.is_set():
                 raise _Cancelled
             self._prepare(job)
+            while _warm_lock.locked():  # the one-time preparation runs right now: never two at once, and after it this is fast
+                self._wait(job, "Die Spracherkennung wird gerade vorbereitet – gleich geht es los.", 0.25)
             long_audio = job.audio_s is None or job.audio_s > LONG_AUDIO_S
             self._wait_for_ram(job, RAM_WAIT_LONG_S if long_audio else RAM_WAIT_SHORT_S)
             if not long_audio:  # a short dictation runs at once: light, and the user is waiting for it
