@@ -115,6 +115,35 @@ jobs:
         env:
           LOWRAM_HOME: ${{ runner.temp }}/lowram-speech
         run: tail -n 80 "$LOWRAM_HOME/logs/app.log" || true
+      # The real window (WKWebView) must offer the page the microphone API for dictation – only a
+      # windowed run can show that. Reads only: nothing is recorded, no permission is asked for.
+      - name: Window test (the app window offers the microphone to the page)
+        env:
+          LOWRAM_HOME: ${{ runner.temp }}/lowram-window
+          LOWRAM_WINDOW_SELFTEST: ${{ runner.temp }}/window-selftest.json
+        run: |
+          "dist/LowRAM AI.app/Contents/MacOS/LowRAM AI" &
+          pid=$!
+          for _ in $(seq 1 120); do
+            [ -s "$LOWRAM_WINDOW_SELFTEST" ] && break
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 1
+          done
+          if [ ! -s "$LOWRAM_WINDOW_SELFTEST" ]; then
+            echo "::warning::No app window on this runner (no screen session?) – the window test was skipped"
+            kill -TERM "$pid" 2>/dev/null || true
+            wait "$pid" || true
+            exit 0
+          fi
+          for _ in $(seq 1 30); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
+          kill -TERM "$pid" 2>/dev/null || true
+          wait "$pid" || true
+          python -c "import json, os, sys; d = json.load(open(os.environ['LOWRAM_WINDOW_SELFTEST'])); print('window:', d); sys.exit(0 if d.get('speech') and d.get('secure') and d.get('mediaDevices') and d.get('audioContext') else 'the app window does not offer the microphone to the page')"
+      - name: Show window log
+        if: always()
+        env:
+          LOWRAM_HOME: ${{ runner.temp }}/lowram-window
+        run: tail -n 60 "$LOWRAM_HOME/logs/app.log" || true
 
   windows:
     name: Windows app (x64)

@@ -24,6 +24,7 @@ from __future__ import annotations
 import array
 import collections
 import hashlib
+import json
 import logging
 import math
 import os
@@ -83,6 +84,8 @@ WAIT_STEP_S = 5.0
 CONVERT_TIMEOUT_S = 600.0
 KEEP_JOBS = 20
 MAX_QUEUE = 3  # recordings waiting at once (each is a file on disk until it is done)
+WARM_UP_PLATFORMS = ("darwin",)  # Metal prepares its GPU code at the first run: do that before the first dictation
+WARM_UP_DELAY_S = 20.0  # at a start: let the app settle first
 RESULT_TTL_S = 3600.0
 PARAGRAPH_CHARS = 700
 MISSING_CLI = ("Die Spracherkennung (whisper.cpp) fehlt. In der fertigen App ist sie enthalten – beim Start aus "
@@ -533,6 +536,10 @@ class SpeechWorker:
             _kill(proc)
         return job.view()
 
+    def busy(self) -> bool:
+        with self._lock:
+            return any(job.active for job in self._jobs.values())
+
     def busy_with(self, model_id: str) -> bool:
         with self._lock:
             return any(job.active and job.model["id"] == model_id for job in self._jobs.values())
@@ -574,6 +581,8 @@ class SpeechWorker:
             if job.cancel.is_set():
                 raise _Cancelled
             self._prepare(job)
+            while _warm_lock.locked():  # the one-time preparation runs right now: never two at once, and after it this is fast
+                self._wait(job, "Die Spracherkennung wird gerade vorbereitet – gleich geht es los.", 0.25)
             long_audio = job.audio_s is None or job.audio_s > LONG_AUDIO_S
             self._wait_for_ram(job, RAM_WAIT_LONG_S if long_audio else RAM_WAIT_SHORT_S)
             if not long_audio:  # a short dictation runs at once: light, and the user is waiting for it
@@ -636,7 +645,7 @@ def _timeout(job: _Job) -> float:
     return 120.0 + 10.0 * job.audio_s if job.audio_s else 6 * 3600.0
 
 
-def transcribe(job: _Job) -> str:
+def transcribe(job: _Job, remember: bool = True) -> str:
     """Run whisper-cli for one job: the percentage from its output, the text from the file it writes."""
     command = _cli_command()
     if not command:
@@ -701,7 +710,7 @@ def transcribe(job: _Job) -> str:
         text = tidy(text_file.read_text(encoding="utf-8", errors="replace"))
     finally:
         _remove(text_file)
-    if job.audio_s:
+    if job.audio_s and remember:
         progress.remember("speech_min", job.model["id"], (time.monotonic() - job.started) * 60 / job.audio_s)
     if not text:
         raise SpeechError("Es wurde keine Sprache erkannt. Sprich etwas näher am Mikrofon oder wähle die richtige "
@@ -712,9 +721,99 @@ def transcribe(job: _Job) -> str:
 WORKER = SpeechWorker()
 
 
+# --------------------------------------------------------------------------- warm-up
+
+_warm_lock = threading.Lock()
+
+
+def _warm_file() -> Path:
+    return config.home_dir() / "speech" / "warmed.json"
+
+
+def _warm_key(model: dict) -> str | None:
+    """Which program and model a warm-up was for: a new app version (new program) warms up again."""
+    command = _cli_command()
+    if not command:
+        return None
+    try:
+        stat = Path(command[-1]).stat()
+    except OSError:
+        return None
+    return f"{model['id']}:{stat.st_size}:{int(stat.st_mtime)}"
+
+
+def _warmed() -> dict:
+    try:
+        data = json.loads(_warm_file().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def warm_up(model: dict) -> bool:
+    """Run the speech recognition once on a second of quiet audio, so macOS prepares its GPU code (Metal)
+    now and not during the first dictation (about 20 s → 2 s). Never in the way: skipped on a low battery,
+    when the Mac is hot, with too little free RAM or while something is transcribed; once per program and
+    model version. Returns whether it ran."""
+    if sys.platform not in WARM_UP_PLATFORMS or not installed(model):
+        return False
+    key = _warm_key(model)
+    if key is None or _warmed().get(model["id"]) == key:
+        return False
+    if power.battery_block_reason() or power.heat_block_reason():
+        return False
+    if int(psutil.virtual_memory().available) < ram_needed(model) or WORKER.busy():
+        return False
+    if not _warm_lock.acquire(blocking=False):
+        return False
+    audio = _temp_dir() / f"warm-{secrets.token_hex(4)}.wav"
+    try:
+        frames = array.array("h", (int(40 * math.sin(i / 7)) for i in range(16000)))  # 1 s, very quiet
+        if sys.byteorder == "big":
+            frames.byteswap()
+        with wave.open(str(audio), "wb") as handle:
+            handle.setnchannels(1)
+            handle.setsampwidth(2)
+            handle.setframerate(16000)
+            handle.writeframes(frames.tobytes())
+        job = _Job(secrets.token_hex(6), audio, "wav", 1.0, model, "de", "Vorbereitung")
+        started = time.monotonic()
+        try:
+            transcribe(job, remember=False)  # the time includes preparing: no measurement for estimates
+        except (SpeechError, _Cancelled):
+            pass  # no words in quiet audio are fine – the GPU code is ready either way
+        done = _warmed()
+        done[model["id"]] = key
+        _warm_file().parent.mkdir(parents=True, exist_ok=True)
+        _warm_file().write_text(json.dumps(done), encoding="utf-8")
+        log.info("Speech recognition prepared for %s in %.1f s", model["id"], time.monotonic() - started)
+        return True
+    except Exception:  # noqa: BLE001 - a warm-up is optional; the first dictation just takes longer
+        log.warning("Could not prepare the speech recognition", exc_info=True)
+        return False
+    finally:
+        _remove(audio)
+        _warm_lock.release()
+
+
+def warm_up_later(model_id: str, delay_s: float) -> None:
+    """In the background after ``delay_s`` (a finished download, a start of the app)."""
+    def run() -> None:
+        time.sleep(delay_s)
+        try:
+            warm_up(get_model(model_id))
+        except db.NotFound:
+            pass
+
+    threading.Thread(target=run, name="lowram-speech-warm-up", daemon=True).start()
+
+
 @on_startup
 def _clean_leftovers(server: Any) -> None:
     clean_temp()
+    chosen = selected_model()
+    if chosen is not None and sys.platform in WARM_UP_PLATFORMS:
+        warm_up_later(chosen["id"], WARM_UP_DELAY_S)
 
 
 @on_shutdown
@@ -771,7 +870,8 @@ def install_model(model_id: str) -> dict:
         raise HTTPError(HTTPStatus.BAD_GATEWAY, f"Hugging Face ist gerade nicht erreichbar ({exc}).") from exc
     _models_folder().mkdir(parents=True, exist_ok=True)
     return downloads.start(f"speech-{model['id']}", meta["url"], model_path(model), sha256=meta["sha256"],
-                           size=meta["size"], label=f"Sprachmodell {model['name']}", kind="speech-model")
+                           size=meta["size"], label=f"Sprachmodell {model['name']}", kind="speech-model",
+                           on_complete=lambda path: warm_up_later(model["id"], 2.0))
 
 
 def delete_model(model_id: str) -> None:

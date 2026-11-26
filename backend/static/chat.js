@@ -114,6 +114,7 @@
       type: 'file', multiple: true, class: 'visually-hidden', tabindex: '-1', 'aria-hidden': 'true',
       accept: '.pdf,.docx,.odt,.pptx,.xlsx,.epub,.rtf,.txt,.md,.markdown,.csv,.tsv,.json,.yaml,.yml,.toml,.ini,.xml,.html,.htm,.css,.js,.mjs,.ts,.tsx,.jsx,.py,.rb,.go,.rs,.java,.kt,.swift,.c,.h,.cpp,.hpp,.cs,.php,.sh,.zsh,.sql,.log,.env.example,text/*',
     });
+    if (LR.ocr) LR.ocr.offerIn(ui.fileInput);  // photos and scans on the Mac (text recognition)
     ui.fileInput.addEventListener('change', () => {
       addFiles(ui.fileInput.files);
       ui.fileInput.value = '';
@@ -572,6 +573,9 @@
     const waitBar = LR.progress({ size: 'sm', label: LR.t('Progress'), cls: 'wait-progress' });
     waitBar.el.hidden = true;
     const wait = h('div', { class: 'msg-wait' }, [h('span', { class: 'typing', 'aria-hidden': 'true' }, [h('i'), h('i'), h('i')]), waitText, waitBar.el]);
+    // While the answer is written: "Schreibt … 120 Wörter · 9 Wörter/s · 0:14" (how long an answer gets is not
+    // known in advance, so there is no percent here – only what is measured, cheaply, twice a second)
+    const live = h('p', { class: 'msg-live', hidden: true, 'aria-hidden': 'true' });
     const extra = h('div', { class: 'msg-extra' });
     const cont = h('div', { class: 'msg-continue', hidden: true });
     const meta = h('span', { class: 'msg-meta' });
@@ -585,6 +589,7 @@
       h('h2', { class: 'visually-hidden', text: LR.t('LowRAM AI said:') }),
       think,
       body,
+      live,
       wait,
       extra,
       cont,
@@ -608,6 +613,29 @@
     let statusExtra = '';
     let started = Date.now();
     let waitTimer = 0;
+    let writing = 0;  // when the first words of the answer arrived
+    let wordsBefore = 0;  // words already there then (continue): the speed counts only the new ones
+    let liveAt = 0;
+    const countWords = (text) => (text.match(/\S+/g) || []).length;
+    function showLive(answer) {
+      const now = Date.now();
+      if (!writing) { writing = now; wordsBefore = countWords(answer); }
+      if (now - liveAt < 500) return;
+      liveAt = now;
+      const secs = (now - writing) / 1000;
+      if (secs < 2) return;
+      const words = countWords(answer);
+      const rate = (words - wordsBefore) / secs;
+      live.textContent = LR.t('Writing … {n} words · {rate} words/s · {time}', {
+        n: fmt.int(words), rate: rate < 10 ? rate.toFixed(1) : String(Math.round(rate)), time: fmt.clock(now - writing),
+      });
+      live.hidden = false;
+    }
+    function hideLive() {
+      writing = 0;
+      liveAt = 0;
+      live.hidden = true;
+    }
     function startWait() {
       started = Date.now();
       statusText = '';
@@ -620,6 +648,7 @@
       }, 1000);
     }
     function stopTimers() {
+      hideLive();
       window.clearInterval(waitTimer);
       if (frame) { window.cancelAnimationFrame(frame); frame = 0; }
       if (throttle) { window.clearTimeout(throttle); throttle = 0; }
@@ -659,6 +688,7 @@
         answerText = answer;
         renderer.render(answer, streaming);
       }
+      if (streaming && answer) showLive(answer);
       wait.hidden = !(streaming && !answer && !(reasoning && reasoning.trim()));
       li.classList.toggle('is-streaming', streaming);
     }
@@ -849,7 +879,12 @@
   /** The text of a document, cut to what fits into one attachment (with a note when cut). */
   async function documentText(file) {
     const data = await LR.upload('/api/documents/uploads?text=1', file);
-    let text = LR.str(data.upload && data.upload.text);
+    let upload = data.upload;
+    if (upload && upload.needs_ocr && LR.ocr) {  // a photo or scan: its text is recognised first
+      upload = await LR.ocr.run(upload, { onProgress: (job) => micNote(file.name + ': ' + LR.ocr.progressText(job)) });
+      micNote('');
+    }
+    let text = LR.str(upload && upload.text);
     const enc = new TextEncoder();
     const note = '\n\n[' + LR.t('Shortened – the document is longer. For the whole document use “Documents”.') + ']';
     if (enc.encode(text).length > MAX_FILE_BYTES) {
@@ -922,7 +957,7 @@
         dictateFile(file);  // runs on its own; its progress shows in the line below the input
         continue;
       }
-      if (DOCUMENT_EXT.test(file.name)) {
+      if (DOCUMENT_EXT.test(file.name) || (LR.ocr && LR.ocr.isImage(file))) {
         attachNote(LR.t('Reading {name}…', { name: file.name }));
         try {
           const text = await documentText(file);

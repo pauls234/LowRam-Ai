@@ -46,15 +46,18 @@ TEXT_SUFFIXES = frozenset((
     ".log", ".xml", ".srt", ".vtt", ".tex", ".bib", ".py", ".js", ".ts", ".java", ".c", ".h", ".cpp", ".cs",
     ".go", ".rs", ".rb", ".php", ".swift", ".kt", ".sh", ".sql", ".css",
 ))
+IMAGE_SUFFIXES = (".jpg", ".jpeg", ".png", ".heic", ".heif", ".tif", ".tiff", ".gif", ".bmp", ".webp")
 SUFFIX_KIND = {
     ".pdf": "pdf", ".docx": "docx", ".odt": "odt", ".pptx": "pptx", ".xlsx": "xlsx", ".epub": "epub",
     ".rtf": "rtf", ".html": "html", ".htm": "html", ".xhtml": "html",
     **{suffix: "text" for suffix in TEXT_SUFFIXES},
+    **{suffix: "image" for suffix in IMAGE_SUFFIXES},  # photos and scans: text recognition (backend.ocr)
 }
+LOW_TEXT_CHARS = 25  # a PDF page with fewer characters is probably a scanned image
 OLD_OFFICE = {".doc": "Word", ".xls": "Excel", ".ppt": "PowerPoint"}
 KIND_LABEL = {"pdf": "PDF", "docx": "Word", "odt": "OpenDocument-Text", "pptx": "PowerPoint", "xlsx": "Excel",
               "epub": "E-Book (EPUB)", "rtf": "RTF", "html": "Webseite (HTML)", "text": "Text",
-              "audio": "Verschriftlichung (Audio)"}
+              "audio": "Verschriftlichung (Audio)", "image": "Foto/Scan"}
 
 W = "http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 A = "http://schemas.openxmlformats.org/drawingml/2006/main}"
@@ -81,10 +84,21 @@ class Extracted:
     pages: int | None = None
     truncated: bool = False
     warnings: list[str] = field(default_factory=list)
+    page_texts: list[str] | None = None  # PDF: the text of every page (to merge recognised pages in later)
+    low_text_pages: list[int] = field(default_factory=list)  # PDF: pages (1-based) with almost no text
 
     @property
     def label(self) -> str:
         return KIND_LABEL.get(self.kind, self.kind)
+
+    @property
+    def needs_ocr(self) -> bool:
+        """A photo, or a PDF that is mostly scanned pages: only text recognition can read it."""
+        if self.kind == "image":
+            return True
+        if self.kind != "pdf" or not self.page_texts:
+            return False
+        return len(self.low_text_pages) >= max(1, 0.3 * len(self.page_texts))
 
 
 class _Enough(Exception):
@@ -101,7 +115,11 @@ def detect_kind(name: str, data: bytes) -> str | None:
         what = OLD_OFFICE.get(suffix, "Office")
         raise DocumentError(f"Das ist eine ältere {what}-Datei oder eine mit Passwort geschützte Office-Datei. "
                             "Speichere sie bitte als PDF oder im neuen Format (.docx, .xlsx, .pptx).")
+    if image_kind(data):
+        return "image"
     kind = SUFFIX_KIND.get(suffix)
+    if kind == "image":
+        raise DocumentError("Die Datei heißt wie ein Bild, ist aber keins (beschädigt?).")
     is_zip = head.startswith(b"PK\x03\x04")
     if kind == "pdf" or (kind is None and b"%PDF-" in data[:1024]):
         if b"%PDF-" not in data[:1024]:
@@ -120,6 +138,26 @@ def detect_kind(name: str, data: bytes) -> str | None:
             return None  # some binary format
         return "text"
     return kind
+
+
+def image_kind(data: bytes) -> str | None:
+    """The image format from the first bytes (``jpeg``, ``png``, ``heic`` …) or None."""
+    head = data[:16]
+    if head.startswith(b"\xff\xd8\xff"):
+        return "jpeg"
+    if head.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    if head[:6] in (b"GIF87a", b"GIF89a"):
+        return "gif"
+    if head[:4] in (b"II*\x00", b"MM\x00*"):
+        return "tiff"
+    if head[:2] == b"BM" and len(data) > 26:
+        return "bmp"
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "webp"
+    if head[4:8] == b"ftyp" and head[8:12] in (b"heic", b"heix", b"hevc", b"heim", b"heis", b"mif1", b"msf1", b"avif"):
+        return "heic"
+    return None
 
 
 def _sniff_zip(data: bytes) -> str | None:
@@ -879,18 +917,28 @@ def _read_pdf(data: bytes) -> Extracted:
     if status != "ok":
         raise DocumentError(str(payload))
     texts = payload["texts"]
-    parts = [f"[Seite {number}]\n{text.strip()}" for number, text in enumerate(texts, 1) if text.strip()]
-    result = Extracted("\n\n".join(parts), "pdf", pages=payload["pages"], truncated=payload["truncated"])
+    result = Extracted(join_pages(texts), "pdf", pages=payload["pages"], truncated=payload["truncated"],
+                       page_texts=list(texts),
+                       low_text_pages=[n for n, text in enumerate(texts, 1) if len(text.strip()) < LOW_TEXT_CHARS])
     chars = sum(len(text.strip()) for text in texts)
     if payload["pages"] and chars < SCANNED_CHARS_PER_PAGE * max(1, len(texts)):
-        result.warnings.append("Das PDF enthält kaum Text – vermutlich eingescannte Seiten (Bilder). "
-                               "Texterkennung (OCR) gibt es in LowRAM AI noch nicht.")
+        result.warnings.append("Das PDF enthält kaum Text – vermutlich eingescannte Seiten (Bilder).")
     if payload["failed"]:
         result.warnings.append(f"{payload['failed']} Seite(n) konnten nicht gelesen werden.")
     return result
 
 
+def join_pages(texts: list[str]) -> str:
+    """The text of a PDF from its pages: ``[Seite N]`` before every page that has text."""
+    return "\n\n".join(f"[Seite {number}]\n{text.strip()}" for number, text in enumerate(texts, 1) if text.strip())
+
+
+def _read_image(data: bytes) -> Extracted:
+    """A photo or scan: no text of its own – text recognition (backend.ocr) reads it."""
+    return Extracted("", "image", pages=1)
+
+
 _READERS: dict[str, Callable[[bytes], Extracted]] = {
     "text": _read_text, "pdf": _read_pdf, "docx": _read_docx, "odt": _read_odt, "pptx": _read_pptx,
-    "xlsx": _read_xlsx, "epub": _read_epub, "rtf": _read_rtf, "html": _read_html,
+    "xlsx": _read_xlsx, "epub": _read_epub, "rtf": _read_rtf, "html": _read_html, "image": _read_image,
 }

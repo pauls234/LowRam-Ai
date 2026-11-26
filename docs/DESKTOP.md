@@ -156,6 +156,15 @@ cannot use the microphone, the message names LowRAM AI's address (e.g.
 `http://127.0.0.1:8765`) – open it in Safari or Chrome – or record with the
 Voice Memos app and drop the file under *Documents*.
 
+### Photos and scans (text recognition)
+
+Photos of letters or receipts and scanned PDFs become text with macOS's own
+text recognition (the one the Photos app uses) – no download and no permission
+prompt; nothing leaves the Mac. Long scans go page by page in a separate
+process with lower priority ("Seite 3 von 12 · noch 10 Seiten"); a scan of more
+than 10 pages waits like other long jobs when the battery is low or the Mac is
+hot. Recognised text can contain mistakes – the result says so.
+
 ### MacBook: long jobs, battery and notifications
 
 * **Stays awake while it works.** During the task queue, image/video jobs and
@@ -209,7 +218,10 @@ python -m PyInstaller --noconfirm --clean desktop/LowRAM-AI.spec   # Windows/Lin
   then `curl http://127.0.0.1:8799/api/status`.
 * `.github/workflows/release.yml` does all of this on `macos-latest` and
   `windows-latest` for every `v*` tag (and on demand), runs the tests and a
-  headless smoke test, and attaches both zips to the GitHub release.
+  headless smoke test (documents, a real web page, skills, text recognition of a
+  photo and a scanned PDF on the Mac, a real model, real speech recognition), on
+  macOS also a window test (the app window offers the microphone to the page),
+  and attaches both zips to the GitHub release.
 
 ### Icon
 

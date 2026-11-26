@@ -50,7 +50,19 @@ class FormatTests(unittest.TestCase):
         self.assertEqual(doctext.detect_kind("download", ds.docx([("", "x")])), "docx")
         self.assertEqual(doctext.detect_kind("download", ds.pdf(["x"])), "pdf")
         self.assertEqual(doctext.detect_kind("notes", b"just text"), "text")
-        self.assertIsNone(doctext.detect_kind("image", b"\x89PNG\r\n\x1a\n\x00\x00\x00"))
+        # photos and scans by their bytes, whatever they are called (text recognition reads them)
+        for head in (b"\x89PNG\r\n\x1a\n\x00\x00\x00", b"\xff\xd8\xff\xe0\x00\x10JFIF\x00",
+                     b"\x00\x00\x00\x18ftypheic\x00\x00", b"II*\x00\x08\x00\x00\x00"):
+            self.assertEqual(doctext.detect_kind("download", head), "image", head)
+        self.assertIsNone(doctext.detect_kind("data", b"\x00\x01\x02 binary"))
+
+    def test_pages_without_text_are_marked_for_text_recognition(self):
+        text = "Das ist eine Seite mit genug echtem Text, um als Text zu gelten."
+        mostly_scanned = doctext.extract("scan.pdf", ds.pdf([text, "", "", ""]))
+        self.assertEqual((mostly_scanned.low_text_pages, mostly_scanned.needs_ocr), ([2, 3, 4], True))
+        self.assertEqual(mostly_scanned.page_texts[0].strip(), text)
+        one_blank = doctext.extract("bericht.pdf", ds.pdf([text, text, text, ""]))
+        self.assertEqual((one_blank.low_text_pages, one_blank.needs_ocr), ([4], False))  # a blank page is no scan
 
     def test_pdf_in_a_separate_process(self):
         result = doctext.extract("Bericht.pdf", ds.pdf(["Das ist die erste Seite mit genug Text darauf.",
@@ -77,7 +89,10 @@ class HostileFileTests(unittest.TestCase):
         self.assertRefused("x.pdf", b"not a pdf", "kein PDF")
         self.assertRefused("x.docx", b"plain text", "kein gültiges Word-Dokument")
         self.assertRefused("x.docx", b"PK\x03\x04broken zip", "beschädigt")
-        self.assertRefused("photo.jpg", b"\xff\xd8\xff\xe0\x00\x10JFIF\x00", "nicht unterstützt")
+        photo = doctext.extract("photo.jpg", b"\xff\xd8\xff\xe0\x00\x10JFIF\x00")
+        self.assertEqual((photo.kind, photo.text, photo.needs_ocr), ("image", "", True))
+        self.assertRefused("photo.jpg", b"just text, no picture", "ist aber keins")
+        self.assertRefused("data.bin", b"\x00\x01\x02 binary", "nicht unterstützt")
         self.assertRefused("leer.txt", b"", "leer")
         self.assertRefused("x.pdf", b"%PDF-1.4\n" + b"garbage " * 50, "beschädigt")
 

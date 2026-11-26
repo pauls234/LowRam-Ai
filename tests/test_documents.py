@@ -72,7 +72,8 @@ class UploadTests(DocumentsTestCase):
         status, data = self.upload("alt.doc", b"\xd0\xcf\x11\xe0" + b"\0" * 64)
         self.assertEqual(status, 422)
         self.assertIn("ältere Word-Datei", data["error"])
-        self.assertEqual(self.upload("scan.pdf", ds.pdf(["", ""]))[0], 422)  # no text at all
+        with mock.patch("backend.ocr.available", return_value=False):  # with text recognition: see test_ocr
+            self.assertEqual(self.upload("scan.pdf", ds.pdf(["", ""]))[0], 422)  # no text at all
         self.assertEqual(self.upload(token=False)[0], 403)
         with mock.patch.object(doctext, "MAX_FILE_BYTES", 100):
             self.assertEqual(self.upload()[0], 413)
