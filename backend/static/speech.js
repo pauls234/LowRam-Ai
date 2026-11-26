@@ -262,6 +262,14 @@
   sp.progressText = function (job) {
     if (!job) return '';
     if (job.status === 'running') {
+      // whisper.cpp works through a long recording in 30-second parts: "Teil 3 von 12 · noch 10 Teile"
+      const parts = LR.isNum(job.audio_s) ? Math.ceil(job.audio_s / 30) : 0;
+      if (parts > 1) {
+        const part = Math.min(parts, Math.floor(((job.percent || 0) / 100) * parts) + 1);
+        const progress = LR.progressText({ percent: job.percent > 0 ? job.percent : null, eta_s: job.eta_s });
+        return [t('Turning speech into text: part {n} of {total}', { n: part, total: parts }),
+          LR.leftText(parts - part + 1, 'part'), progress].filter(Boolean).join(' · ');
+      }
       const progress = LR.progressText({ percent: job.percent > 0 ? job.percent : null, eta_s: job.eta_s });
       if (progress) return t('Turning speech into text … {progress}', { progress });
       return job.first_run ? t('Turning speech into text … the first time takes a little longer (preparing the speech recognition)') : t('Turning speech into text …');

@@ -1367,6 +1367,28 @@
     'Turning {name} into text …': '{name} wird zu Text …',
     'Turning {name} into text on this computer …': '{name} wird auf diesem Computer zu Text …',
     'recordings (MP3, WAV, M4A …) become text on this computer': 'Aufnahmen (MP3, WAV, M4A …) werden auf diesem Computer zu Text',
+    // steps, sections, parts left (v0.6.2)
+    '1 step left': 'noch 1 Schritt',
+    '{n} steps left': 'noch {n} Schritte',
+    '1 section left': 'noch 1 Abschnitt',
+    '{n} sections left': 'noch {n} Abschnitte',
+    '1 part left': 'noch 1 Teil',
+    '{n} parts left': 'noch {n} Teile',
+    'Turning speech into text: part {n} of {total}': 'Sprache wird zu Text: Teil {n} von {total}',
+    'Creating the image': 'Bild wird erzeugt',
+    'Creating the video': 'Video wird erzeugt',
+    '{what}: step {n} of {total}': '{what}: Schritt {n} von {total}',
+    'Finishing: part {n} of {total}': 'Wird fertiggestellt: Teil {n} von {total}',
+    'Finishing…': 'Wird fertiggestellt …',
+    'Loading the model… {n} %': 'Modell wird geladen … {n} %',
+    'Waiting for the model to finish…': 'Wartet, bis das Modell fertig ist …',
+    'Pausing the chat model to free RAM…': 'Das Chat-Modell pausiert, damit Arbeitsspeicher frei wird …',
+    'Loading the model… (this can take a minute)': 'Modell wird geladen … (das kann eine Minute dauern)',
+    'Loading the model…': 'Modell wird geladen …',
+    'Converting the video for the browser…': 'Video wird für den Browser umgewandelt …',
+    'Decoding the result…': 'Ergebnis wird fertiggestellt …',
+    'Cancelled.': 'Abgebrochen.',
+    'Interrupted': 'Unterbrochen',
   };
 
   const NOUNS_DE = {

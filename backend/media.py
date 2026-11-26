@@ -96,6 +96,7 @@ SLOT_RETRY_S = 2.0
 BATTERY_RETRY_S = 15.0  # how often a job waiting for power re-checks the battery
 IDLE_POLL_S = 5.0
 PROGRESS_WRITE_INTERVAL_S = 0.5
+DECODE_ALLOWANCE_STEPS = 2  # time left also covers decoding/saving: roughly two more sampling steps
 CANCEL_WAIT_S = 5.0
 KILL_GRACE_S = 1.0
 METADATA_TIMEOUT_S = 20.0
@@ -324,6 +325,8 @@ def _job_dict(row: Any) -> dict:
     if not done:
         data["output_type"] = None
     data["duration_s"] = _duration(data.get("started_at"), data.get("finished_at"))
+    live = _LIVE.get(data["id"]) if data["status"] == "running" else None
+    data["live"] = dict(live) if live else None
     return data
 
 
@@ -383,6 +386,10 @@ def _mark_running(job_id: int) -> bool:
         return cur.rowcount == 1
 
 
+# running job id → {"phase", "step", "steps", "eta_s"} or {"phase", "percent"} for the page (memory only)
+_LIVE: dict[int, dict] = {}
+
+
 def _update_running(job_id: int, progress: float, message: str) -> None:
     progress = max(0.0, min(1.0, float(progress)))
     with db.connect() as conn:
@@ -402,6 +409,7 @@ def _finish(
     output_type: str | None = None,
 ) -> None:
     """Record the outcome of a running job (retries a transiently locked database)."""
+    _LIVE.pop(job_id, None)
     for attempt in range(3):
         try:
             with db.connect() as conn:
@@ -989,6 +997,12 @@ class ProgressParser:
         self.message = "Loading the model…"
         self.phase = "start"
         self.tail: deque[str] = deque(maxlen=30)
+        self.step: int | None = None  # sampling (or decoding) step x of `total`
+        self.total: int | None = None
+        self.loading_percent: int | None = None
+        self.saving = False
+        self.per_step_s: float | None = None  # measured seconds per sampling step: corrects itself every step
+        self._first_step: tuple[float, int] | None = None  # (monotonic time, step) of the first sampling line
 
     def _set(self, progress: float, message: str) -> None:
         self.progress = max(self.progress, min(0.99, progress))
@@ -1000,9 +1014,17 @@ class ProgressParser:
         message = f"{noun}: step {step}/{total}"
         extras = []
         speed = _SPEED_RE.search(rest)
+        now = time.monotonic()
+        if self._first_step is None or step < self._first_step[1]:
+            self._first_step = (now, step)
+        elif step > self._first_step[1]:  # the average over the steps seen so far – faster or slower, it adapts
+            self.per_step_s = (now - self._first_step[0]) / (step - self._first_step[1])
+        self.step, self.total = step, total
         if speed:
             value, unit = float(speed.group(1)), speed.group(2)
             extras.append(f"{value:.1f} s/step" if unit == "s/it" else f"{value:.1f} steps/s")
+            if self.per_step_s is None and value > 0:  # until two steps were measured: the program's own figure
+                self.per_step_s = value if unit == "s/it" else 1 / value
         eta = _ETA_RE.search(rest)
         if eta:
             extras.append(f"about {eta.group(1)} left")
@@ -1029,6 +1051,7 @@ class ProgressParser:
             rest = bar.group("rest") if bar else text[found.end():]
             if bar and "#" in bar.group("bar"):
                 if self.phase == "start":
+                    self.loading_percent = 100 * step // total
                     self._set(0.02 + 0.08 * step / total, f"Loading the model… {100 * step // total}%")
             elif self.phase in ("start", "sampling") and (
                 step_match or self.steps is None or total == self.steps or self.phase == "sampling"
@@ -1036,6 +1059,7 @@ class ProgressParser:
                 self._sampling(step, total, rest)
             elif self.phase in ("sampled", "decoding"):
                 self.phase = "decoding"
+                self.step, self.total = step, total
                 self._set(0.90 + 0.08 * step / total, f"Decoding: {step}/{total}")
             else:
                 self._set(self.progress, f"Preparing: {step}/{total}")
@@ -1043,11 +1067,34 @@ class ProgressParser:
         self.tail.append(text[:500])
         lowered = text.lower()
         if "save result" in lowered or "saving" in lowered:
+            self.saving = True
             self._set(0.98, "Saving…")
         elif "decod" in lowered and self.phase in ("sampling", "sampled", "decoding"):
             self.phase = "decoding"
             self._set(0.90, "Decoding the result…")
         return (self.progress, self.message) != before
+
+    def live(self) -> dict | None:
+        """Structured progress for the page (it writes the text in the user's language).
+
+        ``sampling``: step x of y and the time probably left – remaining steps × the measured seconds per
+        step (plus a little for decoding), so it gets shorter when the steps get faster; ``finishing``:
+        decoding (part x of y when known); ``saving``; ``loading``: percent of the model file.
+        """
+        if self.saving:
+            return {"phase": "saving"}
+        if self.phase == "sampling" and self.step is not None and self.total:
+            eta = None
+            if self.per_step_s:
+                eta = round((self.total - self.step + DECODE_ALLOWANCE_STEPS) * self.per_step_s, 1)
+            return {"phase": "sampling", "step": self.step, "steps": self.total, "eta_s": eta}
+        if self.phase in ("sampled", "decoding"):
+            decoding = self.phase == "decoding" and self.step is not None
+            return {"phase": "finishing", "step": self.step if decoding else None,
+                    "steps": self.total if decoding else None}
+        if self.phase == "start" and self.loading_percent is not None:
+            return {"phase": "loading", "percent": self.loading_percent}
+        return None
 
     def failure_summary(self, limit: int = 1500) -> str:
         lines = list(self.tail)
@@ -1083,6 +1130,11 @@ class _ProgressReporter:
             _update_running(self.job_id, self.base + self.scale * self.parser.progress, self.parser.message)
         except Exception:  # progress is best effort; never kill the reader thread
             log.exception("Could not store progress of media job #%s", self.job_id)
+        live = self.parser.live()
+        if live is None:
+            _LIVE.pop(self.job_id, None)
+        else:
+            _LIVE[self.job_id] = live
 
     def flush(self) -> None:
         with self._lock:

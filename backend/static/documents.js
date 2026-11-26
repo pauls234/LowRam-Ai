@@ -282,7 +282,11 @@
     const p = j.progress || {};
     const parts = [];
     if (j.status === 'running' && p.phase === 'combine') parts.push(t('Last step: combining the summaries'));
-    else if (j.status === 'running' && LR.isNum(p.current)) parts.push(t('Section {n} of {total}', { n: p.current, total: j.chunks_total }));
+    else if (j.status === 'running' && LR.isNum(p.current)) {
+      parts.push(t('Section {n} of {total}', { n: p.current, total: j.chunks_total }));
+      const left = (j.chunks_total || 0) - (j.chunks_done || 0);  // the running one included
+      if (left > 0) parts.push(LR.leftText(left, 'section'));
+    }
     else if (j.status !== 'done') parts.push(t('{n} of {total} sections done', { n: j.chunks_done, total: j.chunks_total }));
     if (j.status === 'running') {
       if (LR.isNum(p.percent)) parts.push(p.percent + ' %');

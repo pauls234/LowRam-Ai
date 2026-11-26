@@ -515,6 +515,14 @@
     return { percent: Math.min(95, Math.floor((100 * elapsed) / expected)), eta_s: Math.max(1, expected - elapsed), overdue: false };
   };
 
+  /** "noch 3 Schritte" / "noch 1 Abschnitt": how much is left, with the right word (unit: step|section|part). */
+  LR.leftText = function (n, unit) {
+    if (!isNum(n) || n <= 0) return '';
+    const words = { step: ['1 step left', '{n} steps left'], section: ['1 section left', '{n} sections left'], part: ['1 part left', '{n} parts left'] };
+    const pair = words[unit] || words.step;
+    return n === 1 ? LR.t(pair[0]) : LR.t(pair[1], { n });
+  };
+
   /** "40 % · noch etwa 12 s" or "95 % · dauert länger als üblich" for { percent, eta_s, overdue }. */
   LR.progressText = function (info) {
     if (!info) return '';

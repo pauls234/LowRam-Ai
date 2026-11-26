@@ -300,13 +300,32 @@
 
   /* ------------------------------------------------------------ queue */
 
-  /** "noch etwa 3 Min." from the time spent so far and the progress (once there is enough to go by). */
+  /** "noch etwa 3 Min.": while it samples, remaining steps × the measured seconds per step (from the
+   * server, it adapts every step); otherwise from the time spent so far and the progress. */
   function jobTimeLeft(j) {
+    if (j.live && j.live.phase === 'sampling' && LR.isNum(j.live.eta_s)) return fmt.eta(j.live.eta_s);
     const started = fmt.parseTime(j.started_at);
     const p = j.progress;
     if (!started || !LR.isNum(p) || p < 0.05 || p >= 1) return '';
     const elapsed = (Date.now() - started.getTime()) / 1000;
     return elapsed < 5 ? '' : fmt.eta(elapsed * (1 - p) / p);
+  }
+
+  /** What a job does right now, in the user's language: "Bild wird erzeugt: Schritt 12 von 20 · noch 8". */
+  function jobProgressText(j) {
+    const live = j.live || {};
+    if (live.phase === 'sampling' && LR.isNum(live.step) && LR.isNum(live.steps)) {
+      const what = j.kind === 'video' ? LR.t('Creating the video') : LR.t('Creating the image');
+      const parts = [LR.t('{what}: step {n} of {total}', { what, n: live.step, total: live.steps })];
+      if (live.steps > live.step) parts.push(LR.leftText(live.steps - live.step, 'step'));
+      return parts.join(' · ');
+    }
+    if (live.phase === 'finishing') {
+      return LR.isNum(live.step) && LR.isNum(live.steps) ? LR.t('Finishing: part {n} of {total}', { n: live.step, total: live.steps }) : LR.t('Finishing…');
+    }
+    if (live.phase === 'saving') return LR.t('Saving…');
+    if (live.phase === 'loading' && LR.isNum(live.percent)) return LR.t('Loading the model… {n} %', { n: live.percent });
+    return LR.t(LR.str(j.message));  // the fixed messages are translated as a whole
   }
 
   function renderJobs() {
@@ -345,7 +364,9 @@
       r.badge.textContent = { queued: LR.t('Waiting'), running: LR.isNum(j.progress) ? Math.round(j.progress * 100) + '%' : LR.t('Working'), failed: LR.t('Failed'), cancelled: LR.t('Cancelled') }[j.status] || j.status;
       r.bar.set(j.status === 'running' && LR.isNum(j.progress) ? j.progress : null);
       r.msg.className = 'job-msg' + (j.status === 'failed' ? ' is-error' : '');
-      let text = j.status === 'failed' ? LR.str(j.error, LR.t('Generation failed.')) : LR.str(j.message) || (j.status === 'queued' ? LR.t('Waiting for the current job to finish…') : '');
+      let text = j.status === 'failed' ? LR.str(j.error, LR.t('Generation failed.'))
+        : j.status === 'running' ? jobProgressText(j)
+          : LR.t(LR.str(j.message)) || (j.status === 'queued' ? LR.t('Waiting for the current job to finish…') : '');
       const left = j.status === 'running' ? jobTimeLeft(j) : '';
       if (left) text = text ? text + ' · ' + left : left;
       r.msg.textContent = text;

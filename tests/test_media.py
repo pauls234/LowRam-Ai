@@ -165,6 +165,29 @@ class ProgressTests(unittest.TestCase):
         self.assertLess(p.progress, 1.0)
         self.assertFalse(p.feed(""))
 
+    def test_live_steps_and_time_left_correct_themselves(self):
+        p = media.ProgressParser("image", 20)
+        self.assertIsNone(p.live())
+        p.feed("  |############                        | 3/10 - 120.00MB/s")
+        self.assertEqual(p.live(), {"phase": "loading", "percent": 30})
+        clock = [100.0]
+        with mock.patch.object(media.time, "monotonic", side_effect=lambda: clock[0]):
+            p.feed("  |=>           | 2/20 - 4.00s/it - ETA 01:12")
+            # before two steps were measured: stable-diffusion.cpp's own figure (4 s per step), plus decoding
+            self.assertEqual(p.live(), {"phase": "sampling", "step": 2, "steps": 20, "eta_s": (20 - 2 + 2) * 4.0})
+            clock[0] = 110.0
+            p.feed("  |==>          | 4/20 - 4.00s/it")
+            self.assertEqual(p.live()["eta_s"], (20 - 4 + 2) * 5.0)  # measured here: 10 s for 2 steps
+            clock[0] = 118.0
+            p.feed("  |=====>       | 10/20 - 1.30s/it")
+            self.assertEqual(p.live()["eta_s"], round((20 - 10 + 2) * 18 / 8, 1))  # faster now: the estimate shrinks
+        p.feed("  |==================================================| 20/20 - 1.20it/s")
+        self.assertEqual(p.live(), {"phase": "finishing", "step": None, "steps": None})
+        p.feed("  |=====>       | 2/8 - 0.50s/it")  # VAE tiles
+        self.assertEqual(p.live(), {"phase": "finishing", "step": 2, "steps": 8})
+        p.feed("[INFO ] main.cpp - save result image 0 to 'x.png' (success)")
+        self.assertEqual(p.live(), {"phase": "saving"})
+
     def test_generic_step_lines_and_monotonic(self):
         p = media.ProgressParser("video", None)
         p.feed("step 5/10")
@@ -313,9 +336,13 @@ class WorkerTests(MediaTestCase):
         job = media.submit_job(image_job(prompt="HANG"))
         self.assertTrue(wait_until(pid_file.exists, 10))
         self.assertTrue(wait_until(lambda: media.get_job(job["id"])["progress"] > 0.1, 10))
+        live = media.get_job(job["id"])["live"]  # step x of y and the time left from 1.5 s per step
+        self.assertEqual((live["phase"], live["step"]), ("sampling", 1))
+        self.assertEqual(live["eta_s"], round((live["steps"] - 1 + media.DECODE_ALLOWANCE_STEPS) * 1.5, 1))
         pid = int(pid_file.read_text())
         started = time.monotonic()
         cancelled = media.cancel_job(job["id"])
+        self.assertIsNone(media.get_job(job["id"])["live"])
         self.assertLess(time.monotonic() - started, 3.0)
         self.assertEqual(cancelled["status"], "cancelled")
         self.assertTrue(wait_until(lambda: not psutil.pid_exists(pid) or psutil.Process(pid).status() == "zombie", 3))
