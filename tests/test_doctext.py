@@ -51,9 +51,16 @@ class FormatTests(unittest.TestCase):
         self.assertEqual(doctext.detect_kind("download", ds.pdf(["x"])), "pdf")
         self.assertEqual(doctext.detect_kind("notes", b"just text"), "text")
         # photos and scans by their bytes, whatever they are called (text recognition reads them)
+        bmp = b"BM" + (90).to_bytes(4, "little") + b"\0\0\0\0" + (54).to_bytes(4, "little") + (40).to_bytes(4, "little") + b"\0" * 36
         for head in (b"\x89PNG\r\n\x1a\n\x00\x00\x00", b"\xff\xd8\xff\xe0\x00\x10JFIF\x00",
-                     b"\x00\x00\x00\x18ftypheic\x00\x00", b"II*\x00\x08\x00\x00\x00"):
+                     b"\x00\x00\x00\x18ftypheic\x00\x00", b"II*\x00\x08\x00\x00\x00", bmp):
             self.assertEqual(doctext.detect_kind("download", head), "image", head)
+        # a text that only starts like a picture stays a text
+        for name, text in (("notizen.txt", "BMW 320d Inspektion am Montag, Ölwechsel und Bremsen prüfen."),
+                           ("bmi.md", "BMI-Tabelle für Erwachsene: Untergewicht unter 18,5 und mehr Text.")):
+            result = doctext.extract(name, text.encode("utf-8"))
+            self.assertEqual((result.kind, result.text, result.needs_ocr), ("text", text, False))
+        self.assertIsNone(doctext.detect_kind("audio", b"\x00\x00\x00\x20ftypM4A \x00\x00\x00\x00"))  # a voice memo
         self.assertIsNone(doctext.detect_kind("data", b"\x00\x01\x02 binary"))
 
     def test_pages_without_text_are_marked_for_text_recognition(self):

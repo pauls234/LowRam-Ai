@@ -140,6 +140,9 @@ def detect_kind(name: str, data: bytes) -> str | None:
     return kind
 
 
+_BMP_HEADER_SIZES = {12, 40, 52, 56, 64, 108, 124}  # every BMP variant's second header (BITMAPINFOHEADER …)
+
+
 def image_kind(data: bytes) -> str | None:
     """The image format from the first bytes (``jpeg``, ``png``, ``heic`` …) or None."""
     head = data[:16]
@@ -151,7 +154,8 @@ def image_kind(data: bytes) -> str | None:
         return "gif"
     if head[:4] in (b"II*\x00", b"MM\x00*"):
         return "tiff"
-    if head[:2] == b"BM" and len(data) > 26:
+    # "BM" alone is not enough – a text that starts with "BMW …" is no picture: the header size must fit
+    if head[:2] == b"BM" and len(data) > 26 and int.from_bytes(data[14:18], "little") in _BMP_HEADER_SIZES:
         return "bmp"
     if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
         return "webp"

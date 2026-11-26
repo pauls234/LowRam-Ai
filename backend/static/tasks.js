@@ -17,6 +17,26 @@
   const statusLabel = (s) => STATUS_LABEL[s] || s;
   /** Loop/task messages about waiting for memory are information, not errors (v0.4 RAM guard). */
   const isWaitMessage = (text) => /arbeitsspeicher|speicher|memory|\bram\b/i.test(LR.str(text)) && /warte|wait/i.test(LR.str(text));
+  /** The runner's status line (English, also used by the command line) in the page's language; details stay as they are. */
+  const LOOP_MESSAGES = {
+    'Loop started.': 'Loop started.',
+    'Stop requested; the loop ends after the current task.': 'Stop requested; the loop ends after the current task.',
+    'All tasks processed.': 'All tasks processed.',
+    'Stopped on request.': 'Stopped on request.',
+    'Task failed.': 'Task failed.',
+  };
+  function loopMessage(text) {
+    const msg = LR.str(text);
+    if (LOOP_MESSAGES[msg]) return LR.t(LOOP_MESSAGES[msg]);
+    let m = /^Reached the limit of (\d+) task\(s\)\.$/.exec(msg);
+    if (m) return LR.t('Reached the limit of {n} tasks.', { n: m[1] });
+    m = /^Task (\d+) \(id \d+\) (done|failed|[a-z_]+)(?:: ([\s\S]*))?$/.exec(msg);
+    if (m) {
+      const head = m[2] === 'done' ? LR.t('Step {n} done', { n: m[1] }) : m[2] === 'failed' ? LR.t('Step {n} failed', { n: m[1] }) : LR.t('Step {n}', { n: m[1] }) + ' – ' + m[2];
+      return head + (m[3] ? ': ' + m[3] : '');
+    }
+    return msg;
+  }
   const STOP_REASONS = {
     queue_empty: ['ok', LR.t('Queue empty: every pending task was processed.')],
     max_tasks: ['ok', LR.t('Reached the task limit for this loop.')],
@@ -262,8 +282,8 @@
       timeline(loop),
       loop.last_message && !(active && loop.current && !isWaitMessage(loop.last_message))  // the step line says it
         ? (isWaitMessage(loop.last_message)
-          ? h('p', { class: 'loop-msg is-info' }, [icon('clock'), h('span', { text: LR.str(loop.last_message) })])
-          : h('p', { class: 'loop-msg', text: LR.str(loop.last_message) }))
+          ? h('p', { class: 'loop-msg is-info' }, [icon('clock'), h('span', { text: loopMessage(loop.last_message) })])
+          : h('p', { class: 'loop-msg', text: loopMessage(loop.last_message) }))
         : null,
       !active && loop.stopped_because === 'on_battery' ? h('p', { class: 'loop-msg loop-hint' }, [LR.icon('bolt'), h('span', { text: LR.t('Plug in your Mac and run the loop again – or lower the battery limit in Models & Settings.') })]) : null,
     ].filter(Boolean));
@@ -449,7 +469,7 @@
         resumed(t) ? LR.badge(LR.t('continued after a crash'), 'info') : null,
       ]);
       if (t.status === 'failed' && t.error) {
-        const err = LR.str(t.error);
+        const err = LR.serverText(LR.str(t.error));  // e.g. a model error, in the page's language
         const p = h('p', { class: 'task-error' });
         if (err.length > ERROR_PREVIEW) {
           p.append(err.slice(0, ERROR_PREVIEW).trimEnd() + '… ', h('button', { type: 'button', class: 'link-btn', text: LR.t('Show full error'), onclick: () => textDialog(taskLabel(t) + LR.t(' error'), t.title, err) }));
@@ -672,7 +692,7 @@
         await loadProjects();
         if (data.project) LR.go('#/tasks/' + data.project.id);
       } catch (err) {
-        (/task/i.test(err.message) ? fTasks : fName).setError(err.message);
+        (/task/i.test(err.raw || err.message) ? fTasks : fName).setError(err.message);
         LR.setBusy(btn, false);
       }
     }

@@ -247,11 +247,13 @@
     } catch (_) {
       data = null;
     }
-    const message = data && typeof data.error === 'string' && data.error
-      ? data.error
-      : LR.t('Request failed (HTTP ') + res.status + ').';
-    if (res.status === 403 && /token/i.test(message)) LR.emit('token-rejected');
-    return new ApiError(message, res.status, data);
+    const raw = data && typeof data.error === 'string' && data.error ? data.error : '';
+    // shown in the page's language; checks of the wording use err.raw (the server's own text)
+    const message = raw ? (LR.serverText ? LR.serverText(raw) : raw) : LR.t('Request failed (HTTP ') + res.status + ').';
+    if (res.status === 403 && /token/i.test(raw)) LR.emit('token-rejected');
+    const error = new ApiError(message, res.status, data);
+    error.raw = raw || message;
+    return error;
   }
 
   async function api(method, path, body, opts) {
@@ -311,7 +313,11 @@
     if (!type.includes('text/event-stream') || !res.body) {
       let data = null;
       try { data = await res.json(); } catch (_) { data = null; }
-      if (data && typeof data.error === 'string') throw new ApiError(data.error, res.status, data);
+      if (data && typeof data.error === 'string') {
+        const error = new ApiError(LR.serverText ? LR.serverText(data.error) : data.error, res.status, data);
+        error.raw = data.error;  // the server's own wording, for checks
+        throw error;
+      }
       throw new ApiError(LR.t('Expected a streamed answer from LowRAM AI.'), res.status, data);
     }
     const reader = res.body.getReader();

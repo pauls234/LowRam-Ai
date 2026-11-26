@@ -174,7 +174,7 @@ def save_upload(name: str, data: bytes) -> dict:
             "pages": result.pages, "truncated": result.truncated, "warnings": [w for w in result.warnings if w],
             "created_at": db.utcnow(), "needs_ocr": ocr_pending}
     if ocr_pending:
-        (folder / f"{upload_id}.src").write_bytes(data)  # only until the text is recognised (≤ 24 h)
+        artifacts.write_bytes_atomic(folder / f"{upload_id}.src", data)  # private, only until the text is recognised
         meta["ocr_pages"] = result.low_text_pages if result.kind == "pdf" else [1]
         if result.page_texts is not None:
             artifacts.write_json_atomic(folder / f"{upload_id}.pages.json", result.page_texts)
@@ -443,7 +443,7 @@ def create_job(data: dict, *, skill: dict | None = None) -> dict:
     folder = _job_dir(job_id)
     folder.mkdir(parents=True, exist_ok=True)
     artifacts.write_json_atomic(folder / "chunks.json", chunks)
-    WORKER.event(job_id, "queued", detail=f"{len(chunks)} Abschnitt(e)")
+    WORKER.event(job_id, "queued", detail="1 Abschnitt" if len(chunks) == 1 else f"{len(chunks)} Abschnitte")
     WORKER.ensure_started()
     return job_view(_get(job_id))
 

@@ -197,9 +197,9 @@
       else LR.store.remove('lowram.chatCollection');
       ui.kbWrap.classList.toggle('is-on', Boolean(S.collectionId));
     });
-    ui.kbWrap = h('div', { class: 'kb-picker', hidden: true }, [
+    ui.kbWrap = h('div', { class: 'kb-picker', hidden: true, title: LR.t('Answer with knowledge') }, [
       icon('book'),
-      h('label', { class: 'kb-label', for: id, text: LR.t('Answer with knowledge') + ':' }),
+      h('label', { class: 'kb-label', for: id, text: LR.t('Knowledge') + ':' }),  // short: the bar holds many tools
       ui.kbSelect,
     ]);
     S.collectionId = LR.store.get('lowram.chatCollection') || null;
@@ -824,12 +824,12 @@
         else li.classList.remove('is-streaming');
         wait.hidden = true;
         li.classList.add('is-error');
-        const modelIssue = /model|engine|llama|server|start/i.test(LR.str(error));
+        const modelIssue = /model|engine|llama|server|start/i.test(LR.str(error));  // the server's own wording
         const btns = [];
         if (handlers.regenerate && isSmart(message)) btns.push(LR.button({ text: LR.t('Regenerate'), icon: 'retry', size: 'sm', variant: 'secondary', onclick: () => handlers.regenerate() }));
         else if (retryFn) btns.push(LR.button({ text: LR.t('Retry'), icon: 'retry', size: 'sm', variant: 'secondary', onclick: () => retryFn() }));
         if (modelIssue && LR.has('engine')) btns.push(LR.button({ text: LR.t('Open Models'), icon: 'sliders', size: 'sm', variant: 'ghost', onclick: () => LR.go('#/settings') }));
-        extra.replaceChildren(LR.callout({ tone: 'error', title: LR.t('The answer could not be completed'), text: LR.str(error, LR.t('Unknown error.')), actions: btns, role: 'alert' }));
+        extra.replaceChildren(LR.callout({ tone: 'error', title: LR.t('The answer could not be completed'), text: error ? LR.serverText(LR.str(error)) : LR.t('Unknown error.'), actions: btns, role: 'alert' }));
         actions.hidden = !answerText;
         retryBtn.hidden = true;
         cont.hidden = true;
@@ -855,7 +855,7 @@
 
   function showNotice(err, retry) {
     const busy = err.status === 409;
-    const noModel = err.status === 400 || /model|engine|llama|not running|start/i.test(err.message);
+    const noModel = err.status === 400 || /model|engine|llama|not running|start/i.test(err.raw || err.message);
     let title = LR.t('Could not send your message');
     if (err.network) title = LR.t('LowRAM AI is not reachable');
     else if (busy && !noModel) title = LR.t('LowRAM AI is busy right now');
@@ -880,9 +880,17 @@
   async function documentText(file) {
     const data = await LR.upload('/api/documents/uploads?text=1', file);
     let upload = data.upload;
-    if (upload && upload.needs_ocr && LR.ocr) {  // a photo or scan: its text is recognised first
-      upload = await LR.ocr.run(upload, { onProgress: (job) => micNote(file.name + ': ' + LR.ocr.progressText(job)) });
-      micNote('');
+    if (upload && upload.needs_ocr && LR.ocr) {  // a photo or scan: its text is recognised first – page by page, cancellable
+      let cancel = null;
+      const stop = LR.button({ text: LR.t('Cancel'), size: 'sm', variant: 'ghost', onclick: () => { if (cancel) cancel(); } });
+      try {
+        upload = await LR.ocr.run(upload, {
+          onStart: (c) => { cancel = c; },
+          onProgress: (job) => { micNote(file.name + ': ' + LR.ocr.progressText(job)); S.ui.attachMsg.append(' ', stop); },
+        });
+      } finally {
+        micNote('');
+      }
     }
     let text = LR.str(upload && upload.text);
     const enc = new TextEncoder();
@@ -963,7 +971,7 @@
           const text = await documentText(file);
           S.attachments = S.attachments.filter((a) => a.name !== file.name).concat({ name: file.name, size: file.size, content: text });
         } catch (err) {
-          problems.push(file.name + ': ' + err.message);
+          if (!err.cancelled) problems.push(file.name + ': ' + err.message);  // cancelled on purpose: nothing to report
         }
         continue;
       }

@@ -1218,6 +1218,9 @@
     'Delete this skill?': 'Diesen Skill löschen?',
     '“{name}” is removed from this computer.': '„{name}“ wird von diesem Computer entfernt.',
     'Active': 'Aktiv',
+    'Off': 'Aus',
+    'Skill': 'Skill',
+    'Skills': 'Skills',
     'Changed – please check again': 'Geändert – bitte erneut prüfen',
     'Too long': 'Zu lang',
     'Not checked yet': 'Noch nicht geprüft',
@@ -1367,6 +1370,75 @@
     'Turning {name} into text …': '{name} wird zu Text …',
     'Turning {name} into text on this computer …': '{name} wird auf diesem Computer zu Text …',
     'recordings (MP3, WAV, M4A …) become text on this computer': 'Aufnahmen (MP3, WAV, M4A …) werden auf diesem Computer zu Text',
+    // messages from the server (errors), shown through LR.serverText (v0.7.1)
+    'Missing or invalid X-LowRAM-Token; reload the page': 'Die Sitzung ist abgelaufen – bitte lade die Seite neu.',
+    'Request body too large': 'Die Datei ist zu groß.',
+    'Not found': 'Nicht gefunden.',
+    'Download not found': 'Diesen Download gibt es nicht (mehr).',
+    'There is no answer to regenerate in this chat': 'In diesem Chat gibt es keine Antwort, die neu erzeugt werden kann.',
+    'Only an answer that was cut off at the length limit can be continued': 'Fortsetzen geht nur bei einer Antwort, die an der Längengrenze abgeschnitten wurde.',
+    'The chat changed meanwhile; reload it and try again': 'Der Chat hat sich inzwischen geändert – lade ihn neu und versuche es noch einmal.',
+    'That device is not visible any more. Make sure both computers are on the same Wi-Fi (some routers isolate Wi-Fi clients) and Devices is on there – or use the pairing code instead.': 'Dieses Gerät ist nicht mehr sichtbar. Prüfe, ob beide Computer im selben WLAN sind (manche Router trennen WLAN-Geräte voneinander) und dort „Geräte“ eingeschaltet ist – oder nutze stattdessen den Kopplungscode.',
+    'This computer does not accept pairing requests (it is hidden). Use the pairing code from its Devices page instead.': 'Dieser Computer nimmt keine Kopplungsanfragen an (er ist versteckt). Nutze stattdessen den Kopplungscode von seiner Geräte-Seite.',
+    'Unknown or expired pairing request; start pairing again.': 'Unbekannte oder abgelaufene Kopplungsanfrage – starte das Koppeln neu.',
+    'Turn on Devices first; the pairing code needs the device server.': 'Schalte zuerst „Geräte“ ein – der Kopplungscode braucht den Geräte-Server.',
+    'The helper has not finished its request yet; wait a moment.': 'Der Helfer hat seine Anfrage noch nicht abgeschlossen – warte einen Moment.',
+    'Turn on Devices first, so helper devices can join this project.': 'Schalte zuerst „Geräte“ ein, damit Helfer-Geräte bei diesem Projekt mitmachen können.',
+    'Too many pairing requests from this computer': 'Zu viele Kopplungsanfragen von diesem Computer',
+    'Too many pairing requests are waiting on the host': 'Beim anderen Computer warten zu viele Kopplungsanfragen',
+    'combining was not requested for this project': 'für dieses Projekt wurde kein Zusammenführen angefordert',
+    'waiting for all tasks to finish': 'wartet, bis alle Aufgaben fertig sind',
+    'the results are being combined right now': 'die Ergebnisse werden gerade zusammengeführt',
+    'stable-diffusion.cpp is not installed yet. Install the image runtime first.': 'stable-diffusion.cpp ist noch nicht installiert. Installiere zuerst die Bild-Engine.',
+    'The model returned an empty answer': 'Das Modell hat eine leere Antwort geliefert.',
+    'The model endpoint closed the connection before the answer was complete': 'Die Verbindung zum Modell wurde beendet, bevor die Antwort fertig war.',
+    'The model response exceeded 8 MiB and was discarded': 'Die Antwort des Modells war größer als 8 MiB und wurde verworfen.',
+    'The model endpoint sent an oversized streaming event': 'Der Modell-Server hat einen zu großen Datenblock geschickt.',
+    'The model endpoint returned a response that is not OpenAI chat-completions JSON': 'Der Modell-Server hat eine unerwartete Antwort geschickt (kein OpenAI-kompatibles JSON).',
+    '{message} (try again in {n} s)': '{message} (in {n} s erneut versuchen)',
+    'At most {n} devices can be paired; remove one first.': 'Es können höchstens {n} Geräte gekoppelt werden – entferne zuerst eines.',
+    'No combined result yet ({detail}).': 'Noch kein zusammengeführtes Ergebnis ({detail}).',
+    'combining failed: {error}': 'Zusammenführen fehlgeschlagen: {error}',
+    'Not enough free disk space: {free} MiB free, at least {need} GiB needed for this job. Free some space (or delete old images/videos) and try again.': 'Nicht genug freier Speicherplatz: {free} MiB frei, für diesen Auftrag sind mindestens {need} GB nötig. Schaffe Platz (oder lösche alte Bilder/Videos) und versuche es erneut.',
+    'The model could not plan the job: {error}': 'Das Modell konnte den Auftrag nicht planen: {error}',
+    'The model did not return usable subtasks ({reason}). Raw output: {path}': 'Das Modell hat keine brauchbaren Teilaufgaben geliefert ({reason}). Rohausgabe: {path}',
+    'Could not reach the model endpoint at {url} ({reason}). Is llama-server (or another OpenAI-compatible server) running?': 'Der Modell-Server unter {url} ist nicht erreichbar ({reason}). Läuft llama-server (oder ein anderer OpenAI-kompatibler Server)?',
+    'The model endpoint did not answer within {n} s': 'Der Modell-Server hat nicht innerhalb von {n} s geantwortet.',
+    'The connection to the model endpoint was interrupted ({reason})': 'Die Verbindung zum Modell-Server wurde unterbrochen ({reason}).',
+    'The model endpoint sent nothing for {n} s; giving up': 'Der Modell-Server hat {n} s lang nichts geschickt – abgebrochen.',
+    'The model endpoint sent nothing for {n} s (still no first token); giving up': 'Der Modell-Server hat {n} s lang nichts geschickt (noch kein erstes Wort) – abgebrochen.',
+    'The model endpoint reported an error: {error}': 'Der Modell-Server meldet einen Fehler: {error}',
+    'Model endpoint returned HTTP {code}: {detail}': 'Der Modell-Server antwortete mit HTTP {code}: {detail}',
+    'Connection to the model endpoint failed: {reason}': 'Verbindung zum Modell-Server fehlgeschlagen: {reason}',
+    '{thing} #{n} not found': '{thing} #{n} gibt es nicht (mehr).',
+    'Project #{n} is not shared with devices': 'Projekt #{n} ist nicht mit Geräten geteilt.',
+    'Pairing request #{n} no longer exists (it expired or was answered)': 'Die Kopplungsanfrage #{n} gibt es nicht mehr (abgelaufen oder schon beantwortet).',
+    'The output file of media job #{n} is missing on disk': 'Die Datei von Bild-/Video-Auftrag #{n} fehlt auf der Festplatte.',
+    // words inside server messages (the not-found pattern)
+    'Project': 'Projekt',
+    'Media job': 'Bild-/Video-Auftrag',
+    'Collection': 'Sammlung',
+    'Message': 'Nachricht',
+    'Device': 'Gerät',
+    // the task runner's status line (v0.7.1)
+    'Loop started.': 'Durchlauf gestartet.',
+    'Stop requested; the loop ends after the current task.': 'Stopp angefordert – der Durchlauf endet nach der aktuellen Aufgabe.',
+    'All tasks processed.': 'Alle Aufgaben bearbeitet.',
+    'Task failed.': 'Aufgabe fehlgeschlagen.',
+    'Reached the limit of {n} tasks.': 'Das Limit von {n} Aufgaben ist erreicht.',
+    'Step {n} done': 'Schritt {n} erledigt',
+    'Step {n} failed': 'Schritt {n} fehlgeschlagen',
+    // model catalog descriptions (from the server, v0.7.1)
+    'Tiny and very fast. Good for short answers and simple rewrites on machines with little RAM; makes mistakes on harder questions.': 'Winzig und sehr schnell. Gut für kurze Antworten und einfache Umformulierungen auf Computern mit wenig Arbeitsspeicher; bei schwierigeren Fragen macht es Fehler.',
+    'Small multilingual assistant (including German). Fast on almost any computer.': 'Kleiner mehrsprachiger Assistent (auch Deutsch). Schnell auf fast jedem Computer.',
+    'Small coding model for quick code questions and snippets.': 'Kleines Programmier-Modell für schnelle Code-Fragen und kurze Code-Stücke.',
+    'Microsoft\'s compact model with strong reasoning for its size; best in English.': 'Kompaktes Modell von Microsoft, denkt für seine Größe gut mit; am besten auf Englisch.',
+    'Capable multilingual model for 8 GB machines. Thinks step by step before answering (better reasoning, slower answers).': 'Leistungsfähiges mehrsprachiges Modell für Computer mit 8 GB. Denkt vor der Antwort Schritt für Schritt nach (bessere Schlüsse, langsamere Antworten).',
+    'Well-rounded multilingual assistant (including German) for writing, summaries and questions.': 'Vielseitiger mehrsprachiger Assistent (auch Deutsch) für Texte, Zusammenfassungen und Fragen.',
+    'Strong coding model for explaining, writing and fixing code.': 'Starkes Programmier-Modell zum Erklären, Schreiben und Reparieren von Code.',
+    'Stronger reasoning model. Thinks step by step before answering, so replies take longer.': 'Stärker im Nachdenken. Denkt vor der Antwort Schritt für Schritt nach, daher dauern Antworten länger.',
+    'High-quality assistant for machines with 24 GB RAM or more.': 'Hochwertiger Assistent für Computer mit 24 GB Arbeitsspeicher oder mehr.',
+    'High-quality coding model for machines with 24 GB RAM or more.': 'Hochwertiges Programmier-Modell für Computer mit 24 GB Arbeitsspeicher oder mehr.',
     // text recognition (v0.7.0)
     '1 page left': 'noch 1 Seite',
     '{n} pages left': 'noch {n} Seiten',
@@ -1424,6 +1496,42 @@
       s = s.replace(/\{(\w+)\}/g, (m, name) => (Object.prototype.hasOwnProperty.call(vars, name) ? String(vars[name]) : m));
     }
     return s;
+  };
+
+  /** A message from the server in the page's language: whole sentences from the dictionary, a few with numbers
+   *  or details by pattern. Anything unknown stays as the server wrote it (the command line uses the same texts). */
+  const SERVER_PATTERNS = [
+    [/^([\s\S]+) \(try again in (\d+) s\)$/, (m) => LR.t('{message} (try again in {n} s)', { message: LR.serverText(m[1]), n: m[2] })],
+    [/^At most (\d+) devices can be paired; remove one first\.$/, (m) => LR.t('At most {n} devices can be paired; remove one first.', { n: m[1] })],
+    [/^No combined result yet \(([\s\S]*)\)\.$/, (m) => LR.t('No combined result yet ({detail}).', { detail: LR.serverText(m[1]) })],
+    [/^combining failed: ([\s\S]*)$/, (m) => LR.t('combining failed: {error}', { error: LR.serverText(m[1]) })],
+    [/^Not enough free disk space: (\d+) MiB free, at least (\d+) GiB needed for this job\. Free some space \(or delete old images\/videos\) and try again\.$/,
+      (m) => LR.t('Not enough free disk space: {free} MiB free, at least {need} GiB needed for this job. Free some space (or delete old images/videos) and try again.', { free: m[1], need: m[2] })],
+    [/^The model could not plan the job: ([\s\S]*)$/, (m) => LR.t('The model could not plan the job: {error}', { error: LR.serverText(m[1]) })],
+    [/^The model did not return usable subtasks \(([\s\S]*?)\)\. Raw output: ([\s\S]*)$/, (m) => LR.t('The model did not return usable subtasks ({reason}). Raw output: {path}', { reason: m[1], path: m[2] })],
+    [/^Could not reach the model endpoint at (\S+) \(([\s\S]*)\)\. Is llama-server \(or another OpenAI-compatible server\) running\?$/,
+      (m) => LR.t('Could not reach the model endpoint at {url} ({reason}). Is llama-server (or another OpenAI-compatible server) running?', { url: m[1], reason: m[2] })],
+    [/^The model endpoint did not answer within ([\d.]+) s$/, (m) => LR.t('The model endpoint did not answer within {n} s', { n: m[1] })],
+    [/^The connection to the model endpoint was interrupted \(([\s\S]*)\)$/, (m) => LR.t('The connection to the model endpoint was interrupted ({reason})', { reason: m[1] })],
+    [/^The model endpoint sent nothing for ([\d.]+) s; giving up$/, (m) => LR.t('The model endpoint sent nothing for {n} s; giving up', { n: m[1] })],
+    [/^The model endpoint sent nothing for ([\d.]+) s \(still no first token\); giving up$/, (m) => LR.t('The model endpoint sent nothing for {n} s (still no first token); giving up', { n: m[1] })],
+    [/^The model endpoint reported an error: ([\s\S]*)$/, (m) => LR.t('The model endpoint reported an error: {error}', { error: m[1] })],
+    [/^Model endpoint returned HTTP (\d+): ([\s\S]*)$/, (m) => LR.t('Model endpoint returned HTTP {code}: {detail}', { code: m[1], detail: m[2] })],
+    [/^Connection to the model endpoint failed: ([\s\S]*)$/, (m) => LR.t('Connection to the model endpoint failed: {reason}', { reason: m[1] })],
+    [/^(Chat|Project|Task|Media job|Collection|Message|Device|Coding project) #(\d+) not found$/, (m) => LR.t('{thing} #{n} not found', { thing: LR.t(m[1]), n: m[2] })],
+    [/^Project #(\d+) is not shared with devices$/, (m) => LR.t('Project #{n} is not shared with devices', { n: m[1] })],
+    [/^Pairing request #(\d+) no longer exists \(it expired or was answered\)$/, (m) => LR.t('Pairing request #{n} no longer exists (it expired or was answered)', { n: m[1] })],
+    [/^The output file of media job #(\d+) is missing on disk$/, (m) => LR.t('The output file of media job #{n} is missing on disk', { n: m[1] })],
+  ];
+  LR.serverText = function (text) {
+    const msg = text === null || text === undefined ? '' : String(text);
+    if (!dict || !msg) return msg;
+    if (Object.prototype.hasOwnProperty.call(dict, msg)) return dict[msg];
+    for (const [pattern, build] of SERVER_PATTERNS) {
+      const m = pattern.exec(msg);
+      if (m) return build(m);
+    }
+    return msg;
   };
 
   /** "3 files" / "3 Dateien". */
